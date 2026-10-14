@@ -1,0 +1,27 @@
+# agent-assets 为本机只读参考源码区,不进入版本管理(仅追踪其 README)
+/agent-assets/*
+!/agent-assets/README.md
+
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+build/
+out/
+
+# 缓存
+.cache/
+*.tsbuildinfo
+
+# 日志与临时文件
+*.log
+logs/
+tmp/
+
+# 工具目录
+.zcode/
+
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
