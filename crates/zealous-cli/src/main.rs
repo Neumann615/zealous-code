@@ -5,7 +5,10 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use zealous_core::{ApprovalDecision, TaskStatus};
@@ -30,6 +33,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// 配置检查(Git 仓库 / Provider 配置;不回显密钥)
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// 检查 Git 仓库与 OpenAI-compatible 配置
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -58,8 +72,52 @@ enum TaskCmd {
 }
 
 /// stdin 交互审批:完整展示将执行的动作,y/回车=批准,其余=拒绝
+/// 审批 sink:后台线程读 stdin + channel,decide 以 100ms 轮询消费;
+/// abort 置位后立即拒绝并返回(spec 60 §3:Ctrl-C 不被阻塞的审批卡住)。
 struct StdinApproval {
     auto: Option<ApprovalDecision>,
+    rx: Mutex<mpsc::Receiver<String>>,
+    abort: Arc<AtomicBool>,
+}
+
+impl StdinApproval {
+    /// 真实 stdin 模式:auto 时无需读 stdin,不启动读线程
+    fn new(auto: Option<ApprovalDecision>, abort: Arc<AtomicBool>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        if auto.is_none() {
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match std::io::stdin().read_line(&mut line) {
+                        Ok(0) | Err(_) => {
+                            let _ = tx.send("__eof__".into());
+                            return;
+                        }
+                        Ok(_) => {
+                            if tx.send(line.trim().to_string()).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Self {
+            auto,
+            rx: Mutex::new(rx),
+            abort,
+        }
+    }
+
+    fn parse_decision(line: &str) -> Option<ApprovalDecision> {
+        let t = line.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "y" | "yes" => Some(ApprovalDecision::Approve),
+            "n" | "no" => Some(ApprovalDecision::Reject),
+            _ => None,
+        }
+    }
 }
 
 impl ApprovalSink for StdinApproval {
@@ -68,18 +126,31 @@ impl ApprovalSink for StdinApproval {
             println!("[approval auto-{:?}] {call_id}: {summary}", d);
             return d;
         }
-        println!("\n=== 审批请求 {call_id} ===\n{summary}\n批准? [y/N] ");
+        println!("\n=== 审批请求 {call_id} ===\n{summary}\n批准? [y/N](Ctrl-C 中断任务)");
         let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_ok() {
-            let t = line.trim().to_ascii_lowercase();
-            if t == "y" || t == "yes" {
-                ApprovalDecision::Approve
-            } else {
-                ApprovalDecision::Reject
+        let rx = self.rx.lock().unwrap();
+        loop {
+            if self.abort.load(Ordering::Relaxed) {
+                println!("[interrupted] 审批按拒绝收尾");
+                return ApprovalDecision::Reject;
             }
-        } else {
-            ApprovalDecision::Reject
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => {
+                    if line.as_str() == "__eof__" {
+                        return ApprovalDecision::Reject;
+                    }
+                    match Self::parse_decision(&line) {
+                        Some(d) => return d,
+                        // 无效输入:重新提示
+                        None => {
+                            print!("请输入 y 或 n: ");
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return ApprovalDecision::Reject,
+            }
         }
     }
 }
@@ -106,8 +177,51 @@ fn main() {
             TaskCmd::Run { task_id, yes, no } => cmd_run(&task_id, yes, no),
             TaskCmd::Events { task_id } => cmd_events(&task_id),
         },
+        Cmd::Config {
+            cmd: ConfigCmd::Check,
+        } => cmd_config_check(),
     };
     std::process::exit(code);
+}
+
+fn cmd_config_check() -> i32 {
+    let mut ok = true;
+    match repo_root() {
+        Ok(root) => println!("[ok] git repo: {}", root.display()),
+        Err(e) => {
+            println!("[fail] {e}");
+            ok = false;
+        }
+    }
+    match ProviderConfig::resolve() {
+        Ok(cfg) => {
+            println!(
+                "[ok] base_url: {}(应指向 OpenAI-compatible 根路径,如 https://example/v1)",
+                cfg.base_url
+            );
+            println!("[ok] model: {}", cfg.model);
+            println!(
+                "[ok] api_key: configured (len={}, 不回显)",
+                cfg.api_key.len()
+            );
+            println!(
+                "[ok] timeout={}s max_retries={}",
+                cfg.timeout_secs, cfg.max_retries
+            );
+        }
+        Err(e) => {
+            println!("[fail] provider 配置:{e}");
+            println!("       设置 env ZEALOUS_BASE_URL / ZEALOUS_API_KEY / ZEALOUS_MODEL,");
+            println!("       或写入 ~/.zealous/config.json(env 优先)");
+            ok = false;
+        }
+    }
+    if ok {
+        println!("config check: all good");
+        0
+    } else {
+        1
+    }
 }
 
 fn cmd_new(title: &str) -> i32 {
@@ -222,7 +336,15 @@ fn cmd_run(task_id: &str, yes: bool, no: bool) -> i32 {
     } else {
         None
     };
-    let sink: Arc<dyn ApprovalSink> = Arc::new(StdinApproval { auto });
+    let abort = Arc::new(AtomicBool::new(false));
+    // spec 60 §3:handler 只设标志,不做 IO;审批轮询与轮次边界响应 abort
+    if let Err(e) = ctrlc::set_handler({
+        let abort = abort.clone();
+        move || abort.store(true, Ordering::Relaxed)
+    }) {
+        return err(format!("install ctrl-c handler: {e}"));
+    }
+    let sink: Arc<dyn ApprovalSink> = Arc::new(StdinApproval::new(auto, abort.clone()));
     let executor = Arc::new(ToolExecutor::new(
         repo_root().unwrap(),
         builtin_registry(),
@@ -231,7 +353,7 @@ fn cmd_run(task_id: &str, yes: bool, no: bool) -> i32 {
     let orch = Orchestrator {
         provider,
         executor,
-        abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        abort,
         max_turns: 24,
         model,
     };
@@ -285,4 +407,49 @@ fn status_code(s: &TaskStatus) -> i32 {
 fn err(msg: impl std::fmt::Display) -> i32 {
     eprintln!("error: {msg}");
     1
+}
+
+#[cfg(test)]
+impl StdinApproval {
+    fn with_rx(rx: mpsc::Receiver<String>, abort: Arc<AtomicBool>) -> Self {
+        Self {
+            auto: None,
+            rx: Mutex::new(rx),
+            abort,
+        }
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    /// spec 60 §3:abort 置位后,阻塞中的审批等待必须立即以 Reject 退出
+    #[test]
+    fn abort_unblocks_pending_approval() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel();
+        let sink = StdinApproval::with_rx(rx, abort.clone());
+        let sink = Arc::new(sink);
+        let s2 = sink.clone();
+        let handle = std::thread::spawn(move || s2.decide("c1", "shell: echo"));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!handle.is_finished(), "无决策且无 abort 时应保持阻塞");
+        abort.store(true, Ordering::Relaxed);
+        let d = handle.join().unwrap();
+        assert_eq!(d, ApprovalDecision::Reject);
+    }
+
+    #[test]
+    fn stdin_line_parses_to_decision() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let sink = StdinApproval::with_rx(rx, abort.clone());
+        tx.send("y".into()).unwrap();
+        assert_eq!(sink.decide("c", "s"), ApprovalDecision::Approve);
+        let (tx2, rx2) = mpsc::channel();
+        let sink2 = StdinApproval::with_rx(rx2, abort.clone());
+        tx2.send("n".into()).unwrap();
+        assert_eq!(sink2.decide("c", "s"), ApprovalDecision::Reject);
+    }
 }
