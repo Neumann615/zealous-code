@@ -423,6 +423,12 @@ impl Orchestrator {
         }
 
         // resume 语义(spec 10):非 Queued 进入时记 TaskResumed;终态/中断都可 resume
+        // resume 必须携带投影摘要(spec 70):模型据此续跑而非重新开始
+        let resume_brief = if from != TaskStatus::Queued {
+            Some(resume_brief(&proj))
+        } else {
+            None
+        };
         if from != TaskStatus::Queued {
             let run_id = AgentRunId::generate();
             self.append(
@@ -458,12 +464,21 @@ impl Orchestrator {
         }
 
         // ---- 阶段 1:规划(spec 10:1 Coordinator + ≤3 Worker)----
-        let plan_prompt = format!(
-            "TASK: {task_prompt}\n\n\
-             返回一个 JSON 动作。规划动作格式:\n\
-             {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
-             workers 最多 3 个,只安排只读分析任务。"
-        );
+        let plan_prompt = if let Some(brief) = &resume_brief {
+            format!(
+                "{brief}\n\nTASK: {task_prompt}\n\n\
+                 返回一个 JSON 动作。规划动作格式:\n\
+                 {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
+                 workers 最多 3 个,只安排只读分析任务。注意:这是续跑,基于上方投影增量推进。"
+            )
+        } else {
+            format!(
+                "TASK: {task_prompt}\n\n\
+                 返回一个 JSON 动作。规划动作格式:\n\
+                 {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
+                 workers 最多 3 个,只安排只读分析任务。"
+            )
+        };
         // 工具契约由注册表生成(spec 60 §5),与实现天然一致
         let coord_system = format!(
             "你是 Coordinator:拆解任务、调度只读 Worker、串行应用结果、验证并汇报。\n\
@@ -1010,6 +1025,47 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// 恢复上下文摘要(spec 70):从投影构造,包含原任务、中断次数、已有计划、
+/// 各 Run 最后产出、工具调用摘要与上次错误。三条硬性提示:续跑非重开、
+/// 已完成的读操作不必重复、被拒/失败的工具需调整方案。
+fn resume_brief(proj: &zealous_core::TaskProjection) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "【这是续跑(RESUME),不是重新开始】任务原标题:{}",
+        proj.title
+    );
+    let _ = writeln!(
+        s,
+        "恢复前状态:{:?};历史中断次数:{};已完成读操作不必重复",
+        proj.status, proj.interrupted_count
+    );
+    if let Some(plan) = &proj.plan {
+        let _ = writeln!(s, "已有计划:{}", truncate(plan, 400));
+    }
+    for r in &proj.runs {
+        if let Some(m) = &r.last_message {
+            let _ = writeln!(s, "[run {} 最后产出] {}", r.run_id, truncate(m, 300));
+        }
+    }
+    for c in &proj.tool_calls {
+        let _ = writeln!(
+            s,
+            "[工具摘要] {} 风险={:?} 状态={:?}",
+            c.tool, c.risk, c.state
+        );
+    }
+    if let Some((scope, msg)) = &proj.last_error {
+        let _ = writeln!(
+            s,
+            "上次错误 [{scope}]:{}(被拒绝或失败的工具需要调整方案)",
+            truncate(msg, 300)
+        );
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,7 +1076,7 @@ mod tests {
     use std::path::Path;
     use zealous_core::{projection, EventPayload, RiskTier, TaskId};
 
-    fn fixture_dir(tag: &str) -> PathBuf {
+    pub(crate) fn fixture_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "zealous-orch-{tag}-{}-{}",
             std::process::id(),
@@ -1033,12 +1089,12 @@ mod tests {
         dir
     }
 
-    fn msg(text: &str) -> Result<String, String> {
+    pub(crate) fn msg(text: &str) -> Result<String, String> {
         Ok(format!("{{\"action\":\"message\",\"text\":\"{text}\"}}"))
     }
 
     /// 模拟一次"进程被 kill"的账本:任务 Running + 挂起审批,无收尾事件
-    fn crashed_running_ledger(dir: &Path) -> Arc<Ledger> {
+    pub(crate) fn crashed_running_ledger(dir: &Path) -> Arc<Ledger> {
         let task_id = TaskId::generate();
         let ledger = Arc::new(Ledger::create(dir, &task_id).unwrap());
         ledger
@@ -1207,5 +1263,80 @@ mod parse_tests {
     #[test]
     fn unknown_action_rejected() {
         assert!(parse_action_strict(r#"{"action":"deploy","target":"prod"}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod resume_ctx_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::approval::AutoApprove;
+    use crate::tools::builtin_registry;
+
+    #[test]
+    fn resume_prompt_carries_projection_context() {
+        let dir = fixture_dir("resume-ctx");
+        let ledger = crashed_running_ledger(&dir);
+        // 增补历史要素:计划 + 错误(投影摘要的断言素材)
+        ledger
+            .append(
+                AgentRef::Coordinator,
+                EventPayload::TaskPlanUpdated {
+                    plan: "先分析再修改".into(),
+                },
+            )
+            .unwrap();
+        ledger
+            .append(
+                AgentRef::Coordinator,
+                EventPayload::ErrorOccurred {
+                    scope: "orchestrator".into(),
+                    message: "验证命令失败: exit 1".into(),
+                },
+            )
+            .unwrap();
+
+        let mock = Arc::new(crate::provider::MockProvider::scripted(vec![msg(
+            "续跑完成",
+        )]));
+        let orch = Orchestrator {
+            provider: mock.clone(),
+            executor: Arc::new(ToolExecutor::new(
+                &dir,
+                builtin_registry(),
+                Arc::new(AutoApprove),
+            )),
+            abort: Arc::new(AtomicBool::new(false)),
+            max_turns: 8,
+            model: "mock".into(),
+        };
+        let status = orch.run_task(&ledger, "t").unwrap();
+        assert_eq!(status, TaskStatus::Completed);
+
+        let prompts = mock.prompts.lock().unwrap();
+        assert!(!prompts.is_empty());
+        let first = &prompts[0];
+        let joined = format!(
+            "{}\n{}",
+            first.system.clone().unwrap_or_default(),
+            first
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // spec 70:resume prompt 必须携带计划、工具摘要、上次错误与续跑语义
+        assert!(joined.contains("续跑"), "缺少续跑语义: {joined}");
+        assert!(joined.contains("先分析再修改"), "缺少历史计划: {joined}");
+        assert!(
+            joined.contains("工具摘要") && joined.contains("shell"),
+            "缺少工具摘要: {joined}"
+        );
+        assert!(joined.contains("验证命令失败"), "缺少上次错误: {joined}");
+        assert!(
+            joined.contains("不必重复"),
+            "缺少读操作免重复提示: {joined}"
+        );
     }
 }
