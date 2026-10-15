@@ -112,6 +112,7 @@ dependencies = [
 name = "zealous-engine"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "zealous-core",
 ]
 

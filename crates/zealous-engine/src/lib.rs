@@ -5,5 +5,4 @@
 //!
 //! 本 crate 是未来桌面 app 复用的内核主体;UI 一律为薄客户端。
 
-// 骨架阶段:各模块随对应 spec 的首次实现逐个落地,
-// 依赖方向保持 cli → engine → core,禁止反向。
+pub mod ledger;
