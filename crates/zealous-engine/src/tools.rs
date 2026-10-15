@@ -26,6 +26,15 @@ pub enum ToolError {
     Failed(String),
 }
 
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolError::BadArgs(m) => f.write_str(m),
+            ToolError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     /// 固定分级表(spec 30):T0 只读自动执行;T1 写入审批;T2 高危审批
@@ -338,32 +347,79 @@ impl Tool for WriteFile {
         let path = resolve_in_repo(&ctx.repo_root, &arg_str(raw_args, "path")?)?;
         let content = arg_str(raw_args, "content")?;
         assert_clean_worktree(&ctx.repo_root)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ToolError::Failed(format!("mkdir: {e}")))?;
-        }
-        std::fs::write(&path, content).map_err(|e| ToolError::Failed(format!("write: {e}")))?;
-        // spec 60 §4:apply 即回退点——写入成功后框架立即提交(zealous 署名),
-        // 串行 apply 时工作区回到干净状态
-        commit_applied(&ctx.repo_root, &path)?;
+        apply_transactional(&ctx.repo_root, &path, &content)?;
         Ok(ToolOutput {
             summary: format!("written {} (committed as rollback point)", path.display()),
         })
     }
 }
 
-/// 把刚写入的文件作为独立回退点提交;作者署名 zealous,与用户提交区分
-fn commit_applied(repo_root: &Path, file: &Path) -> Result<(), ToolError> {
-    // file 是 canonicalize 产物(Windows 带 \\?\ 前缀),须对规范化后的根
-    // 求 strip_prefix 才能得到干净的相对路径
+/// apply 事务(spec 70 §4):临时文件 → 原子替换 → git add → git commit;
+/// git 步骤失败则回滚文件与 index,ok=true 仅在提交成功后产生。
+/// 崩溃窗口(替换与 commit 之间)如实声明于 spec 70 §4,不做虚假事务保证。
+fn apply_transactional(repo_root: &Path, path: &Path, content: &str) -> Result<(), ToolError> {
+    // 回滚素材:原内容(新文件则为 None)
+    let original = std::fs::read(path).ok();
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ToolError::Failed(format!("mkdir: {e}")))?;
+    }
+    // 同目录临时文件 + 原子替换(跨盘 rename 会失败,同目录保证同卷)
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| ToolError::BadArgs("path 无文件名".into()))?;
+    let tmp = path.with_file_name(format!(".{file_name}.zealous-tmp"));
+    std::fs::write(&tmp, content).map_err(|e| ToolError::Failed(format!("write tmp: {e}")))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ToolError::Failed(format!("atomic replace: {e}")));
+    }
+
+    match commit_applied(repo_root, path) {
+        Ok(summary) => {
+            let _ = summary;
+            Ok(())
+        }
+        Err(commit_err) => {
+            // 回滚:恢复原内容或删除新文件;清理 staged index
+            let restore = match &original {
+                Some(bytes) => std::fs::write(path, bytes),
+                None => std::fs::remove_file(path),
+            };
+            let rel = rel_to_repo(repo_root, path);
+            let reset = std::process::Command::new("git")
+                .args(["reset", "-q", "HEAD", "--", &rel])
+                .current_dir(repo_root)
+                .output();
+            match (restore, reset) {
+                (Ok(()), Ok(out)) if out.status.success() => Err(ToolError::Failed(format!(
+                    "apply 后 git 提交失败,已回滚文件与 index。原因: {commit_err}"
+                ))),
+                (restore_res, reset_res) => Err(ToolError::Failed(format!(
+                    "apply 失败且回滚未完全成功,需要人工处理: commit 原因={commit_err}; \
+                     文件恢复={restore_res:?}; index 清理={reset_res:?}"
+                ))),
+            }
+        }
+    }
+}
+
+/// file 相对仓库根的路径串(git 命令用;file 是 canonicalize 产物,
+/// Windows 带 \\?\ 前缀,须对规范化后的根求 strip_prefix)
+fn rel_to_repo(repo_root: &Path, file: &Path) -> String {
     let canon_root = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
-    let rel = file
-        .strip_prefix(&canon_root)
+    file.strip_prefix(&canon_root)
         .or_else(|_| file.strip_prefix(repo_root))
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| file.display().to_string());
+        .unwrap_or_else(|_| file.display().to_string())
+}
+
+/// 把刚写入的文件作为独立回退点提交;作者署名 zealous,与用户提交区分
+fn commit_applied(repo_root: &Path, file: &Path) -> Result<String, ToolError> {
+    let rel = rel_to_repo(repo_root, file);
     let add = std::process::Command::new("git")
         .args(["add", "--", &rel])
         .current_dir(repo_root)
@@ -391,11 +447,18 @@ fn commit_applied(repo_root: &Path, file: &Path) -> Result<(), ToolError> {
         .map_err(|e| ToolError::Failed(format!("spawn git commit: {e}")))?;
     if !commit.status.success() {
         return Err(ToolError::Failed(format!(
-            "apply 后自动 commit 失败(文件已写入,请手动提交): {}",
+            "git commit 失败: {}",
             String::from_utf8_lossy(&commit.stderr)
         )));
     }
-    Ok(())
+    let hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    Ok(hash)
 }
 
 /// 主工作区写入保护(spec 60 §4):apply 前工作区必须干净,
@@ -653,5 +716,107 @@ mod tests {
         assert!(t0.contains("`read_file`"));
         assert!(!t0.contains("`write_file`"), "T0 manifest 不应含写工具");
         assert!(!t0.contains("`shell`"));
+    }
+}
+
+#[cfg(test)]
+mod apply_tx_tests {
+    use super::*;
+
+    /// 真实 git 仓库 + 初始 commit(spec 60 §4:脏工作区保护与回退点都依赖)
+    fn real_git_fixture(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zealous-apply-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("README.md"), "fixture\n").unwrap();
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        dir
+    }
+
+    #[test]
+    fn apply_rolls_back_file_and_index_when_commit_fails() {
+        let dir = real_git_fixture("rollback");
+        // 让 commit 必然失败:pre-commit hook exit 1
+        let hook = dir.join(".git").join("hooks").join("pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        let write = WriteFile;
+        let err = write
+            .execute(r#"{"path":"new.txt","content":"x"}"#, &ctx)
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed(m) if m.contains("已回滚")),
+            "{err}"
+        );
+        assert!(!dir.join("new.txt").exists(), "回滚后新文件不得残留");
+        let st = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&st.stdout).trim().is_empty(),
+            "回滚后工作区与 index 必须干净"
+        );
+    }
+
+    #[test]
+    fn apply_happy_path_commits_rollback_point() {
+        let dir = real_git_fixture("happy");
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        let write = WriteFile;
+        write
+            .execute(r#"{"path":"feature.txt","content":"v1"}"#, &ctx)
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("feature.txt")).unwrap(),
+            "v1"
+        );
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&log.stdout).contains("zealous: apply feature.txt"),
+            "应有 zealous 回退 commit"
+        );
+        let st = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&st.stdout).trim().is_empty());
     }
 }
