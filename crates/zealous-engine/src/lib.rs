@@ -6,3 +6,13 @@
 //! 本 crate 是未来桌面 app 复用的内核主体;UI 一律为薄客户端。
 
 pub mod ledger;
+pub mod provider;
+pub mod task_service;
+
+/// 测试专用:ProviderConfig::resolve 读取进程级环境变量,
+/// 触碰环境的测试必须持有此锁串行执行,避免并行测试互相污染。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+}

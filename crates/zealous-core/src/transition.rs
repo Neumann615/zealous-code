@@ -6,6 +6,8 @@ use crate::events::TaskStatus;
 
 /// 合法流转(spec 10):
 /// - Queued → Running
+/// - Queued → Failed | Cancelled(启动前即失败/取消:如 provider 配置非法,
+///   spec 10 要求创建时即失败并落账)
 /// - Running → Completed | Failed | Cancelled | Interrupted
 /// - Interrupted → Running(恢复)
 /// - 终态(Completed/Failed/Cancelled)→ Running(resume 是一等公民)
@@ -15,6 +17,7 @@ pub fn can_transition(from: TaskStatus, to: TaskStatus) -> bool {
     matches!(
         (from, to),
         (Queued, Running)
+            | (Queued, Failed | Cancelled)
             | (Running, Completed | Failed | Cancelled | Interrupted)
             | (Interrupted, Running)
             | (Completed | Failed | Cancelled, Running)

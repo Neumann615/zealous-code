@@ -1,0 +1,550 @@
+//! Provider 抽象与 OpenAI-compatible 实现(spec 10)。
+//!
+//! 失败语义(A6):配置缺失/非法 → `Invalid`,创建任务即失败并落账;
+//! 网络/5xx/429 → 指数退避重试,耗尽 → 可解释错误;4xx(除 429)不重试。
+//! `api_key` 只存在于 Provider 内部,禁止进入账本与日志(spec 20)。
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// 单次模型调用的最小请求形态;多轮上下文由调用方拼接 messages。
+#[derive(Debug, Clone)]
+pub struct ChatRequest {
+    pub system: Option<String>,
+    pub user: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatResponse {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderError {
+    /// 配置缺失/非法——创建任务即失败的原因(A6)
+    Invalid(String),
+    /// 重试耗尽仍失败,携带最后一次可解释原因
+    Exhausted { attempts: u32, last: String },
+    /// 不可重试的 4xx
+    Rejected { status: u16, summary: String },
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderError::Invalid(r) => write!(f, "provider_config_invalid: {r}"),
+            ProviderError::Exhausted { attempts, last } => {
+                write!(f, "provider_exhausted after {attempts} attempts: {last}")
+            }
+            ProviderError::Rejected { status, summary } => {
+                write!(f, "provider_rejected {status}: {summary}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+/// 解析后的配置。`Display` 刻意不输出 key。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// 单次 HTTP 超时(默认 120s,spec 10)
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// 网络错误/5xx/429 的重试次数(默认 3,spec 10)
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_timeout_secs() -> u64 {
+    120
+}
+fn default_max_retries() -> u32 {
+    3
+}
+
+impl ProviderConfig {
+    /// 解析优先级(spec 10,代码内固定):环境变量 > 用户配置文件。
+    /// 配置文件:`~/.zealous/config.json`
+    pub fn resolve() -> Result<Self, ProviderError> {
+        let from_file = Self::from_config_file();
+        let pick = |env_key: &str, file_val: Option<String>| -> Option<String> {
+            std::env::var(env_key)
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or(file_val)
+        };
+        let cfg = Self {
+            base_url: pick(
+                "ZEALOUS_BASE_URL",
+                from_file.as_ref().map(|c| c.base_url.clone()),
+            )
+            .ok_or_else(|| ProviderError::Invalid("missing base_url".into()))?,
+            api_key: pick(
+                "ZEALOUS_API_KEY",
+                from_file.as_ref().map(|c| c.api_key.clone()),
+            )
+            .ok_or_else(|| ProviderError::Invalid("missing api_key".into()))?,
+            model: pick("ZEALOUS_MODEL", from_file.as_ref().map(|c| c.model.clone()))
+                .ok_or_else(|| ProviderError::Invalid("missing model".into()))?,
+            timeout_secs: pick(
+                "ZEALOUS_TIMEOUT_SECS",
+                from_file.as_ref().map(|c| c.timeout_secs.to_string()),
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_timeout_secs),
+            max_retries: pick(
+                "ZEALOUS_MAX_RETRIES",
+                from_file.as_ref().map(|c| c.max_retries.to_string()),
+            )
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_retries),
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn config_path() -> Option<PathBuf> {
+        dirs_home().map(|h| h.join(".zealous").join("config.json"))
+    }
+
+    fn from_config_file() -> Option<Self> {
+        let path = Self::config_path()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    fn validate(&self) -> Result<(), ProviderError> {
+        if self.base_url.trim().is_empty() {
+            return Err(ProviderError::Invalid("empty base_url".into()));
+        }
+        if !self.base_url.starts_with("http://") && !self.base_url.starts_with("https://") {
+            return Err(ProviderError::Invalid(format!(
+                "base_url must be http(s): {}",
+                self.base_url
+            )));
+        }
+        if self.api_key.trim().is_empty() {
+            return Err(ProviderError::Invalid("empty api_key".into()));
+        }
+        if self.model.trim().is_empty() {
+            return Err(ProviderError::Invalid("empty model".into()));
+        }
+        if self.timeout_secs == 0 || self.timeout_secs > 1800 {
+            return Err(ProviderError::Invalid(format!(
+                "timeout_secs out of range: {}",
+                self.timeout_secs
+            )));
+        }
+        Ok(())
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    // 不引 dirs crate:Windows 用 USERPROFILE,*nix 用 HOME
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+/// Provider trait:内核只依赖此抽象;测试用 Mock 替换(spec 50)。
+pub trait Provider: Send + Sync {
+    fn complete(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError>;
+}
+
+/// 重试策略:退避序列由调用方注入,测试可零等待。
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    /// 第 n 次重试前的等待(毫秒);传入 n 从 0 开始
+    pub backoff: Box<dyn Fn(u32) -> Duration + Send + Sync>,
+}
+
+impl RetryPolicy {
+    pub fn default_policy() -> Self {
+        Self {
+            max_retries: 3,
+            backoff: Box::new(|n| Duration::from_millis(500u64.saturating_mul(1 << n.min(6)))),
+        }
+    }
+}
+
+/// OpenAI-compatible chat/completions 客户端(同步,ureq + rustls)。
+pub struct OpenAiCompatProvider {
+    config: ProviderConfig,
+    retry: RetryPolicy,
+}
+
+impl OpenAiCompatProvider {
+    pub fn new(config: ProviderConfig) -> Self {
+        Self {
+            config,
+            retry: RetryPolicy::default_policy(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    fn endpoint(&self) -> String {
+        let base = self.config.base_url.trim_end_matches('/');
+        format!("{base}/chat/completions")
+    }
+
+    fn once(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(serde_json::json!({ "role": "system", "content": sys }));
+        }
+        messages.push(serde_json::json!({ "role": "user", "content": req.user }));
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+        })
+        .to_string();
+
+        let resp = ureq::post(&self.endpoint())
+            .timeout(self.config.timeout())
+            .set("Authorization", &format!("Bearer {}", self.config.api_key))
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+            .map_err(classify_ureq)?;
+
+        let status = resp.status();
+        let text = resp.into_string().map_err(|e| ProviderError::Rejected {
+            status,
+            summary: format!("unreadable body: {e}"),
+        })?;
+        let parsed: ChatCompletionsResponse =
+            serde_json::from_str(&text).map_err(|e| ProviderError::Rejected {
+                status,
+                summary: format!("bad json: {e}"),
+            })?;
+        parsed.into_response()
+    }
+}
+
+impl Provider for OpenAiCompatProvider {
+    fn complete(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+        let attempts = self.retry.max_retries + 1;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..attempts {
+            match self.once(model, req) {
+                Ok(resp) => return Ok(resp),
+                // 4xx(非 429)不可重试:立即以可解释状态失败
+                Err(e @ ProviderError::Rejected { .. }) => return Err(e),
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep((self.retry.backoff)(attempt));
+            }
+        }
+        Err(ProviderError::Exhausted {
+            attempts,
+            last: last_err.unwrap_or_else(|| "unknown".into()),
+        })
+    }
+}
+
+fn classify_ureq(e: ureq::Error) -> ProviderError {
+    match e {
+        // ureq 把 4xx/5xx 作为 Error 返回:统一转成带状态的错误
+        ureq::Error::Status(code, resp) => {
+            let summary = resp
+                .into_string()
+                .map(|s| truncate(&s, 200))
+                .unwrap_or_else(|_| "<unreadable body>".into());
+            if code == 429 || code >= 500 {
+                ProviderError::Exhausted {
+                    attempts: 0,
+                    last: format!("http {code}: {summary}"),
+                }
+            } else {
+                ProviderError::Rejected {
+                    status: code,
+                    summary,
+                }
+            }
+        }
+        other => ProviderError::Exhausted {
+            attempts: 0,
+            last: format!("network: {other}"),
+        },
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionsResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Deserialize)]
+struct ChatMessage {
+    content: String,
+}
+
+impl ChatCompletionsResponse {
+    fn into_response(self) -> Result<ChatResponse, ProviderError> {
+        self.choices
+            .into_iter()
+            .next()
+            .map(|c| ChatResponse {
+                text: c.message.content,
+            })
+            .ok_or_else(|| ProviderError::Rejected {
+                status: 200,
+                summary: "empty choices".into(),
+            })
+    }
+}
+
+/// 确定性 Mock:按脚本依次返回;用于编排与验收测试(spec 50 Provider trait 替身)。
+pub struct MockProvider {
+    /// 每个元素:Ok(text) 或 Err(描述);耗尽后重复最后一项
+    pub script: std::sync::Mutex<Vec<Result<String, String>>>,
+    pub calls: std::sync::atomic::AtomicU32,
+}
+
+impl MockProvider {
+    pub fn ok(text: &str) -> Self {
+        Self {
+            script: std::sync::Mutex::new(vec![Ok(text.to_string())]),
+            calls: Default::default(),
+        }
+    }
+
+    pub fn scripted(script: Vec<Result<String, String>>) -> Self {
+        Self {
+            script: std::sync::Mutex::new(script),
+            calls: Default::default(),
+        }
+    }
+}
+
+impl Provider for MockProvider {
+    fn complete(&self, _model: &str, _req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut script = self.script.lock().unwrap();
+        let item = if script.is_empty() {
+            return Err(ProviderError::Exhausted {
+                attempts: 1,
+                last: "mock script exhausted".into(),
+            });
+        } else if script.len() == 1 {
+            script[0].clone()
+        } else {
+            script.remove(0)
+        };
+        item.map(|text| ChatResponse { text })
+            .map_err(|last| ProviderError::Exhausted { attempts: 1, last })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::ENV_LOCK;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    /// 就绪屏障:部分环境(如杀软对新监听端口)会在短暂窗口内丢弃 SYN,
+    /// 造成 loopback connect 偶发超时。在正式调用前用可重试的探测连接
+    /// 穿过该窗口;探测连接由测试服务线程的正常 accept 循环消化。
+    fn wait_listening(addr: std::net::SocketAddr) {
+        for _ in 0..50 {
+            if TcpStream::connect(addr).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("test server never became reachable at {addr}");
+    }
+
+    /// 全测试进程共享一个 mock endpoint:端口只创建一次(规避杀软对多个
+    /// 新端口的干扰窗口),按请求路径路由行为,各测试互不共享可变脚本。
+    fn shared_server() -> std::net::SocketAddr {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SERVER: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
+        static RETRY_HITS: AtomicU32 = AtomicU32::new(0);
+        *SERVER.get_or_init(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || loop {
+                let Ok((mut stream, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let first_line = String::from_utf8_lossy(&buf);
+                let path = first_line.split_whitespace().nth(1).unwrap_or("");
+                let resp = if path.starts_with("/retry") {
+                    // 前两次命中 500,之后 200(A6:5xx 重试路径)
+                    let hit = RETRY_HITS.fetch_add(1, Ordering::Relaxed);
+                    if hit < 2 {
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        let body = serde_json::json!({
+                            "choices": [{ "message": { "content": "hello from server" } }]
+                        })
+                        .to_string();
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                    }
+                } else {
+                    // /reject 及未知路径:恒 401(A6:4xx 不重试路径)
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                let _ = stream.write_all(resp.as_bytes());
+            });
+            addr
+        })
+    }
+
+    fn zero_backoff_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: 2,
+            backoff: Box::new(|_| Duration::ZERO),
+        }
+    }
+
+    #[test]
+    fn config_resolution_env_overrides_file_and_validates() {
+        let _env = ENV_LOCK.lock().unwrap();
+        // 无配置 → Invalid(可解释)
+        for k in [
+            "ZEALOUS_BASE_URL",
+            "ZEALOUS_API_KEY",
+            "ZEALOUS_MODEL",
+            "ZEALOUS_TIMEOUT_SECS",
+            "ZEALOUS_MAX_RETRIES",
+        ] {
+            std::env::remove_var(k);
+        }
+        let err = ProviderConfig::resolve().unwrap_err();
+        assert!(matches!(err, ProviderError::Invalid(_)));
+
+        // env 齐全 → 成功
+        std::env::set_var("ZEALOUS_BASE_URL", "https://api.example.com/v1");
+        std::env::set_var("ZEALOUS_API_KEY", "test-key");
+        std::env::set_var("ZEALOUS_MODEL", "test-model");
+        let cfg = ProviderConfig::resolve().unwrap();
+        assert_eq!(cfg.model, "test-model");
+        assert_eq!(cfg.max_retries, 3);
+        for k in ["ZEALOUS_BASE_URL", "ZEALOUS_API_KEY", "ZEALOUS_MODEL"] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn retries_on_5xx_then_succeeds_against_local_server() {
+        let addr = shared_server();
+        wait_listening(addr);
+        let cfg = ProviderConfig {
+            base_url: format!("http://{addr}/retry"),
+            api_key: "k".into(),
+            model: "m".into(),
+            timeout_secs: 5,
+            max_retries: 2,
+        };
+        let provider = OpenAiCompatProvider::new(cfg).with_retry(zero_backoff_policy());
+        let resp = provider
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    user: "hi".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.text, "hello from server");
+    }
+
+    #[test]
+    fn client_error_4xx_fails_fast_without_retry() {
+        let addr = shared_server();
+        wait_listening(addr);
+        let cfg = ProviderConfig {
+            base_url: format!("http://{addr}/reject"),
+            api_key: "k".into(),
+            model: "m".into(),
+            timeout_secs: 5,
+            max_retries: 2,
+        };
+        let provider = OpenAiCompatProvider::new(cfg).with_retry(zero_backoff_policy());
+        let err = provider
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    user: "hi".into(),
+                },
+            )
+            .unwrap_err();
+        // 关键断言:4xx 不重试,单次调用即以 Rejected 失败
+        assert!(
+            matches!(err, ProviderError::Rejected { status: 401, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn mock_provider_script_is_consumed_in_order() {
+        let mock = MockProvider::scripted(vec![Ok("first".into()), Err("boom".into())]);
+        let r1 = mock
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    user: "u".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(r1.text, "first");
+        assert!(mock
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    user: "u".into()
+                }
+            )
+            .is_err());
+        // 耗尽后重复最后一项
+        assert!(mock
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    user: "u".into()
+                }
+            )
+            .is_err());
+        assert_eq!(mock.calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+}
