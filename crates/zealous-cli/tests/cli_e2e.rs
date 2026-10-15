@@ -256,6 +256,63 @@ fn e2e_real_binary_plan_write_approve_complete() {
     let last = events.last().unwrap();
     assert_eq!(last["type"], "TaskStatusChanged");
     assert_eq!(last["to"], "Completed");
+
+    // ---- --quiet:抑制非关键输出,保留审批与最终结果(spec 80 §5)----
+    // 恢复任务到 Completed 已不可重跑;换新任务验证 quiet
+    let out = Command::new(zealous)
+        .args(["task", "new", "quiet: read README then edit"])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .unwrap();
+    let quiet_task = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("task created: "))
+        .expect("task id")
+        .trim()
+        .to_string();
+
+    let endpoint2 = mock_endpoint(vec![
+        r#"{"action":"plan","plan":"edit fixture to quiet","workers":[]}"#.into(),
+        r#"{"action":"tool","tool":"edit_file","args":{"path":"README.md","old_text":"fixture edited","new_text":"fixture quiet"}}"#.into(),
+        r#"{"action":"message","text":"quiet done"}"#.into(),
+    ]);
+    let mut quiet_cmd = Command::new(zealous);
+    quiet_cmd
+        .args(["task", "run", &quiet_task, "--quiet"])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint2)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut quiet_child = quiet_cmd.spawn().expect("spawn quiet run");
+    {
+        let stdin = quiet_child.stdin.as_mut().expect("stdin");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        stdin.write_all(b"y\n").expect("write approval");
+        stdin.flush().unwrap();
+    }
+    let mut quiet_stdout_pipe = quiet_child.stdout.take().expect("stdout");
+    let quiet_status = wait_exit(quiet_child, 30);
+    assert!(quiet_status.success(), "quiet run exit: {quiet_status}");
+    let mut quiet_out = String::new();
+    let _ = quiet_stdout_pipe.read_to_string(&mut quiet_out);
+    assert!(
+        !quiet_out.contains("· [") && !quiet_out.contains("工具 "),
+        "--quiet 不应输出 turn/工具进度: {quiet_out}"
+    );
+    assert!(
+        quiet_out.contains("任务最终状态"),
+        "--quiet 保留最终结果: {quiet_out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).unwrap(),
+        "fixture quiet\n"
+    );
 }
 
 /// 读取仓库根 .env(真实 smoke 专用);不打印任何值
