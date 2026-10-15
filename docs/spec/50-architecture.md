@@ -37,6 +37,21 @@ crates/zealous-cli
 docs/spec/            # 本目录,先于代码修订
 ```
 
+## CLI 命令面(V1,已实现)
+
+均在 Git 仓库根目录执行;Provider 配置来自 env(`ZEALOUS_BASE_URL/API_KEY/MODEL`)> `~/.zealous/config.json`。
+
+| 命令 | 行为 |
+| ---- | ---- |
+| `zealous task new <title>` | 创建任务并校验 Provider 配置;配置非法 → 任务落账为 Failed(可恢复) |
+| `zealous task list` | 列出任务与损坏账本(不阻塞) |
+| `zealous task status <id>` | 投影状态:runs/pending approvals/last error |
+| `zealous task run <id> [--yes/--no]` | 运行或恢复;T1/T2 审批经 stdin 交互(--yes/--no 脚本化) |
+| `zealous task events <id>` | 输出事件账本(seq/ts/agent/payload) |
+
+退出码:0 = Completed;1 = Failed/Interrupted/配置错误;2+ = clap 用法错误。
+TUI(ratatui)与 `app-server` 模式是 cli crate 的下一形态,复用同一投影 API。
+
 ## 验证命令(建立后以实际为准)
 
 `cargo check` / `cargo test` / `cargo fmt --check` / `cargo clippy -- -D warnings`

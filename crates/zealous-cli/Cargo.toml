@@ -11,3 +11,5 @@ path = "src/main.rs"
 [dependencies]
 zealous-core = { workspace = true }
 zealous-engine = { workspace = true }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
