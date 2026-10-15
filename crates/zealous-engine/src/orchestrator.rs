@@ -482,9 +482,15 @@ impl Orchestrator {
         }
 
         // ---- 阶段 1:规划(spec 10:1 Coordinator + ≤3 Worker)----
+        // brief(spec 80)作为权威需求来源注入规划 prompt
+        let brief_section = proj
+            .brief
+            .as_ref()
+            .map(|b| format!("\nBRIEF(任务简报,权威需求来源):\n{}\n", truncate(b, 4000)))
+            .unwrap_or_default();
         let plan_prompt = if let Some(brief) = &resume_brief {
             format!(
-                "{brief}\n\nTASK: {task_prompt}\n\n\
+                "{brief}\n\nTASK: {task_prompt}{brief_section}\n\n\
                  返回一个 JSON 动作。规划动作格式:\n\
                  {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
                  {WORKER_POLICY}
@@ -492,7 +498,7 @@ impl Orchestrator {
             )
         } else {
             format!(
-                "TASK: {task_prompt}\n\n\
+                "TASK: {task_prompt}{brief_section}\n\n\
                  返回一个 JSON 动作。规划动作格式:\n\
                  {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
                  {WORKER_POLICY}"
@@ -1063,6 +1069,9 @@ fn resume_brief(proj: &zealous_core::TaskProjection) -> String {
     if let Some(plan) = &proj.plan {
         let _ = writeln!(s, "已有计划:{}", truncate(plan, 400));
     }
+    if let Some(brief) = &proj.brief {
+        let _ = writeln!(s, "任务简报(BRIEF,权威需求):{}", truncate(brief, 1500));
+    }
     for r in &proj.runs {
         if let Some(m) = &r.last_message {
             let _ = writeln!(s, "[run {} 最后产出] {}", r.run_id, truncate(m, 300));
@@ -1383,5 +1392,54 @@ mod worker_policy_tests {
     fn planning_prompt_states_worker_policy() {
         assert!(WORKER_POLICY.contains("默认不创建 Worker"));
         assert!(WORKER_POLICY.contains("互不重复"));
+    }
+}
+
+#[cfg(test)]
+mod brief_prompt_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::approval::AutoApprove;
+    use crate::tools::builtin_registry;
+
+    #[test]
+    fn planning_prompt_contains_brief() {
+        let dir = fixture_dir("brief-prompt");
+        let ledger = crashed_running_ledger(&dir);
+        ledger
+            .append(
+                AgentRef::Coordinator,
+                EventPayload::TaskBriefAttached {
+                    brief: "实现 slugify;必须跑 node test.js 验证".into(),
+                },
+            )
+            .unwrap();
+
+        let mock = Arc::new(crate::provider::MockProvider::scripted(vec![msg("ok")]));
+        let orch = Orchestrator {
+            provider: mock.clone(),
+            executor: Arc::new(ToolExecutor::new(
+                &dir,
+                builtin_registry(),
+                Arc::new(AutoApprove),
+            )),
+            abort: Arc::new(AtomicBool::new(false)),
+            max_turns: 8,
+            model: "mock".into(),
+        };
+        let status = orch.run_task(&ledger, "t").unwrap();
+        assert_eq!(status, TaskStatus::Completed);
+
+        let prompts = mock.prompts.lock().unwrap();
+        let joined = prompts[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("BRIEF") && joined.contains("slugify"),
+            "规划 prompt 应包含 brief: {joined}"
+        );
     }
 }

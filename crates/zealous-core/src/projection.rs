@@ -56,6 +56,8 @@ pub struct TaskProjection {
     pub repo_root: String,
     pub status: TaskStatus,
     pub plan: Option<String>,
+    /// 任务简报(spec 80)
+    pub brief: Option<String>,
     pub runs: Vec<RunView>,
     pub tool_calls: Vec<ToolCallView>,
     /// 待决策审批(即阻塞中的 T1/T2 调用)
@@ -101,6 +103,7 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
         repo_root: String::new(),
         status: TaskStatus::Queued,
         plan: None,
+        brief: None,
         runs: Vec::new(),
         tool_calls: Vec::new(),
         pending_approvals: Vec::new(),
@@ -155,6 +158,7 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
                 proj.status = *to;
             }
             EventPayload::TaskPlanUpdated { plan } => proj.plan = Some(plan.clone()),
+            EventPayload::TaskBriefAttached { brief } => proj.brief = Some(brief.clone()),
             EventPayload::AgentRunStarted { run_id, role } => {
                 if let AgentRole::Worker(n) = role {
                     if !(1..=MAX_WORKERS).contains(n) {

@@ -145,6 +145,10 @@ pub enum EventPayload {
         title: String,
         repo_root: String,
     },
+    /// 任务简报(spec 80):--file 指定的 brief 全文,创建时附加
+    TaskBriefAttached {
+        brief: String,
+    },
     TaskStatusChanged {
         from: TaskStatus,
         to: TaskStatus,

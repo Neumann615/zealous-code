@@ -52,6 +52,9 @@ enum TaskCmd {
     New {
         /// 一句话描述工程任务
         title: String,
+        /// 任务简报文件(须位于当前 Git 仓库内,spec 80 §1)
+        #[arg(long = "file")]
+        brief_file: Option<String>,
     },
     /// 列出全部任务
     List,
@@ -203,7 +206,7 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.cmd {
         Cmd::Task { cmd } => match cmd {
-            TaskCmd::New { title } => cmd_new(&title),
+            TaskCmd::New { title, brief_file } => cmd_new(&title, brief_file.as_deref()),
             TaskCmd::List => cmd_list(),
             TaskCmd::Status { task_id } => cmd_status(&task_id),
             TaskCmd::Run { task_id, yes, no } => cmd_run(&task_id, yes, no),
@@ -256,12 +259,13 @@ fn cmd_config_check() -> i32 {
     }
 }
 
-fn cmd_new(title: &str) -> i32 {
+fn cmd_new(title: &str, brief_file: Option<&str>) -> i32 {
     let svc = match svc() {
         Ok(s) => s,
         Err(e) => return err(e),
     };
-    match svc.create_task(title) {
+    let brief_path = brief_file.map(std::path::PathBuf::from);
+    match svc.create_task_with_brief(title, brief_path.as_deref()) {
         Ok(CreateOutcome::Ready { task_id, .. }) => {
             println!("task created: {task_id}");
             println!("next: zealous task run {task_id}");
@@ -314,6 +318,15 @@ fn cmd_status(task_id: &str) -> i32 {
             println!("status: {:?}", proj.status);
             if let Some(plan) = &proj.plan {
                 println!("plan:   {plan}");
+            }
+            if let Some(brief) = &proj.brief {
+                let summary: String = brief.chars().take(80).collect();
+                let ellipsis = if brief.chars().count() > 80 {
+                    "…"
+                } else {
+                    ""
+                };
+                println!("brief:  {summary}{ellipsis}");
             }
             println!("runs:   {}", proj.runs.len());
             println!("pending approvals: {}", proj.pending_approvals.len());
