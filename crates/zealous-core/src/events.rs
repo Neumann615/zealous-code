@@ -117,6 +117,17 @@ pub enum RiskTier {
     T2,
 }
 
+impl std::fmt::Display for RiskTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            RiskTier::T0 => "T0",
+            RiskTier::T1 => "T1",
+            RiskTier::T2 => "T2",
+        };
+        f.write_str(s)
+    }
+}
+
 /// 审批决策(spec 30:V1 只做逐请求 Approve/Reject,不做"始终允许")。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]

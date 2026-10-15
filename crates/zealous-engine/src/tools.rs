@@ -30,6 +30,10 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     /// 固定分级表(spec 30):T0 只读自动执行;T1 写入审批;T2 高危审批
     fn risk(&self) -> RiskTier;
+    /// 参数模板(稳定契约,进模型 manifest,spec 60 §5)
+    fn args_template(&self) -> &'static str;
+    /// 一句话语义说明(进模型 manifest)
+    fn description(&self) -> &'static str;
     /// 审批摘要:T1/T2 挂起时必须完整展示将发生什么
     fn summarize(&self, raw_args: &str) -> String;
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
@@ -121,6 +125,12 @@ impl Tool for ReadFile {
     fn risk(&self) -> RiskTier {
         RiskTier::T0
     }
+    fn args_template(&self) -> &'static str {
+        "{\"path\": \"relative/path\"}"
+    }
+    fn description(&self) -> &'static str {
+        "读取仓库内文本文件(<=512KB),返回文件全文"
+    }
     fn summarize(&self, raw_args: &str) -> String {
         truncate_for_display(raw_args, 200)
     }
@@ -150,6 +160,12 @@ impl Tool for ListDir {
     }
     fn risk(&self) -> RiskTier {
         RiskTier::T0
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"path\": \"relative/dir\"}"
+    }
+    fn description(&self) -> &'static str {
+        "列出目录条目,d 前缀为目录、f 前缀为文件"
     }
     fn summarize(&self, raw_args: &str) -> String {
         truncate_for_display(raw_args, 200)
@@ -189,6 +205,12 @@ impl Tool for SearchText {
     }
     fn risk(&self) -> RiskTier {
         RiskTier::T0
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"query\": \"substring\"}"
+    }
+    fn description(&self) -> &'static str {
+        "在仓库文本文件中做子串搜索(跳过 .git/target 等),返回 file:line: 片段"
     }
     fn summarize(&self, raw_args: &str) -> String {
         truncate_for_display(raw_args, 200)
@@ -263,6 +285,12 @@ impl Tool for GitStatus {
     fn risk(&self) -> RiskTier {
         RiskTier::T0
     }
+    fn args_template(&self) -> &'static str {
+        "{}"
+    }
+    fn description(&self) -> &'static str {
+        "返回 git status --porcelain 输出(只读)"
+    }
     fn summarize(&self, raw_args: &str) -> String {
         truncate_for_display(raw_args, 120)
     }
@@ -294,6 +322,12 @@ impl Tool for WriteFile {
     }
     fn risk(&self) -> RiskTier {
         RiskTier::T1
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"path\": \"relative/path\", \"content\": \"full content\"}"
+    }
+    fn description(&self) -> &'static str {
+        "写入主工作区文件(T1:需审批;要求工作区干净;成功后自动 commit 作为回退点)"
     }
     fn summarize(&self, raw_args: &str) -> String {
         let path = arg_str(raw_args, "path").unwrap_or_default();
@@ -405,6 +439,12 @@ impl Tool for Shell {
     fn risk(&self) -> RiskTier {
         RiskTier::T2
     }
+    fn args_template(&self) -> &'static str {
+        "{\"command\": \"command line\"}"
+    }
+    fn description(&self) -> &'static str {
+        "经 cmd /C 执行命令(T2:需审批;完整命令会展示给用户)"
+    }
     fn summarize(&self, raw_args: &str) -> String {
         format!(
             "shell: {}",
@@ -446,6 +486,31 @@ pub fn builtin_registry() -> Vec<Box<dyn Tool>> {
         Box::new(WriteFile),
         Box::new(Shell),
     ]
+}
+
+/// 工具 manifest(spec 60 §5):模型提示的稳定契约。
+/// 由注册表生成,与实现天然一致;`only` 过滤风险级(如 Worker 仅 T0)。
+pub fn tool_manifest(only: Option<RiskTier>) -> String {
+    let mut out = String::from(
+        "## 可用工具
+",
+    );
+    for t in builtin_registry() {
+        if let Some(risk) = only {
+            if t.risk() != risk {
+                continue;
+            }
+        }
+        let line = format!(
+            "- `{}` [{}] 参数: {} — {}\n",
+            t.name(),
+            t.risk(),
+            t.args_template(),
+            t.description()
+        );
+        out.push_str(&line);
+    }
+    out
 }
 
 /// 未知工具按 T2 处理(就高不就低);执行层据此决定审批或拒绝。
@@ -568,5 +633,19 @@ mod tests {
             "{err:?}"
         );
         assert!(!dir.join("new.txt").exists());
+    }
+
+    #[test]
+    fn manifest_covers_all_tools_and_filters_t0() {
+        let names: Vec<&str> = builtin_registry().iter().map(|t| t.name()).collect();
+        let all = tool_manifest(None);
+        for n in &names {
+            assert!(all.contains(&format!("`{n}`")), "manifest 缺 {n}");
+        }
+        assert!(all.contains("T0") && all.contains("T1") && all.contains("T2"));
+        let t0 = tool_manifest(Some(RiskTier::T0));
+        assert!(t0.contains("`read_file`"));
+        assert!(!t0.contains("`write_file`"), "T0 manifest 不应含写工具");
+        assert!(!t0.contains("`shell`"));
     }
 }

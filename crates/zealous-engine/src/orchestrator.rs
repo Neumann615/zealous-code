@@ -328,13 +328,20 @@ impl Orchestrator {
              {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
              workers 最多 3 个,只安排只读分析任务。"
         );
-        let coord_system = "你是 Coordinator:拆解任务、调度只读 Worker、串行应用结果、验证并汇报。\
-            每轮只返回一个 JSON 动作对象。可用动作:plan / tool / message。\
-            可用工具:read_file, list_dir, search_text, git_status (T0), write_file (T1), shell (T2)。";
+        // 工具契约由注册表生成(spec 60 §5),与实现天然一致
+        let coord_system = format!(
+            "你是 Coordinator:拆解任务、调度只读 Worker、串行应用结果、验证并汇报。\n\
+             每轮只返回一个 JSON 动作对象。可用动作:\n\
+             {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<子任务>\", ...]}}(仅首轮)\n\
+             {{\"action\":\"tool\",\"tool\":\"<工具名>\",\"args\":{{...}}}}\n\
+             {{\"action\":\"message\",\"text\":\"<最终答复>\"}}\n\
+             {}",
+            crate::tools::tool_manifest(None)
+        );
         let mut ctx = LoopCtx {
             transcript: Vec::new(),
         };
-        let action = match self.turn(&mut ctx, coord_system, &plan_prompt) {
+        let action = match self.turn(&mut ctx, &coord_system, &plan_prompt) {
             Ok(a) => a,
             Err(e) => return self.provider_failed(ledger, &coord_run, e),
         };
@@ -430,7 +437,7 @@ impl Orchestrator {
             serde_json::json!({"action":"plan","plan":plan}).to_string(),
         ));
         let run =
-            self.agent_loop_continue(ledger, &coord_run, &mut ctx, coord_system, &apply_prompt);
+            self.agent_loop_continue(ledger, &coord_run, &mut ctx, &coord_system, &apply_prompt);
         self.finish_task(ledger, &coord_run, run)
     }
 
@@ -702,8 +709,10 @@ fn run_worker(
     }
 
     let system = format!(
-        "你是 worker-{worker_no},只做只读分析(仅 T0 工具:read_file/list_dir/search_text/git_status)。\
-         禁止修改任何文件。完成分析后返回 {{\"action\":\"message\",\"text\":\"<提案>\"}}。"
+        "你是 worker-{worker_no},只做只读分析,禁止修改任何文件。\n\
+         完成分析后返回 {{\"action\":\"message\",\"text\":\"<提案>\"}}。\n\
+         {}",
+        crate::tools::tool_manifest(Some(zealous_core::RiskTier::T0))
     );
     let prompt = format!("OVERALL PLAN: {plan}\nYOUR SUBTASK: {subtask}");
     match orchestrator.agent_loop(&ledger, &run_id, agent.clone(), &system, &prompt) {
