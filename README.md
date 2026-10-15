@@ -41,3 +41,26 @@ node scripts/update-agent-assets.mjs
 
 - 先改 `docs/spec/`,再改代码;spec 与实现不一致视为 bug。
 - 上游参考代码只读,不在 `agent-assets/` 内进行开发或提交本地修改。
+
+## TUI 快速开始(zealous tui)
+
+在任意 Git 仓库根目录运行 `zealous tui` 进入可视化任务工作台。
+
+| 键位(列表) | 作用 | | 键位(详情) | 作用 |
+| ------------ | ---- | - | ------------ | ---- |
+| `↑/↓` | 选择任务 | | `R` | 运行/恢复 |
+| `r` | 刷新列表 | | `x` | 中断任务 |
+| `Enter` | 打开详情 | | `a` / `d` | 批准/拒绝当前审批 |
+| `n` | 新建任务表单 | | `e` | 展开/收起事件流 |
+| `q` | 退出 | | `Esc` | 返回列表 |
+
+新建表单:title 必填;brief file 可选(相对当前 Git 仓库根)。
+`--quiet` 等 CLI 文本输出参数与 TUI 无关;审批、进度、最终状态均来自
+engine 编排事实,TUI 不维护第二份任务状态。
+
+真实模型配置(三选一,优先级从高到低):
+1. 环境变量 `ZEALOUS_BASE_URL` / `ZEALOUS_API_KEY` / `ZEALOUS_MODEL`;
+2. 当前目录 `.env`(同上三个键,.gitignore 已忽略);
+3. 全局 `~/.zealous/config.json`(跨仓库使用推荐)。
+
+配置错误不会阻塞浏览既有任务,错误会显示在底部,按任意键消除。
