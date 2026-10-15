@@ -97,6 +97,7 @@ fn orchestrator(
         abort,
         max_turns: 12,
         model: "mock-model".into(),
+        progress: None,
     }
 }
 

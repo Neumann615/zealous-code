@@ -69,6 +69,9 @@ enum TaskCmd {
         /// 全部审批自动拒绝
         #[arg(long)]
         no: bool,
+        /// 只保留审批请求、错误与最终结果(spec 80 §5)
+        #[arg(long)]
+        quiet: bool,
     },
     /// 查看任务事件账本(可审计)
     Events { task_id: String },
@@ -209,7 +212,12 @@ fn main() {
             TaskCmd::New { title, brief_file } => cmd_new(&title, brief_file.as_deref()),
             TaskCmd::List => cmd_list(),
             TaskCmd::Status { task_id } => cmd_status(&task_id),
-            TaskCmd::Run { task_id, yes, no } => cmd_run(&task_id, yes, no),
+            TaskCmd::Run {
+                task_id,
+                yes,
+                no,
+                quiet,
+            } => cmd_run(&task_id, yes, no, quiet),
             TaskCmd::Events { task_id } => cmd_events(&task_id),
         },
         Cmd::Config {
@@ -342,7 +350,23 @@ fn cmd_status(task_id: &str) -> i32 {
     }
 }
 
-fn cmd_run(task_id: &str, yes: bool, no: bool) -> i32 {
+/// CLI 进度 sink:默认全量,--quiet 只保留 important(审批/错误/最终)
+struct CliProgress {
+    quiet: bool,
+}
+
+impl zealous_engine::progress::ProgressSink for CliProgress {
+    fn progress(&self, line: &str) {
+        if !self.quiet {
+            println!("{line}");
+        }
+    }
+    fn important(&self, line: &str) {
+        println!("{line}");
+    }
+}
+
+fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool) -> i32 {
     let svc = match svc() {
         Ok(s) => s,
         Err(e) => return err(e),
@@ -401,6 +425,7 @@ fn cmd_run(task_id: &str, yes: bool, no: bool) -> i32 {
         abort,
         max_turns: 24,
         model,
+        progress: Some(Arc::new(CliProgress { quiet })),
     };
     let title = proj.title.clone();
     match orch.run_task(&ledger, &title) {

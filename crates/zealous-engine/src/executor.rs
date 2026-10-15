@@ -19,6 +19,7 @@ use crate::tools::{ToolContext, ToolError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
     pub ok: bool,
+    pub risk: zealous_core::RiskTier,
     /// 回给模型的文本:成功为输出摘要,失败/被拒为可解释原因
     pub text: String,
 }
@@ -99,7 +100,10 @@ impl ToolExecutor {
             )
             .map_err(ExecutorError::LedgerIo)?;
 
-        let fail = |ok: bool, text: String| -> Result<ToolOutcome, ExecutorError> {
+        let fail = |ok: bool,
+                    risk: zealous_core::RiskTier,
+                    text: String|
+         -> Result<ToolOutcome, ExecutorError> {
             ledger
                 .append(
                     agent.clone(),
@@ -110,19 +114,20 @@ impl ToolExecutor {
                     },
                 )
                 .map_err(ExecutorError::LedgerIo)?;
-            Ok(ToolOutcome { ok, text })
+            Ok(ToolOutcome { ok, risk, text })
         };
 
         // Worker 边界(spec 30):Worker 只有 T0 工具权
         if matches!(agent, AgentRef::Worker(_)) && risk != RiskTier::T0 {
             return fail(
                 false,
+                risk,
                 format!("worker 不具备 {risk:?} 工具权(仅 T0);请求的工具: {tool_name}"),
             );
         }
 
         let Some(tool) = tool else {
-            return fail(false, format!("unknown tool: {tool_name}"));
+            return fail(false, risk, format!("unknown tool: {tool_name}"));
         };
 
         // T1/T2:审批闸门
@@ -155,6 +160,7 @@ impl ToolExecutor {
                 // "以失败结果回给模型"由返回值承载,任务不因此失败
                 return Ok(ToolOutcome {
                     ok: false,
+                    risk,
                     text: "rejected by user".into(),
                 });
             }
@@ -164,9 +170,9 @@ impl ToolExecutor {
             repo_root: self.repo_root.clone(),
         };
         match tool.execute(raw_args, &ctx) {
-            Ok(out) => fail(true, out.summary),
-            Err(ToolError::BadArgs(m)) => fail(false, format!("invalid args: {m}")),
-            Err(ToolError::Failed(m)) => fail(false, format!("tool failed: {m}")),
+            Ok(out) => fail(true, risk, out.summary),
+            Err(ToolError::BadArgs(m)) => fail(false, risk, format!("invalid args: {m}")),
+            Err(ToolError::Failed(m)) => fail(false, risk, format!("tool failed: {m}")),
         }
     }
 }

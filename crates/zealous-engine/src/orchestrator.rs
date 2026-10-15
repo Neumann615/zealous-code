@@ -213,6 +213,8 @@ pub struct Orchestrator {
     pub max_turns: u64,
     /// 提供给 Provider 的模型名
     pub model: String,
+    /// 进度反馈 sink(spec 80 §5);None = 静默
+    pub progress: Option<crate::progress::SharedSink>,
 }
 
 /// 单 Agent 循环的上下文(内存中的对话转写;账本保存的是持久事实)。
@@ -224,6 +226,17 @@ struct LoopCtx {
 impl Orchestrator {
     fn aborted(&self) -> bool {
         self.abort.load(Ordering::Relaxed)
+    }
+
+    /// 进度发射(spec 80 §5):只陈述编排器事实,不打印业务日志
+    fn emit(&self, important: bool, line: String) {
+        if let Some(sink) = &self.progress {
+            if important {
+                sink.important(&line);
+            } else {
+                sink.progress(&line);
+            }
+        }
     }
 
     fn append(
@@ -277,6 +290,7 @@ impl Orchestrator {
             },
         )
         .map_err(AgentLoopOutcome::Ledger)?;
+        self.emit(false, format!("· [{}] turn {turn_no}", env.agent));
         let raw = match self.turn_raw(ctx, system, prompt) {
             Ok(r) => r,
             Err(e) => return Err(AgentLoopOutcome::ProviderFailed(e)),
@@ -381,6 +395,19 @@ impl Orchestrator {
                         .executor
                         .run_tool(ledger, run_id, agent.clone(), &args_json, &tool)
                         .map_err(executor_err)?;
+                    self.emit(
+                        !outcome.ok,
+                        format!(
+                            "工具 {}({:?}) {}",
+                            tool,
+                            outcome.risk,
+                            if outcome.ok {
+                                "完成"
+                            } else {
+                                "失败/被拒"
+                            }
+                        ),
+                    );
                     prompt = format!(
                         "tool `{tool}` result (ok={}):\n{}\n\n继续:返回下一个 JSON 动作。",
                         outcome.ok,
@@ -466,6 +493,7 @@ impl Orchestrator {
                 reason: None,
             },
         )?;
+        self.emit(true, format!("任务进入 Running(from {from:?})"));
 
         let coord_run = AgentRunId::generate();
         self.append(
@@ -476,6 +504,7 @@ impl Orchestrator {
                 role: AgentRole::Coordinator,
             },
         )?;
+        self.emit(false, "Coordinator 开始".into());
 
         if self.aborted() {
             return self.interrupt(ledger, &coord_run, "aborted before start");
@@ -628,6 +657,10 @@ impl Orchestrator {
             let ledger_snapshot_task_dir = task_dir.clone();
             let subtask = subtask.clone();
             let plan = plan.clone();
+            self.emit(
+                false,
+                format!("worker-{worker_no} 启动: {}", truncate(&subtask, 80)),
+            );
             worker_handles.push(std::thread::spawn(move || {
                 run_worker(
                     provider,
@@ -760,6 +793,19 @@ impl Orchestrator {
                         .executor
                         .run_tool(ledger, run_id, AgentRef::Coordinator, &args_json, &tool)
                         .map_err(executor_err)?;
+                    self.emit(
+                        !outcome.ok,
+                        format!(
+                            "工具 {}({:?}) {}",
+                            tool,
+                            outcome.risk,
+                            if outcome.ok {
+                                "完成"
+                            } else {
+                                "失败/被拒"
+                            }
+                        ),
+                    );
                     prompt = format!(
                         "tool `{tool}` result (ok={}):\n{}\n\n继续:返回下一个 JSON 动作。",
                         outcome.ok,
@@ -816,6 +862,7 @@ impl Orchestrator {
                         reason: None,
                     },
                 )?;
+                self.emit(true, "任务最终状态: Completed".into());
                 Ok(TaskStatus::Completed)
             }
             Err(AgentLoopOutcome::Aborted) => self.interrupt(ledger, coord_run, "aborted"),
@@ -959,6 +1006,7 @@ fn run_worker(
         abort,
         max_turns: 10,
         model,
+        progress: None,
     };
     let agent = AgentRef::Worker(worker_no);
     let run_id = AgentRunId::generate();
@@ -1201,6 +1249,7 @@ mod tests {
             abort: Arc::new(AtomicBool::new(false)),
             max_turns: 8,
             model: "mock".into(),
+            progress: None,
         };
         let status = orch.run_task(&ledger, "t").unwrap();
         assert_eq!(status, TaskStatus::Completed);
@@ -1337,6 +1386,7 @@ mod resume_ctx_tests {
             abort: Arc::new(AtomicBool::new(false)),
             max_turns: 8,
             model: "mock".into(),
+            progress: None,
         };
         let status = orch.run_task(&ledger, "t").unwrap();
         assert_eq!(status, TaskStatus::Completed);
@@ -1426,6 +1476,7 @@ mod brief_prompt_tests {
             abort: Arc::new(AtomicBool::new(false)),
             max_turns: 8,
             model: "mock".into(),
+            progress: None,
         };
         let status = orch.run_task(&ledger, "t").unwrap();
         assert_eq!(status, TaskStatus::Completed);
@@ -1440,6 +1491,52 @@ mod brief_prompt_tests {
         assert!(
             joined.contains("BRIEF") && joined.contains("slugify"),
             "规划 prompt 应包含 brief: {joined}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::approval::AutoApprove;
+    use crate::progress::{RecordingSink, SharedSink};
+    use crate::tools::builtin_registry;
+
+    #[test]
+    fn progress_reports_turns_tools_and_final_status() {
+        let dir = fixture_dir("progress");
+        let ledger = crashed_running_ledger(&dir);
+        let sink = Arc::new(RecordingSink::default());
+        let sink2: SharedSink = sink.clone();
+        let orch = Orchestrator {
+            provider: Arc::new(crate::provider::MockProvider::scripted(vec![msg("done")])),
+            executor: Arc::new(ToolExecutor::new(
+                &dir,
+                builtin_registry(),
+                Arc::new(AutoApprove),
+            )),
+            abort: Arc::new(AtomicBool::new(false)),
+            max_turns: 8,
+            model: "mock".into(),
+            progress: Some(sink2),
+        };
+        let status = orch.run_task(&ledger, "t").unwrap();
+        assert_eq!(status, TaskStatus::Completed);
+
+        let prog = sink.progress.lock().unwrap();
+        assert!(
+            prog.iter().any(|l| l.contains("turn 1")),
+            "应有 turn 进度: {prog:?}"
+        );
+        assert!(
+            prog.iter().any(|l| l.contains("Coordinator")),
+            "应有 Agent 进度: {prog:?}"
+        );
+        let imp = sink.important.lock().unwrap();
+        assert!(
+            imp.iter().any(|l| l.contains("任务最终状态: Completed")),
+            "应有最终状态: {imp:?}"
         );
     }
 }

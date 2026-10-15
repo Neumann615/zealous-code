@@ -114,11 +114,12 @@ fn e2e_real_binary_plan_write_approve_complete() {
         "init",
     ]);
 
-    // ---- mock endpoint:plan → read → write → message(spec 70 要求 read 步骤)----
+    // ---- mock endpoint:plan → read → git_diff → edit → message(spec 80)----
     let endpoint = mock_endpoint(vec![
-        r#"{"action":"plan","plan":"read README then create hello.txt","workers":[]}"#.into(),
+        r#"{"action":"plan","plan":"read README, diff, then edit it","workers":[]}"#.into(),
         r#"{"action":"tool","tool":"read_file","args":{"path":"README.md"}}"#.into(),
-        r#"{"action":"tool","tool":"write_file","args":{"path":"hello.txt","content":"hello from e2e"}}"#.into(),
+        r#"{"action":"tool","tool":"git_diff","args":{}}"#.into(),
+        r#"{"action":"tool","tool":"edit_file","args":{"path":"README.md","old_text":"fixture","new_text":"fixture edited"}}"#.into(),
         r#"{"action":"message","text":"e2e done"}"#.into(),
     ]);
 
@@ -165,20 +166,34 @@ fn e2e_real_binary_plan_write_approve_complete() {
         stdin.write_all(b"y\n").expect("write approval");
         stdin.flush().unwrap();
     }
+    // 取走管道,读线程读到 EOF(与 wait 并行,避免任何时序丢数据)
+    let mut stdout_pipe = child.stdout.take().expect("stdout");
+    let reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout_pipe.read_to_string(&mut s);
+        s
+    });
     let status = wait_exit(child, 30);
     assert!(status.success(), "task run exit: {status}");
+    let run_stdout = reader.join().unwrap();
+    // 默认模式输出轻量进度(spec 80 §5)
+    assert!(run_stdout.contains("turn"), "缺少 turn 进度: {run_stdout}");
+    assert!(
+        run_stdout.contains("工具 edit_file"),
+        "缺少工具进度: {run_stdout}"
+    );
 
     // ---- 断言:文件修改存在 ----
-    let hello = std::fs::read_to_string(repo.join("hello.txt")).unwrap();
-    assert_eq!(hello, "hello from e2e");
-    // 自动 commit 作为回退点(spec 60 §4)
+    let readme = std::fs::read_to_string(repo.join("README.md")).unwrap();
+    assert_eq!(readme, "fixture edited\n");
+    // 自动 commit 作为回退点(spec 80 §3)
     let log = Command::new("git")
         .args(["log", "--oneline"])
         .current_dir(&repo)
         .output()
         .unwrap();
     let log = String::from_utf8_lossy(&log.stdout);
-    assert!(log.contains("zealous: apply hello.txt"), "git log: {log}");
+    assert!(log.contains("zealous: edit README.md"), "git log: {log}");
 
     // ---- 断言:账本健康 + 事件链完整 + 密钥不落账 ----
     let ledger_path = repo
@@ -217,6 +232,26 @@ fn e2e_real_binary_plan_write_approve_complete() {
             .iter()
             .any(|e| e["type"] == "ToolCallRequested" && e["tool"] == "read_file"),
         "缺少 read_file 调用"
+    );
+    // spec 80:edit_file + 审批摘要含 exact old/new text
+    let approval = events
+        .iter()
+        .find(|e| e["type"] == "ApprovalRequested")
+        .expect("应有审批请求");
+    let summary = approval["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("fixture"),
+        "审批摘要缺 old text: {summary}"
+    );
+    assert!(
+        summary.contains("fixture edited"),
+        "审批摘要缺 new text: {summary}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "ToolCallRequested" && e["tool"] == "edit_file"),
+        "缺少 edit_file 调用"
     );
     let last = events.last().unwrap();
     assert_eq!(last["type"], "TaskStatusChanged");
