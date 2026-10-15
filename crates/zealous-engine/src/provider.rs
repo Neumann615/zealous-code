@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 单次模型调用的最小请求形态;多轮上下文由调用方拼接 messages。
@@ -180,15 +181,27 @@ impl RetryPolicy {
 pub struct OpenAiCompatProvider {
     config: ProviderConfig,
     retry: RetryPolicy,
+    /// 显式注入 NativeTls 连接器的 agent:ureq 2.12 仅启用 native-tls
+    /// feature(无 rustls)时,https 默认处理器直接拒绝请求,必须经
+    /// AgentBuilder::tls_connector 提供 TlsConnector。
+    agent: ureq::Agent,
     /// 实际发起的 HTTP 尝试次数(观测/测试用)
     pub attempts: std::sync::atomic::AtomicU32,
 }
 
 impl OpenAiCompatProvider {
     pub fn new(config: ProviderConfig) -> Self {
+        // Windows 上 native-tls 走 schannel,零额外编译依赖(不用 rustls/ring)
+        let tls: Arc<ureq::native_tls::TlsConnector> =
+            Arc::new(ureq::native_tls::TlsConnector::new().expect("init native TLS (schannel)"));
+        let agent = ureq::AgentBuilder::new()
+            .tls_connector(tls)
+            .timeout(config.timeout())
+            .build();
         Self {
             config,
             retry: RetryPolicy::default_policy(),
+            agent,
             attempts: std::sync::atomic::AtomicU32::new(0),
         }
     }
@@ -219,8 +232,9 @@ impl OpenAiCompatProvider {
         })
         .to_string();
 
-        let resp = ureq::post(&self.endpoint())
-            .timeout(self.config.timeout())
+        let resp = self
+            .agent
+            .post(&self.endpoint())
             .set("Authorization", &format!("Bearer {}", self.config.api_key))
             .set("Content-Type", "application/json")
             .send_string(&body)
