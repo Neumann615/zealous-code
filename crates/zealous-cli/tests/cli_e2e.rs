@@ -300,7 +300,7 @@ fn real_model_smoke() {
     };
     let mut new_cmd = Command::new(zealous);
     new_cmd
-        .args(["task", "new", "smoke: read README then create alpha.txt"])
+        .args(["task", "new", "smoke: 单一简单任务,不要创建 Worker,直接完成。先读取 README.md,然后创建 alpha.txt,其内容必须恰好等于 README.md 的第一行文字(仅这一行,不得包含 README 其余内容)。完成后用 message 汇报。"])
         .current_dir(&repo)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

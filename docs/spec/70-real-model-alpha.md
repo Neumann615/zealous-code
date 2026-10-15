@@ -17,6 +17,8 @@
   每个非法输出最多 2 次修复,耗尽后当前 AgentRun 以可解释原因 Failed。
 - Turn 语义:一次模型调用 = 一个 turn;TurnStarted/TurnCompleted 恰好成对,
   run 内 turn 编号单调递增(规划轮与 apply 轮接续,不跳号)。
+- Worker 规划策略:默认 0 Worker;仅存在独立可并行的只读分析子任务时才创建;
+  描述必须非空且互不重复(违反即解析失败进修复轮)。
 
 ## 2. 原生多消息上下文
 

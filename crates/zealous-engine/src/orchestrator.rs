@@ -124,13 +124,26 @@ fn parse_action_strict(raw: &str) -> Result<Action, String> {
                             arr.len()
                         ));
                     }
-                    arr.iter()
+                    let mut descs = arr
+                        .iter()
                         .map(|x| {
                             x.as_str()
                                 .map(String::from)
                                 .ok_or_else(|| "plan.workers 元素必须是字符串".into())
                         })
-                        .collect::<Result<Vec<String>, String>>()?
+                        .collect::<Result<Vec<String>, String>>()?;
+                    // spec 70:Worker 描述必须非空且互不重复——空泛/重复描述
+                    // 只会制造无意义成本,解析失败进修复轮让模型收敛
+                    for (i, d) in descs.iter().enumerate() {
+                        if d.trim().is_empty() {
+                            return Err(format!("plan.workers[{i}] 描述为空"));
+                        }
+                    }
+                    descs.sort();
+                    if descs.windows(2).any(|w| w[0] == w[1]) {
+                        return Err("plan.workers 存在重复子任务描述".into());
+                    }
+                    descs
                 }
             };
             Ok(Action::Plan { plan, workers })
@@ -170,6 +183,11 @@ const ACTION_SCHEMA: &str = r#"恰好输出一个 JSON 对象,三选一:
 {"action":"tool","tool":"<工具名>","args":{...}}
 {"action":"message","text":"<最终答复>"}
 禁止:说明文字、markdown 代码围栏外的内容、多个对象、未知字段。"#;
+
+/// Worker 规划策略(spec 70:简单任务默认 0 Worker,控制成本与延迟)
+const WORKER_POLICY: &str = "Worker 策略:默认不创建 Worker(workers 省略或为空)。\
+仅当存在彼此独立、可并行且值得并行的只读分析子任务时才创建 Worker;\
+每个 Worker 描述必须具体、非空且互不重复。";
 
 /// 修复轮 prompt:指出解析错误并附 schema(spec 70);原输出已保留在上下文
 fn repair_prompt(error: &str, raw: &str) -> String {
@@ -469,14 +487,15 @@ impl Orchestrator {
                 "{brief}\n\nTASK: {task_prompt}\n\n\
                  返回一个 JSON 动作。规划动作格式:\n\
                  {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
-                 workers 最多 3 个,只安排只读分析任务。注意:这是续跑,基于上方投影增量推进。"
+                 {WORKER_POLICY}
+                 注意:这是续跑,基于上方投影增量推进。"
             )
         } else {
             format!(
                 "TASK: {task_prompt}\n\n\
                  返回一个 JSON 动作。规划动作格式:\n\
                  {{\"action\":\"plan\",\"plan\":\"<步骤>\",\"workers\":[\"<worker 子任务>\", ...]}}\n\
-                 workers 最多 3 个,只安排只读分析任务。"
+                 {WORKER_POLICY}"
             )
         };
         // 工具契约由注册表生成(spec 60 §5),与实现天然一致
@@ -1338,5 +1357,31 @@ mod resume_ctx_tests {
             joined.contains("不必重复"),
             "缺少读操作免重复提示: {joined}"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_policy_tests {
+    use super::*;
+
+    #[test]
+    fn empty_worker_description_rejected() {
+        let err =
+            parse_action_strict(r#"{"action":"plan","plan":"p","workers":["  "]}"#).unwrap_err();
+        assert!(err.contains("描述为空"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_worker_descriptions_rejected() {
+        let err =
+            parse_action_strict(r#"{"action":"plan","plan":"p","workers":["read x","read x"]}"#)
+                .unwrap_err();
+        assert!(err.contains("重复"), "{err}");
+    }
+
+    #[test]
+    fn planning_prompt_states_worker_policy() {
+        assert!(WORKER_POLICY.contains("默认不创建 Worker"));
+        assert!(WORKER_POLICY.contains("互不重复"));
     }
 }
