@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+mod serve;
 mod tui;
 use zealous_core::{ApprovalDecision, TaskStatus};
 use zealous_engine::approval::ApprovalSink;
@@ -36,6 +37,8 @@ enum Cmd {
     },
     /// 可视化任务工作台(spec 90)
     Tui,
+    /// app-server:stdio JSON 协议(spec 100)
+    Serve,
     /// 配置检查(Git 仓库 / Provider 配置;不回显密钥)
     Config {
         #[command(subcommand)]
@@ -213,6 +216,10 @@ fn main() {
     let code = match cli.cmd {
         Cmd::Tui => match repo_root() {
             Ok(root) => tui::run_command(root),
+            Err(e) => err(e),
+        },
+        Cmd::Serve => match repo_root() {
+            Ok(root) => serve::run_command(root),
             Err(e) => err(e),
         },
         Cmd::Task { cmd } => match cmd {

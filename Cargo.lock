@@ -2283,6 +2283,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "ratatui",
+ "serde",
  "serde_json",
  "zealous-core",
  "zealous-engine",

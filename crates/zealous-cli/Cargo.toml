@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 zealous-core = { workspace = true }
 zealous-engine = { workspace = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 # TUI(spec 90):ratatui 只允许出现在 zealous-cli

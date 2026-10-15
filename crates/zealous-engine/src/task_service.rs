@@ -68,7 +68,7 @@ impl std::fmt::Debug for CreateOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TaskSummary {
     pub task_id: TaskId,
     pub title: String,
@@ -78,6 +78,7 @@ pub struct TaskSummary {
 /// 列表结果:(可用任务, 跳过的损坏账本及其原因)
 pub type TaskListing = (Vec<TaskSummary>, Vec<(TaskId, String)>);
 
+#[derive(Clone)]
 pub struct TaskService {
     repo_root: PathBuf,
 }
@@ -133,6 +134,55 @@ impl TaskService {
     /// 配置非法时不回滚:任务以 Failed 状态留档,原因可解释(spec 10)。
     pub fn create_task(&self, title: &str) -> Result<CreateOutcome, ServiceError> {
         self.create_task_with_brief(title, None)
+    }
+
+    /// brief 为文本(spec 100:app-server create_task 直接携带文本,
+    /// 客户端不允许自行写账本)
+    pub fn create_task_with_brief_text(
+        &self,
+        title: &str,
+        brief: Option<String>,
+    ) -> Result<CreateOutcome, ServiceError> {
+        if !Self::is_git_repo(&self.repo_root) {
+            return Err(ServiceError::NotGitRepo(self.repo_root.clone()));
+        }
+        let task_id = TaskId::generate();
+        let ledger = Ledger::create(&self.repo_root, &task_id)?;
+        ledger.append(
+            AgentRef::User,
+            EventPayload::TaskCreated {
+                title: title.to_string(),
+                repo_root: self.repo_root.display().to_string(),
+            },
+        )?;
+        if let Some(b) = &brief {
+            ledger.append(
+                AgentRef::User,
+                EventPayload::TaskBriefAttached { brief: b.clone() },
+            )?;
+        }
+        match ProviderConfig::resolve() {
+            Ok(_) => Ok(CreateOutcome::Ready { task_id, ledger }),
+            Err(e) => {
+                let reason = e.to_string();
+                ledger.append(
+                    AgentRef::User,
+                    EventPayload::TaskStatusChanged {
+                        from: TaskStatus::Queued,
+                        to: TaskStatus::Failed,
+                        reason: Some(reason.clone()),
+                    },
+                )?;
+                ledger.append(
+                    AgentRef::User,
+                    EventPayload::ErrorOccurred {
+                        scope: "provider".into(),
+                        message: reason.clone(),
+                    },
+                )?;
+                Ok(CreateOutcome::FailedAtCreation { task_id, reason })
+            }
+        }
     }
 
     /// 带 brief 的创建(spec 80 §1):brief 文件必须位于当前 Git 仓库内。

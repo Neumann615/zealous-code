@@ -11,7 +11,7 @@ use crate::ids::{AgentRunId, TaskId};
 use crate::transition::can_transition;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ToolCallState {
     /// 已请求,尚未判定(T0 直接执行 / T1+ 等审批)
     Requested,
@@ -23,7 +23,7 @@ pub enum ToolCallState {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ToolCallView {
     pub call_id: String,
     pub run_id: String,
@@ -33,7 +33,7 @@ pub struct ToolCallView {
     pub state: ToolCallState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RunView {
     pub run_id: String,
     pub role: AgentRole,
@@ -42,14 +42,14 @@ pub struct RunView {
     pub last_message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PendingApproval {
     pub call_id: String,
     pub summary: String,
 }
 
 /// Task 的完整投影:所有 UI/恢复判定只读这里,不读原始事件。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TaskProjection {
     pub task_id: TaskId,
     pub title: String,
