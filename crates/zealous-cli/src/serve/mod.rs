@@ -18,7 +18,7 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
     let (request_tx, request_rx) = mpsc::channel::<String>();
 
     // stdin 读取线程:逐行送入请求通道;EOF 时发送 None 语义(通道关闭)
-    let stdin_reader = std::thread::spawn(move || {
+    let _stdin_reader = std::thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             match line {
@@ -68,10 +68,11 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
                 if !write_line(&mut out, &json) {
                     return 1;
                 }
-                // shutdown:等待 worker 完成后退出
+                // shutdown:等待 worker(join),随后进程退出;
+                // stdin 读取线程是 IO 管道,随进程结束,不 join(否则
+                // 客户端不关 stdin 会永远挂起)
                 if resp.ok && line.contains("\"shutdown\"") {
                     session.worker_finished();
-                    let _ = stdin_reader.join();
                     return 0;
                 }
             }
