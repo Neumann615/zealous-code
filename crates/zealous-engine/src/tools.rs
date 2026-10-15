@@ -123,6 +123,43 @@ fn arg_str(raw: &str, key: &str) -> Result<String, ToolError> {
         .ok_or_else(|| ToolError::BadArgs(format!("missing string arg: {key}")))
 }
 
+fn args_object(raw: &str) -> Result<serde_json::Value, ToolError> {
+    serde_json::from_str(raw).map_err(|e| ToolError::BadArgs(format!("bad json: {e}")))
+}
+
+fn opt_str(raw: &str, key: &str) -> Result<Option<String>, ToolError> {
+    Ok(args_object(raw)?
+        .get(key)
+        .and_then(|x| x.as_str())
+        .map(String::from))
+}
+
+fn opt_u64(raw: &str, key: &str) -> Result<Option<u64>, ToolError> {
+    Ok(args_object(raw)?.get(key).and_then(|x| x.as_u64()))
+}
+
+fn opt_bool(raw: &str, key: &str) -> Result<Option<bool>, ToolError> {
+    Ok(args_object(raw)?.get(key).and_then(|x| x.as_bool()))
+}
+
+/// diff/长输出统一上限:64 KiB,超限按字符边界截断并显式标记(spec 80 §2)
+const GIT_OUTPUT_CAP: usize = 64 * 1024;
+
+fn cap_output(s: String) -> String {
+    if s.len() <= GIT_OUTPUT_CAP {
+        return s;
+    }
+    let mut cut = GIT_OUTPUT_CAP;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n[truncated: 输出超过 {} 字节,已截断]",
+        &s[..cut],
+        GIT_OUTPUT_CAP
+    )
+}
+
 // ---------- T0:read_file ----------
 
 struct ReadFile;
@@ -317,6 +354,98 @@ impl Tool for GitStatus {
         }
         Ok(ToolOutput {
             summary: String::from_utf8_lossy(&out.stdout).into(),
+        })
+    }
+}
+
+// ---------- T0:git_log ----------
+
+struct GitLog;
+
+impl Tool for GitLog {
+    fn name(&self) -> &'static str {
+        "git_log"
+    }
+    fn risk(&self) -> RiskTier {
+        RiskTier::T0
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"limit\": 20, \"path\": \"optional/path\"}"
+    }
+    fn description(&self) -> &'static str {
+        "查看提交历史(默认 20 条,上限 100,可限定路径)"
+    }
+    fn summarize(&self, raw_args: &str) -> String {
+        truncate_for_display(raw_args, 200)
+    }
+    fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        // spec 80 §2:默认 20 条,上限 100;可限定路径(仓库内守卫同其他工具)
+        let limit = opt_u64(raw_args, "limit")?.unwrap_or(20).clamp(1, 100);
+        let mut args = vec!["log".to_string(), "-n".to_string(), limit.to_string()];
+        if let Some(p) = opt_str(raw_args, "path")? {
+            let canon = resolve_in_repo(&ctx.repo_root, &p)?;
+            args.push("--".into());
+            args.push(rel_to_repo(&ctx.repo_root, &canon));
+        }
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&ctx.repo_root)
+            .output()
+            .map_err(|e| ToolError::Failed(format!("spawn git: {e}")))?;
+        if !out.status.success() {
+            return Err(ToolError::Failed(
+                String::from_utf8_lossy(&out.stderr).into(),
+            ));
+        }
+        Ok(ToolOutput {
+            summary: String::from_utf8_lossy(&out.stdout).into(),
+        })
+    }
+}
+
+// ---------- T0:git_diff ----------
+
+struct GitDiff;
+
+impl Tool for GitDiff {
+    fn name(&self) -> &'static str {
+        "git_diff"
+    }
+    fn risk(&self) -> RiskTier {
+        RiskTier::T0
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"path\": \"optional/path\", \"staged\": false}"
+    }
+    fn description(&self) -> &'static str {
+        "查看未提交改动(工作区或 staged),输出上限 64KiB"
+    }
+    fn summarize(&self, raw_args: &str) -> String {
+        truncate_for_display(raw_args, 200)
+    }
+    fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let staged = opt_bool(raw_args, "staged")?.unwrap_or(false);
+        let mut args = vec!["diff".to_string()];
+        if staged {
+            args.push("--staged".into());
+        }
+        if let Some(p) = opt_str(raw_args, "path")? {
+            let canon = resolve_in_repo(&ctx.repo_root, &p)?;
+            args.push("--".into());
+            args.push(rel_to_repo(&ctx.repo_root, &canon));
+        }
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&ctx.repo_root)
+            .output()
+            .map_err(|e| ToolError::Failed(format!("spawn git: {e}")))?;
+        if !out.status.success() {
+            return Err(ToolError::Failed(
+                String::from_utf8_lossy(&out.stderr).into(),
+            ));
+        }
+        Ok(ToolOutput {
+            summary: cap_output(String::from_utf8_lossy(&out.stdout).into()),
         })
     }
 }
@@ -552,6 +681,8 @@ pub fn builtin_registry() -> Vec<Box<dyn Tool>> {
         Box::new(ListDir),
         Box::new(SearchText),
         Box::new(GitStatus),
+        Box::new(GitLog),
+        Box::new(GitDiff),
         Box::new(WriteFile),
         Box::new(Shell),
     ]
@@ -818,5 +949,126 @@ mod apply_tx_tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&st.stdout).trim().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod git_tools_tests {
+    use super::*;
+
+    fn real_repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zealous-git-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+        };
+        run(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "line1\nline2\n").unwrap();
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "commit one",
+        ]);
+        std::fs::write(dir.join("a.txt"), "line1\nline2 changed\n").unwrap();
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "commit two",
+        ]);
+        std::fs::write(dir.join("a.txt"), "line1\nline2 changed again\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn git_log_default_limit_and_path() {
+        let dir = real_repo("log");
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        let out = GitLog.execute("{}", &ctx).unwrap();
+        assert!(out.summary.contains("commit two"));
+        assert!(out.summary.contains("commit one"));
+        // limit=1:只含最新提交,不含更早的
+        let out = GitLog.execute(r#"{"limit":1}"#, &ctx).unwrap();
+        assert!(out.summary.contains("commit two"));
+        assert!(!out.summary.contains("commit one"), "{}", out.summary);
+        // 越界路径拒绝
+        let err = GitLog
+            .execute(r#"{"path":"../outside"}"#, &ctx)
+            .unwrap_err();
+        assert!(matches!(err, ToolError::BadArgs(m) if m.contains("越界")));
+    }
+
+    #[test]
+    fn git_log_limit_clamped_to_100() {
+        let dir = real_repo("logcap");
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        // limit=99999 被 clamp 到 100(等价合法执行,不报错)
+        let out = GitLog.execute(r#"{"limit":99999}"#, &ctx).unwrap();
+        assert!(!out.summary.is_empty());
+    }
+
+    #[test]
+    fn git_diff_worktree_and_staged_and_truncation() {
+        let dir = real_repo("diff");
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        // 工作区 diff:未暂存改动可见
+        let out = GitDiff.execute("{}", &ctx).unwrap();
+        assert!(out.summary.contains("line2 changed"), "{}", out.summary);
+        // staged diff:未暂存时为空
+        let out = GitDiff.execute(r#"{"staged":true}"#, &ctx).unwrap();
+        assert!(out.summary.trim().is_empty(), "{}", out.summary);
+        // 暂存后可见
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let out = GitDiff.execute(r#"{"staged":true}"#, &ctx).unwrap();
+        assert!(out.summary.contains("line2 changed"));
+
+        // 截断标记:构造 >64KiB 的 diff(git diff 不含 untracked,改已跟踪文件)
+        let big = format!("{}\n", "x".repeat(80 * 1024));
+        let mut tracked = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+        tracked.push_str(&big);
+        std::fs::write(dir.join("a.txt"), tracked).unwrap();
+        let out = GitDiff.execute("{}", &ctx).unwrap();
+        assert!(out.summary.contains("[truncated"), "应显式标记截断");
+        assert!(out.summary.len() <= 64 * 1024 + 200);
+    }
+
+    #[test]
+    fn git_tools_registered_as_t0() {
+        let reg = builtin_registry();
+        assert_eq!(risk_of(&reg, "git_log"), Some(RiskTier::T0));
+        assert_eq!(risk_of(&reg, "git_diff"), Some(RiskTier::T0));
     }
 }
