@@ -117,9 +117,10 @@ pub struct Orchestrator {
     pub model: String,
 }
 
-/// 单 Agent 循环的上下文(内存中的对话转写;账本保存的是持久事实)
+/// 单 Agent 循环的上下文(内存中的对话转写;账本保存的是持久事实)。
+/// 多轮上下文原生传递给 Provider(spec 70),不再拼接进单个字符串。
 struct LoopCtx {
-    transcript: Vec<(String, String)>, // (role, content)
+    transcript: Vec<crate::provider::ChatMessage>,
 }
 
 impl Orchestrator {
@@ -143,21 +144,17 @@ impl Orchestrator {
         system: &str,
         user: &str,
     ) -> Result<Action, crate::provider::ProviderError> {
-        ctx.transcript.push(("user".into(), user.to_string()));
-        // 拼接完整对话为单 prompt(V1:OpenAI-compatible 多消息由 provider 层
-        // 以 system+user 两段表达;历史以文本转写折叠进 user 段)
-        let mut history = String::new();
-        for (role, content) in &ctx.transcript {
-            history.push_str(&format!("[{role}] {content}\n"));
-        }
+        ctx.transcript
+            .push(crate::provider::ChatMessage::user(user));
         let resp = self.provider.complete(
             &self.model,
             &crate::provider::ChatRequest {
                 system: Some(system.to_string()),
-                user: history,
+                messages: ctx.transcript.clone(),
             },
         )?;
-        ctx.transcript.push(("assistant".into(), resp.text.clone()));
+        ctx.transcript
+            .push(crate::provider::ChatMessage::assistant(resp.text.clone()));
         parse_action(&resp.text).map_err(|e| crate::provider::ProviderError::Rejected {
             status: 200,
             summary: format!(
@@ -432,8 +429,7 @@ impl Orchestrator {
             )
         };
         // 续用规划轮的转写,带上 plan 上下文
-        ctx.transcript.push((
-            "assistant".into(),
+        ctx.transcript.push(crate::provider::ChatMessage::assistant(
             serde_json::json!({"action":"plan","plan":plan}).to_string(),
         ));
         let run =

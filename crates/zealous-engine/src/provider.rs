@@ -9,11 +9,41 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 单次模型调用的最小请求形态;多轮上下文由调用方拼接 messages。
+/// 对话角色:V1 只需要 user/assistant(system 单独字段承载)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    User,
+    Assistant,
+}
+
+/// 一条历史消息(spec 70:多轮上下文原生传递,不再拼接进单个字符串)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        ChatMessage {
+            role: ChatRole::User,
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: content.into(),
+        }
+    }
+}
+
+/// 单次模型调用请求:system + 历史消息序列(顺序即语义)
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub system: Option<String>,
-    pub user: String,
+    pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,11 +250,18 @@ impl OpenAiCompatProvider {
     fn once(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // OpenAI 映射:system 在前,历史 user/assistant 按序透传(spec 70)
         let mut messages = Vec::new();
         if let Some(sys) = &req.system {
             messages.push(serde_json::json!({ "role": "system", "content": sys }));
         }
-        messages.push(serde_json::json!({ "role": "user", "content": req.user }));
+        for m in &req.messages {
+            let role = match m.role {
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+            };
+            messages.push(serde_json::json!({ "role": role, "content": m.content }));
+        }
 
         let body = serde_json::json!({
             "model": model,
@@ -321,11 +358,11 @@ struct ChatCompletionsResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    message: ApiResponseMessage,
 }
 
 #[derive(Deserialize)]
-struct ChatMessage {
+struct ApiResponseMessage {
     content: String,
 }
 
@@ -349,6 +386,8 @@ pub struct MockProvider {
     /// 每个元素:Ok(text) 或 Err(描述);耗尽后重复最后一项
     pub script: std::sync::Mutex<Vec<Result<String, String>>>,
     pub calls: std::sync::atomic::AtomicU32,
+    /// 收到的请求记录(断言上下文顺序/内容用)
+    pub prompts: std::sync::Mutex<Vec<ChatRequest>>,
 }
 
 impl MockProvider {
@@ -356,6 +395,7 @@ impl MockProvider {
         Self {
             script: std::sync::Mutex::new(vec![Ok(text.to_string())]),
             calls: Default::default(),
+            prompts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -363,14 +403,16 @@ impl MockProvider {
         Self {
             script: std::sync::Mutex::new(script),
             calls: Default::default(),
+            prompts: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
 
 impl Provider for MockProvider {
-    fn complete(&self, _model: &str, _req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+    fn complete(&self, _model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.prompts.lock().unwrap().push(req.clone());
         let mut script = self.script.lock().unwrap();
         let item = if script.is_empty() {
             return Err(ProviderError::Exhausted {
@@ -491,6 +533,67 @@ mod tests {
     }
 
     #[test]
+    fn openai_mapping_preserves_message_order() {
+        // spec 70:多轮上下文原生传递——system 在前,历史 user/assistant 按序透传
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(String::new()));
+        let captured2 = captured.clone();
+        let server = std::thread::spawn(move || loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut buf = [0u8; 16 * 1024];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+            // 取请求体(空行之后)
+            let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            *captured2.lock().unwrap() = body;
+            let resp = serde_json::json!({
+                "choices": [{ "message": { "content": "ok" } }]
+            })
+            .to_string();
+            let _ = stream.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", resp.len(), resp).as_bytes(),
+            );
+        });
+
+        let cfg = ProviderConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_key: "k".into(),
+            model: "m".into(),
+            timeout_secs: 5,
+            max_retries: 0,
+        };
+        let provider = OpenAiCompatProvider::new(cfg);
+        let req = ChatRequest {
+            system: Some("SYS".into()),
+            messages: vec![
+                ChatMessage::user("u1"),
+                ChatMessage::assistant("a1"),
+                ChatMessage::user("u2"),
+            ],
+        };
+        provider.complete("m", &req).unwrap();
+
+        let body = captured.lock().unwrap().clone();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "SYS");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "u1");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "a1");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"], "u2");
+        assert_eq!(v["model"], "m");
+        drop(server);
+    }
+
+    #[test]
     fn retries_on_5xx_then_succeeds_against_local_server() {
         let addr = shared_server();
         wait_listening(addr);
@@ -507,7 +610,7 @@ mod tests {
                 "m",
                 &ChatRequest {
                     system: None,
-                    user: "hi".into(),
+                    messages: vec![ChatMessage::user("hi")],
                 },
             )
             .unwrap();
@@ -534,7 +637,7 @@ mod tests {
                 "m",
                 &ChatRequest {
                     system: None,
-                    user: "hi".into(),
+                    messages: vec![ChatMessage::user("hi")],
                 },
             )
             .unwrap_err();
@@ -553,7 +656,7 @@ mod tests {
                 "m",
                 &ChatRequest {
                     system: None,
-                    user: "u".into(),
+                    messages: vec![ChatMessage::user("u")],
                 },
             )
             .unwrap();
@@ -563,7 +666,7 @@ mod tests {
                 "m",
                 &ChatRequest {
                     system: None,
-                    user: "u".into()
+                    messages: vec![ChatMessage::user("u")]
                 }
             )
             .is_err());
@@ -573,7 +676,7 @@ mod tests {
                 "m",
                 &ChatRequest {
                     system: None,
-                    user: "u".into()
+                    messages: vec![ChatMessage::user("u")]
                 }
             )
             .is_err());
