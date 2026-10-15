@@ -354,8 +354,14 @@ impl Tool for WriteFile {
 
 /// 把刚写入的文件作为独立回退点提交;作者署名 zealous,与用户提交区分
 fn commit_applied(repo_root: &Path, file: &Path) -> Result<(), ToolError> {
+    // file 是 canonicalize 产物(Windows 带 \\?\ 前缀),须对规范化后的根
+    // 求 strip_prefix 才能得到干净的相对路径
+    let canon_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
     let rel = file
-        .strip_prefix(repo_root)
+        .strip_prefix(&canon_root)
+        .or_else(|_| file.strip_prefix(repo_root))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| file.display().to_string());
     let add = std::process::Command::new("git")
