@@ -167,7 +167,39 @@ fn svc() -> Result<TaskService, String> {
     Ok(TaskService::new(repo_root()?))
 }
 
+/// 加载当前目录下的 `.env`(存在时):KEY=VALUE,已存在的进程环境变量
+/// 优先、不被覆盖。密钥因此可放在项目根且不入库(.gitignore 已忽略 .env)。
+fn load_dotenv() {
+    let Ok(text) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            continue;
+        }
+        let mut v = v.trim();
+        if v.len() >= 2
+            && ((v.starts_with('"') && v.ends_with('"'))
+                || (v.starts_with('\'') && v.ends_with('\'')))
+        {
+            v = &v[1..v.len() - 1];
+        }
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
+    }
+}
+
 fn main() {
+    load_dotenv();
     let cli = Cli::parse();
     let code = match cli.cmd {
         Cmd::Task { cmd } => match cmd {

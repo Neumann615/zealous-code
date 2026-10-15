@@ -39,7 +39,7 @@ docs/spec/            # 本目录,先于代码修订
 
 ## CLI 命令面(V1,已实现)
 
-均在 Git 仓库根目录执行;Provider 配置来自 env(`ZEALOUS_BASE_URL/API_KEY/MODEL`)> `~/.zealous/config.json`。
+均在 Git 仓库根目录执行;Provider 配置来源优先级:进程 env(`ZEALOUS_BASE_URL/API_KEY/MODEL`)> 当前目录 `.env`(gitignore 忽略)> `~/.zealous/config.json`。
 
 | 命令 | 行为 |
 | ---- | ---- |
