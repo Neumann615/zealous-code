@@ -50,6 +50,12 @@ pub struct TuiState {
     pub progress_lines: Vec<String>,
     pub important_lines: Vec<String>,
     pub pending_approval: Option<ApprovalRequestUi>,
+    /// 审批弹窗滚动位置与总行数(总行数由渲染层按换行宽度写入)
+    pub approval_scroll: usize,
+    pub approval_total_lines: usize,
+    /// 事件流滚动位置与总行数
+    pub events_scroll: usize,
+    pub events_total_lines: usize,
     pub last_status: Option<TaskStatus>,
     pub error: Option<String>,
     pub form: NewTaskForm,
@@ -77,6 +83,10 @@ impl TuiState {
             progress_lines: Vec::new(),
             important_lines: Vec::new(),
             pending_approval: None,
+            approval_scroll: 0,
+            approval_total_lines: 0,
+            events_scroll: 0,
+            events_total_lines: 0,
             last_status: None,
             error: None,
             form: NewTaskForm::default(),
@@ -139,11 +149,52 @@ impl TuiState {
 
     pub fn approval_arrived(&mut self, req: ApprovalRequestUi) {
         self.pending_approval = Some(req);
+        self.approval_scroll = 0;
+        self.approval_total_lines = 0;
     }
 
     /// 取走当前待决审批(a/d 决策后由调用方发送决策)
     pub fn take_pending_approval(&mut self) -> Option<ApprovalRequestUi> {
         self.pending_approval.take()
+    }
+
+    // ---- 滚动(spec 90 收口:审批内容必须能完整查看)----
+
+    pub fn set_approval_total(&mut self, total: usize) {
+        self.approval_total_lines = total;
+        if self.approval_scroll > total.saturating_sub(1) {
+            self.approval_scroll = total.saturating_sub(1);
+        }
+    }
+
+    pub fn approval_scroll_down(&mut self, page: usize) {
+        let max = self.approval_total_lines.saturating_sub(1);
+        self.approval_scroll = (self.approval_scroll + page).min(max);
+    }
+
+    pub fn approval_scroll_up(&mut self, page: usize) {
+        self.approval_scroll = self.approval_scroll.saturating_sub(page);
+    }
+
+    /// 是否已滚动到末尾(配合可见行数判断;不到末尾不得提示"已完整查看")
+    pub fn approval_at_end(&self, visible: usize) -> bool {
+        self.approval_scroll + visible >= self.approval_total_lines
+    }
+
+    pub fn set_events_total(&mut self, total: usize) {
+        self.events_total_lines = total;
+        if self.events_scroll > total.saturating_sub(1) {
+            self.events_scroll = total.saturating_sub(1);
+        }
+    }
+
+    pub fn events_scroll_down(&mut self, page: usize) {
+        let max = self.events_total_lines.saturating_sub(1);
+        self.events_scroll = (self.events_scroll + page).min(max);
+    }
+
+    pub fn events_scroll_up(&mut self, page: usize) {
+        self.events_scroll = self.events_scroll.saturating_sub(page);
     }
 
     // ---- 表单 ----
@@ -334,5 +385,57 @@ mod tests {
         assert_eq!(s.error.as_deref(), Some("boom"));
         s.dismiss_error();
         assert!(s.error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn approval_scroll_clamps_and_reports_end() {
+        let mut s = TuiState::new();
+        s.approval_arrived(ApprovalRequestUi {
+            call_id: "c".into(),
+            summary: "x".into(),
+        });
+        s.set_approval_total(10);
+        assert!(s.approval_at_end(10), "一屏能放下时默认即到末尾");
+        s.approval_scroll_down(3);
+        assert_eq!(s.approval_scroll, 3);
+        assert!(!s.approval_at_end(5), "3+5 < 10,不应到末尾");
+        s.approval_scroll_down(5);
+        assert!(s.approval_at_end(5), "8+5 >= 10,已到末尾");
+        s.approval_scroll_up(10);
+        assert_eq!(s.approval_scroll, 0);
+        s.approval_scroll_down(999);
+        assert_eq!(s.approval_scroll, 9, "向下滚动应钳制在末行");
+        assert!(s.approval_at_end(2));
+    }
+
+    #[test]
+    fn approval_arrived_resets_scroll() {
+        let mut s = TuiState::new();
+        s.approval_arrived(ApprovalRequestUi {
+            call_id: "1".into(),
+            summary: "a".into(),
+        });
+        s.set_approval_total(5);
+        s.approval_scroll_down(4);
+        s.approval_arrived(ApprovalRequestUi {
+            call_id: "2".into(),
+            summary: "b".into(),
+        });
+        assert_eq!(s.approval_scroll, 0, "新审批应从头查看");
+    }
+
+    #[test]
+    fn events_scroll_clamps() {
+        let mut s = TuiState::new();
+        s.set_events_total(20);
+        s.events_scroll_down(25);
+        assert_eq!(s.events_scroll, 19);
+        s.events_scroll_up(5);
+        assert_eq!(s.events_scroll, 14);
     }
 }

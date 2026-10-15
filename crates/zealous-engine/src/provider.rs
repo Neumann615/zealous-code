@@ -77,8 +77,10 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-/// 解析后的配置。`Display` 刻意不输出 key。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 解析后的配置。`Display` 与 `Debug` 都刻意不输出 api_key
+/// (spec 10/70:任何失败输出不得含凭据;derive(Debug) 曾把 key 打进
+/// 测试 panic 消息,已改为手动实现)。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
@@ -89,6 +91,19 @@ pub struct ProviderConfig {
     /// 网络错误/5xx/429 的重试次数(默认 3,spec 10)
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+}
+
+/// Debug 脱敏:api_key 只显示长度
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key_len", &self.api_key.len())
+            .field("model", &self.model)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
 }
 
 fn default_timeout_secs() -> u64 {
@@ -102,7 +117,13 @@ impl ProviderConfig {
     /// 解析优先级(spec 10,代码内固定):环境变量 > 用户配置文件。
     /// 配置文件:`~/.zealous/config.json`
     pub fn resolve() -> Result<Self, ProviderError> {
-        let from_file = Self::from_config_file();
+        Self::resolve_from(Self::config_path())
+    }
+
+    /// 测试/嵌入用法:显式指定配置文件路径(None = 无配置文件),
+    /// 使测试不依赖本机真实配置(否则全局配置存在时"无配置"分支不可测)。
+    pub(crate) fn resolve_from(file: Option<PathBuf>) -> Result<Self, ProviderError> {
+        let from_file = file.and_then(Self::read_config_file);
         let pick = |env_key: &str, file_val: Option<String>| -> Option<String> {
             std::env::var(env_key)
                 .ok()
@@ -143,8 +164,7 @@ impl ProviderConfig {
         dirs_home().map(|h| h.join(".zealous").join("config.json"))
     }
 
-    fn from_config_file() -> Option<Self> {
-        let path = Self::config_path()?;
+    fn read_config_file(path: PathBuf) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
     }
@@ -506,7 +526,7 @@ mod tests {
 
     #[test]
     fn config_resolution_env_overrides_file_and_validates() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 无配置 → Invalid(可解释)
         for k in [
             "ZEALOUS_BASE_URL",
@@ -517,14 +537,15 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
-        let err = ProviderConfig::resolve().unwrap_err();
+        // resolve_from(None) 隔离本机真实 ~/.zealous/config.json
+        let err = ProviderConfig::resolve_from(None).unwrap_err();
         assert!(matches!(err, ProviderError::Invalid(_)));
 
-        // env 齐全 → 成功
-        std::env::set_var("ZEALOUS_BASE_URL", "https://api.example.com/v1");
+        // env 齐全 → 成功(与配置文件无关)
+        std::env::set_var("ZEALOUS_BASE_URL", "https://api.example.invalid/v1");
         std::env::set_var("ZEALOUS_API_KEY", "test-key");
         std::env::set_var("ZEALOUS_MODEL", "test-model");
-        let cfg = ProviderConfig::resolve().unwrap();
+        let cfg = ProviderConfig::resolve_from(None).unwrap();
         assert_eq!(cfg.model, "test-model");
         assert_eq!(cfg.max_retries, 3);
         for k in ["ZEALOUS_BASE_URL", "ZEALOUS_API_KEY", "ZEALOUS_MODEL"] {

@@ -33,7 +33,7 @@ fn task_id_short(id: &zealous_core::TaskId) -> String {
 }
 
 /// 主渲染:左列表 / 右详情 + 底部帮助;弹窗叠加
-pub fn render(f: &mut Frame, state: &TuiState) {
+pub fn render(f: &mut Frame, state: &mut TuiState) {
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
     let cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(chunks[0]);
@@ -117,20 +117,40 @@ fn projection_lines(state: &TuiState, full: bool) -> Vec<Line<'static>> {
         )));
     }
     if full && state.events_expanded {
-        lines.push(Line::from("--- 最近事件 ---"));
-        let take = 15;
-        for e in state.detail_events.iter().rev().take(take).rev() {
+        lines.push(Line::from("--- 事件流(↑/↓ 滚动) ---"));
+        let all: Vec<String> = state
+            .detail_events
+            .iter()
+            .map(|e| {
+                format!(
+                    "  {:>3} {}",
+                    e.seq,
+                    serde_json::to_string(&e.payload).unwrap_or_default()
+                )
+            })
+            .collect();
+        let total = all.len();
+        if total == 0 {
+            lines.push(Line::from("  (无事件)"));
+        } else {
+            let visible = 8usize;
+            let start = state.events_scroll.min(total.saturating_sub(1));
+            let end = (start + visible).min(total);
+            for l in &all[start..end] {
+                lines.push(Line::from(l.clone()));
+            }
             lines.push(Line::from(format!(
-                "  {:>3} {}",
-                e.seq,
-                serde_json::to_string(&e.payload).unwrap_or_default()
+                "  [事件 {}-{}/{}]",
+                start + 1,
+                end,
+                total
             )));
         }
     }
     lines
 }
 
-fn render_detail_summary(f: &mut Frame, area: Rect, state: &TuiState) {
+fn render_detail_summary(f: &mut Frame, area: Rect, state: &mut TuiState) {
     f.render_widget(
         Paragraph::new(projection_lines(state, false))
             .wrap(Wrap { trim: false })
@@ -139,7 +159,9 @@ fn render_detail_summary(f: &mut Frame, area: Rect, state: &TuiState) {
     );
 }
 
-fn render_detail_full(f: &mut Frame, area: Rect, state: &TuiState) {
+fn render_detail_full(f: &mut Frame, area: Rect, state: &mut TuiState) {
+    // 事件流总行数供滚动钳制(渲染层测量,UI-only 状态)
+    state.set_events_total(state.detail_events.len());
     let mut lines = projection_lines(state, true);
     if state.screen == Screen::Detail {
         lines.push(Line::from(format!(
@@ -200,23 +222,49 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     .split(v[1])[1]
 }
 
-fn render_approval_modal(f: &mut Frame, state: &TuiState) {
-    let Some(req) = &state.pending_approval else {
+fn render_approval_modal(f: &mut Frame, state: &mut TuiState) {
+    let Some(req) = state.pending_approval.clone() else {
         return;
     };
     let area = centered_rect(70, 50, f.area());
     f.render_widget(Clear, area);
-    let text = vec![
-        Line::from(format!("审批请求 {}", req.call_id)),
+    // 内容区:标题 1 行 + 摘要滚动窗口 + 位置指示 1 行 + 键位 1 行
+    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    let visible = inner.height.saturating_sub(3) as usize;
+    const CONTENT_WIDTH: usize = 62;
+    let summary_lines = wrap_lines(&req.summary, CONTENT_WIDTH);
+    let total = summary_lines.len();
+    state.set_approval_total(total);
+    let scroll = state.approval_scroll.min(total.saturating_sub(1));
+    let start = scroll.min(total);
+    let end = (scroll + visible).min(total);
+    let window: Vec<Line<'static>> = summary_lines[start..end]
+        .iter()
+        .map(|l| Line::from(l.clone()))
+        .collect();
+
+    let at_end = state.approval_at_end(visible);
+    let pos = if at_end {
+        Line::from(Span::styled(
+            format!("滚动 {}/{}(已完整查看)", end, total),
+            Style::default().green(),
+        ))
+    } else {
+        Line::from(format!(
+            "滚动 {}/{} 行 —— 审批前请滚动到末尾确认全部内容(↑/↓ 或 PgUp/PgDn)",
+            end, total
+        ))
+    };
+    let mut text = vec![
+        Line::from(format!("审批请求 {}(下方为将执行的完整内容)", req.call_id)),
         Line::from(""),
-        Line::from(req.summary.clone()),
-        Line::from(""),
-        Line::from("a 批准 · d 拒绝 · x 中断任务"),
     ];
+    text.extend(window);
+    text.push(pos);
+    text.push(Line::from("a 批准 · d 拒绝 · x 中断任务"));
+
     f.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(Block::new().borders(Borders::ALL).title("审批").bold()),
+        Paragraph::new(text).block(Block::new().borders(Borders::ALL).title("审批").bold()),
         area,
     );
 }
@@ -251,6 +299,32 @@ fn render_form_modal(f: &mut Frame, state: &TuiState) {
     );
 }
 
+/// 按显示宽度把文本折行(CJK 每字符占一格),返回总行数;
+/// 弹窗/事件流的"总行数"由本函数与渲染使用同一实现,保证一致
+fn wrap_lines(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for c in para.chars() {
+            cur.push(c);
+            if cur.chars().count() >= width {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -267,12 +341,12 @@ pub(crate) mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    pub(crate) fn render_to_string(state: &TuiState) -> String {
+    pub(crate) fn render_to_string(state: &mut TuiState) -> String {
         render_rows(state).join("")
     }
 
     /// 按 buffer 行切块并去除空格(CJK 每字符占一格,join 后字间出现空格)
-    fn render_rows(state: &TuiState) -> Vec<String> {
+    fn render_rows(state: &mut TuiState) -> Vec<String> {
         const WIDTH: u16 = 100;
         let backend = TestBackend::new(WIDTH, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -302,7 +376,7 @@ pub(crate) mod tests {
     fn empty_task_list_renders_placeholder() {
         let mut s = TuiState::new();
         s.refresh_tasks(vec![]);
-        let text = render_to_string(&s);
+        let text = render_to_string(&mut s);
         assert!(text.contains("(无任务)"), "{text}");
     }
 
@@ -313,12 +387,12 @@ pub(crate) mod tests {
             summary("task_aaa", zealous_core::TaskStatus::Queued, "first"),
             summary("task_bbb", zealous_core::TaskStatus::Running, "second"),
         ]);
-        let text = render_to_string(&s);
+        let text = render_to_string(&mut s);
         assert!(text.contains("first"));
         assert!(text.contains("second"));
         assert!(text.contains("Running"));
         // 选中态:所在行以 > 开头(去空格后)
-        let row = render_rows(&s)
+        let row = render_rows(&mut s)
             .into_iter()
             .find(|r| r.contains("first"))
             .expect("first row");
@@ -361,7 +435,7 @@ pub(crate) mod tests {
         };
         s.set_detail(proj, vec![]);
         s.screen = Screen::Detail;
-        let text = render_to_string(&s);
+        let text = render_to_string(&mut s);
         // 去空格比较(CJK 渲染占格)
         let strip = |t: &str| t.replace(' ', "");
         for needle in ["brokentask", "brieftext", "step1", "shell", "验证失败"] {
@@ -377,7 +451,7 @@ pub(crate) mod tests {
             summary: "write_file 新建文件: out.txt\n--- 完整新内容 ---\nbody".into(),
         });
         // 去空格比较(CJK 渲染占格)
-        let text = render_to_string(&s).replace(' ', "");
+        let text = render_to_string(&mut s).replace(' ', "");
         assert!(text.contains("call_9"), "{text}");
         assert!(text.contains("out.txt"), "{text}");
         assert!(text.contains("body"), "{text}");
@@ -393,7 +467,7 @@ pub(crate) mod tests {
             "visible",
         )]);
         s.set_error("配置无效".into());
-        let text = render_to_string(&s);
+        let text = render_to_string(&mut s);
         assert!(text.contains("配置无效"), "错误应显示: {text}");
         assert!(text.contains("visible"), "错误不应遮蔽任务列表: {text}");
     }

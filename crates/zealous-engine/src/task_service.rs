@@ -305,8 +305,13 @@ mod tests {
 
     #[test]
     fn invalid_provider_config_fails_task_with_explainable_reason() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_zealous_env();
+        // 显式非法值(env 优先级高于 ~/.zealous/config.json,保证与
+        // 本机全局配置解耦的确定性;spec 10 优先级)
+        std::env::set_var("ZEALOUS_BASE_URL", "notaurl");
+        std::env::set_var("ZEALOUS_API_KEY", "k");
+        std::env::set_var("ZEALOUS_MODEL", "m");
         let repo = git_repo_fixture();
         let svc = TaskService::new(&repo);
         let outcome = svc.create_task("build feature").unwrap();
@@ -327,7 +332,7 @@ mod tests {
 
     #[test]
     fn valid_config_creates_ready_task_and_lists_it() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ZEALOUS_BASE_URL", "https://api.example.com/v1");
         std::env::set_var("ZEALOUS_API_KEY", "k");
         std::env::set_var("ZEALOUS_MODEL", "m");

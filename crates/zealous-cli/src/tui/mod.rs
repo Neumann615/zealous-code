@@ -73,6 +73,13 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
 
     let mut state = TuiState::new();
     state.refresh_tasks(list_tasks(&svc));
+    // 启动校验(spec 90 收口):Provider 配置错误进错误弹窗,
+    // 不阻塞浏览既有任务;运行 R 时会再次解析并失败
+    if let Err(e) = zealous_engine::provider::ProviderConfig::resolve() {
+        state.set_error(format!(
+            "provider 配置无效: {e}(运行任务会失败;请修 .env 或 ~/.zealous/config.json)"
+        ));
+    }
 
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = match Terminal::new(backend) {
@@ -101,7 +108,7 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
         }
 
         // 3) 绘制
-        let _ = terminal.draw(|f| views::render(f, &state));
+        let _ = terminal.draw(|f| views::render(f, &mut state));
 
         // 4) 退出判定:已请求退出且 engine 不再运行
         if state.quit && !state.running {
@@ -135,6 +142,23 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
 
 fn list_tasks(svc: &TaskService) -> Vec<zealous_engine::task_service::TaskSummary> {
     svc.list_tasks().map(|(items, _)| items).unwrap_or_default()
+}
+
+/// 滚动路由:审批弹窗优先,其次已展开的事件流
+fn scroll_view(state: &mut TuiState, page: usize, down: bool) {
+    if state.pending_approval.is_some() {
+        if down {
+            state.approval_scroll_down(page);
+        } else {
+            state.approval_scroll_up(page);
+        }
+    } else if state.events_expanded {
+        if down {
+            state.events_scroll_down(page);
+        } else {
+            state.events_scroll_up(page);
+        }
+    }
 }
 
 /// engine 事件 → TUI 状态的应用逻辑(spec 90:控制器与渲染分离,
@@ -247,6 +271,11 @@ fn handle_key(
             }
             KeyCode::Esc => state.screen = Screen::List,
             KeyCode::Char('e') => state.toggle_events(),
+            // 滚动:审批弹窗优先,其次事件流(spec 90 收口)
+            KeyCode::Up => scroll_view(state, 1, false),
+            KeyCode::PageUp => scroll_view(state, 10, false),
+            KeyCode::Down => scroll_view(state, 1, true),
+            KeyCode::PageDown => scroll_view(state, 10, true),
             KeyCode::Char('x') => {
                 state.request_abort();
                 abort.store(true, Ordering::Relaxed);
