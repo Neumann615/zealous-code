@@ -44,67 +44,147 @@ impl From<crate::ledger::LedgerError> for OrchestratorError {
 }
 
 /// 模型动作解析结果
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     Plan { plan: String, workers: Vec<String> },
     Tool { tool: String, args_json: String },
     Message { text: String },
 }
 
-fn parse_action(text: &str) -> Result<Action, String> {
-    // 容忍模型输出中夹杂说明文字:取第一个 { 到最后一个 } 之间的 JSON
-    let (start, end) = (
-        text.find('{').ok_or("no json object")?,
-        text.rfind('}').ok_or("no json object")?,
-    );
-    if start >= end {
-        return Err("empty json".into());
+/// 非法模型输出的最大修复轮数(spec 70):首轮 + 2 次修复 = 最多 3 次调用
+pub const MAX_ACTION_REPAIRS: u32 = 2;
+
+/// 从原始输出提取 JSON 文本:接受裸 JSON(整体恰为一个 object)或
+/// 单个 markdown fenced JSON block;夹带说明文字/多个对象一律拒绝(spec 70)。
+fn extract_json_block(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        let rest = rest.trim_start_matches(['\r', '\n']);
+        let end = rest.rfind("```").ok_or("fenced block 未闭合")?;
+        let body = rest[..end].trim();
+        let after = rest[end + 3..].trim();
+        if !after.is_empty() {
+            return Err("fenced block 之后存在多余内容(疑似多个输出)".into());
+        }
+        if body.contains("```") {
+            return Err("存在多个 fenced block".into());
+        }
+        if body.is_empty() {
+            return Err("fenced block 为空".into());
+        }
+        return Ok(body.to_string());
     }
+    if !trimmed.starts_with('{') {
+        return Err("输出不是 JSON 对象:裸 JSON 必须整体恰为一个 object,禁止夹杂说明文字".into());
+    }
+    if !trimmed.ends_with('}') {
+        return Err("输出末尾不是 '}':可能存在多个对象或说明文字".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn require_keys(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    for k in obj.keys() {
+        if !allowed.contains(&k.as_str()) {
+            return Err(format!("未知字段: {k}(允许的字段: {allowed:?})"));
+        }
+    }
+    Ok(())
+}
+
+/// 严格解析(spec 70):必填字段齐全、类型合法、workers ≤ 3、未知字段拒绝
+fn parse_action_strict(raw: &str) -> Result<Action, String> {
+    let body = extract_json_block(raw)?;
     let v: serde_json::Value =
-        serde_json::from_str(&text[start..=end]).map_err(|e| format!("bad json: {e}"))?;
-    let action = v
+        serde_json::from_str(&body).map_err(|e| format!("json 解析失败: {e}"))?;
+    let obj = v.as_object().ok_or("顶层必须是 JSON object")?;
+    let action = obj
         .get("action")
         .and_then(|a| a.as_str())
-        .ok_or("missing action")?
-        .to_string();
-    match action.as_str() {
-        "message" => Ok(Action::Message {
-            text: v
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        }),
-        "tool" => Ok(Action::Tool {
-            tool: v
-                .get("tool")
-                .and_then(|t| t.as_str())
-                .ok_or("tool action missing tool")?
-                .to_string(),
-            args_json: v
-                .get("args")
-                .map(|a| a.to_string())
-                .unwrap_or_else(|| "{}".into()),
-        }),
+        .ok_or("缺少 action 字段(必须是字符串)")?;
+    match action {
         "plan" => {
-            let plan = v
+            require_keys(obj, &["action", "plan", "workers"])?;
+            let plan = obj
                 .get("plan")
                 .and_then(|p| p.as_str())
-                .unwrap_or_default()
+                .ok_or("plan.plan 必须是字符串")?
                 .to_string();
-            let workers = v
-                .get("workers")
-                .and_then(|w| w.as_array())
-                .map(|arr| {
+            let workers = match obj.get("workers") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(w) => {
+                    let arr = w.as_array().ok_or("plan.workers 必须是字符串数组")?;
+                    if arr.len() > MAX_WORKERS as usize {
+                        return Err(format!(
+                            "plan.workers 数量 {} 超过上限 {MAX_WORKERS}",
+                            arr.len()
+                        ));
+                    }
                     arr.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .take(MAX_WORKERS as usize)
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .map(|x| {
+                            x.as_str()
+                                .map(String::from)
+                                .ok_or_else(|| "plan.workers 元素必须是字符串".into())
+                        })
+                        .collect::<Result<Vec<String>, String>>()?
+                }
+            };
             Ok(Action::Plan { plan, workers })
         }
-        other => Err(format!("unknown action: {other}")),
+        "tool" => {
+            require_keys(obj, &["action", "tool", "args"])?;
+            let tool = obj
+                .get("tool")
+                .and_then(|t| t.as_str())
+                .ok_or("tool.tool 必须是字符串")?
+                .to_string();
+            let args = obj.get("args").ok_or("缺少 tool.args")?;
+            if !args.is_object() {
+                return Err("tool.args 必须是 object".into());
+            }
+            Ok(Action::Tool {
+                tool,
+                args_json: args.to_string(),
+            })
+        }
+        "message" => {
+            require_keys(obj, &["action", "text"])?;
+            let text = obj
+                .get("text")
+                .and_then(|t| t.as_str())
+                .ok_or("message.text 必须是字符串")?
+                .to_string();
+            Ok(Action::Message { text })
+        }
+        other => Err(format!("未知 action: {other}(允许: plan / tool / message)")),
     }
+}
+
+/// action schema 提示(修复轮附给模型)
+const ACTION_SCHEMA: &str = r#"恰好输出一个 JSON 对象,三选一:
+{"action":"plan","plan":"<步骤>","workers":["<子任务>", ...]}
+{"action":"tool","tool":"<工具名>","args":{...}}
+{"action":"message","text":"<最终答复>"}
+禁止:说明文字、markdown 代码围栏外的内容、多个对象、未知字段。"#;
+
+/// 修复轮 prompt:指出解析错误并附 schema(spec 70);原输出已保留在上下文
+fn repair_prompt(error: &str, raw: &str) -> String {
+    format!(
+        "你上一轮的输出不是合法 action JSON。\n解析错误:{error}\n原始输出(截断):{}\n\n{}",
+        truncate(raw, 300),
+        ACTION_SCHEMA
+    )
+}
+
+/// turn_action 的固定环境参数(账本 + 当前 Run 标识 + 事件主体)
+struct TurnEnv<'a> {
+    ledger: &'a Ledger,
+    run_id: &'a AgentRunId,
+    agent: &'a AgentRef,
 }
 
 pub struct Orchestrator {
@@ -137,13 +217,13 @@ impl Orchestrator {
         ledger.append(agent, payload)
     }
 
-    /// 单轮模型调用:返回动作;Provider 失败返回 Err(已可解释)
-    fn turn(
+    /// 单轮模型调用:返回原始输出(已进转写);解析与修复由调用方处理
+    fn turn_raw(
         &self,
         ctx: &mut LoopCtx,
         system: &str,
         user: &str,
-    ) -> Result<Action, crate::provider::ProviderError> {
+    ) -> Result<String, crate::provider::ProviderError> {
         ctx.transcript
             .push(crate::provider::ChatMessage::user(user));
         let resp = self.provider.complete(
@@ -155,17 +235,53 @@ impl Orchestrator {
         )?;
         ctx.transcript
             .push(crate::provider::ChatMessage::assistant(resp.text.clone()));
-        parse_action(&resp.text).map_err(|e| crate::provider::ProviderError::Rejected {
-            status: 200,
-            summary: format!(
-                "model returned unparseable action: {e}; raw: {}",
-                truncate(&resp.text, 200)
-            ),
+        Ok(resp.text)
+    }
+
+    /// 单轮模型调用 + 严格解析(spec 70)。
+    /// TurnStarted 在此落账;TurnCompleted 一律由调用方统一落账(恰好一次,
+    /// 包括修复轮路径)。解析失败:ErrorOccurred(model_action) 落账后返回
+    /// `NeedsRepair`;重试与超限由调用方裁决。
+    fn turn_action(
+        &self,
+        env: &TurnEnv<'_>,
+        ctx: &mut LoopCtx,
+        system: &str,
+        prompt: &str,
+        turn_no: u64,
+    ) -> Result<Action, AgentLoopOutcome> {
+        self.append(
+            env.ledger,
+            env.agent.clone(),
+            EventPayload::TurnStarted {
+                run_id: env.run_id.clone(),
+                turn: turn_no,
+            },
+        )
+        .map_err(AgentLoopOutcome::Ledger)?;
+        let raw = match self.turn_raw(ctx, system, prompt) {
+            Ok(r) => r,
+            Err(e) => return Err(AgentLoopOutcome::ProviderFailed(e)),
+        };
+        parse_action_strict(&raw).map_err(|e| {
+            if let Err(le) = self.append(
+                env.ledger,
+                env.agent.clone(),
+                EventPayload::ErrorOccurred {
+                    scope: "model_action".into(),
+                    message: format!("action 解析失败: {e}"),
+                },
+            ) {
+                return AgentLoopOutcome::Ledger(le);
+            }
+            AgentLoopOutcome::NeedsRepair {
+                next_prompt: repair_prompt(&e, &raw),
+            }
         })
     }
 
     /// 单 Agent 的工具循环:循环执行 tool 动作,直到 message/abort/超轮次。
-    /// 返回最终 message 文本(作为本 Agent 的产出)。
+    /// 返回最终 message 文本(作为本 Agent 的产出)。修复计数由本循环持有。
     fn agent_loop(
         &self,
         ledger: &Ledger,
@@ -178,25 +294,47 @@ impl Orchestrator {
             transcript: Vec::new(),
         };
         let mut prompt = first_prompt.to_string();
+        let mut repairs = 0u32;
         for turn_no in 1..=self.max_turns {
             if self.aborted() {
                 return Err(AgentLoopOutcome::Aborted);
             }
-            self.append(
-                ledger,
-                agent.clone(),
-                EventPayload::TurnStarted {
-                    run_id: run_id.clone(),
-                    turn: turn_no,
+            let action = match self.turn_action(
+                &TurnEnv {
+                    ledger,
+                    run_id,
+                    agent: &agent,
                 },
-            )
-            .map_err(AgentLoopOutcome::Ledger)?;
-
-            let action = match self.turn(&mut ctx, system, &prompt) {
-                Ok(a) => a,
-                Err(e) => return Err(AgentLoopOutcome::ProviderFailed(e)),
+                &mut ctx,
+                system,
+                &prompt,
+                turn_no,
+            ) {
+                Ok(a) => {
+                    repairs = 0;
+                    a
+                }
+                Err(AgentLoopOutcome::NeedsRepair { next_prompt }) => {
+                    repairs += 1;
+                    if repairs > MAX_ACTION_REPAIRS {
+                        return Err(AgentLoopOutcome::InvalidModelOutput(format!(
+                            "model_action 修复 {MAX_ACTION_REPAIRS} 轮后仍非法"
+                        )));
+                    }
+                    self.append(
+                        ledger,
+                        agent.clone(),
+                        EventPayload::TurnCompleted {
+                            run_id: run_id.clone(),
+                            turn: turn_no,
+                        },
+                    )
+                    .map_err(AgentLoopOutcome::Ledger)?;
+                    prompt = next_prompt;
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
-
             match action {
                 Action::Message { text } => {
                     self.append(
@@ -237,6 +375,7 @@ impl Orchestrator {
                         "plan action is not allowed here; return a tool or message action.".into();
                 }
             }
+            // Tool/Plan 路径的收尾(Message 已提前 return;修复路径在分支内)
             self.append(
                 ledger,
                 agent.clone(),
@@ -338,10 +477,72 @@ impl Orchestrator {
         let mut ctx = LoopCtx {
             transcript: Vec::new(),
         };
-        let action = match self.turn(&mut ctx, &coord_system, &plan_prompt) {
-            Ok(a) => a,
-            Err(e) => return self.provider_failed(ledger, &coord_run, e),
+        // 规划轮同样受修复轮约束(spec 70):首轮 + ≤2 次修复;
+        // turn 编号从此处起算,apply 阶段接续(spec 20:run 内 turn 单调)
+        let action = {
+            let mut prompt = plan_prompt;
+            let mut parsed: Option<Action> = None;
+            let mut turn_no: u64 = 0;
+            while turn_no <= u64::from(MAX_ACTION_REPAIRS) {
+                turn_no += 1;
+                if self.aborted() {
+                    return self.interrupt(ledger, &coord_run, "aborted during planning");
+                }
+                let env = TurnEnv {
+                    ledger,
+                    run_id: &coord_run,
+                    agent: &AgentRef::Coordinator,
+                };
+                match self.turn_action(&env, &mut ctx, &coord_system, &prompt, turn_no) {
+                    Ok(a) => {
+                        // 成功路径的 TurnCompleted 由本循环补齐(break 前恰好一次)
+                        self.append(
+                            ledger,
+                            AgentRef::Coordinator,
+                            EventPayload::TurnCompleted {
+                                run_id: coord_run.clone(),
+                                turn: turn_no,
+                            },
+                        )?;
+                        parsed = Some(a);
+                        break;
+                    }
+                    Err(AgentLoopOutcome::NeedsRepair { next_prompt }) => {
+                        self.append(
+                            ledger,
+                            AgentRef::Coordinator,
+                            EventPayload::TurnCompleted {
+                                run_id: coord_run.clone(),
+                                turn: turn_no,
+                            },
+                        )?;
+                        prompt = next_prompt;
+                    }
+                    Err(AgentLoopOutcome::ProviderFailed(e)) => {
+                        return self.provider_failed(ledger, &coord_run, e);
+                    }
+                    Err(e) => {
+                        return Err(OrchestratorError::Ledger(
+                            crate::ledger::LedgerError::Corrupt {
+                                line: 0,
+                                detail: format!("规划轮中断: {e:?}"),
+                            },
+                        ));
+                    }
+                }
+            }
+            match parsed {
+                Some(a) => (a, turn_no),
+                None => {
+                    return self.fail_task(
+                        ledger,
+                        &coord_run,
+                        format!("model_action 规划轮修复 {MAX_ACTION_REPAIRS} 次后仍非法"),
+                    );
+                }
+            }
         };
+        let (action, planning_turns) = action;
         let (plan, worker_tasks) = match action {
             Action::Plan { plan, workers } => (plan, workers),
             Action::Message { text } => {
@@ -432,8 +633,14 @@ impl Orchestrator {
         ctx.transcript.push(crate::provider::ChatMessage::assistant(
             serde_json::json!({"action":"plan","plan":plan}).to_string(),
         ));
-        let run =
-            self.agent_loop_continue(ledger, &coord_run, &mut ctx, &coord_system, &apply_prompt);
+        let run = self.agent_loop_continue(
+            ledger,
+            &coord_run,
+            &mut ctx,
+            &coord_system,
+            &apply_prompt,
+            planning_turns + 1,
+        );
         self.finish_task(ledger, &coord_run, run)
     }
 
@@ -444,25 +651,46 @@ impl Orchestrator {
         ctx: &mut LoopCtx,
         system: &str,
         prompt: &str,
+        start_turn: u64,
     ) -> Result<String, AgentLoopOutcome> {
-        // 与 agent_loop 相同的循环体;拆出独立实现以复用已开始的转写
+        // 与 agent_loop 相同的循环体;拆出独立实现以复用已开始的转写。
+        // turn 编号接续规划轮(run 内单调,spec 20)
         let mut prompt = prompt.to_string();
-        for turn_no in 1..=self.max_turns {
+        let mut repairs = 0u32;
+        for turn_no in start_turn..start_turn + self.max_turns {
             if self.aborted() {
                 return Err(AgentLoopOutcome::Aborted);
             }
-            self.append(
+            let env = TurnEnv {
                 ledger,
-                AgentRef::Coordinator,
-                EventPayload::TurnStarted {
-                    run_id: run_id.clone(),
-                    turn: turn_no,
-                },
-            )
-            .map_err(AgentLoopOutcome::Ledger)?;
-            let action = match self.turn(ctx, system, &prompt) {
-                Ok(a) => a,
-                Err(e) => return Err(AgentLoopOutcome::ProviderFailed(e)),
+                run_id,
+                agent: &AgentRef::Coordinator,
+            };
+            let action = match self.turn_action(&env, &mut *ctx, system, &prompt, turn_no) {
+                Ok(a) => {
+                    repairs = 0;
+                    a
+                }
+                Err(AgentLoopOutcome::NeedsRepair { next_prompt }) => {
+                    repairs += 1;
+                    if repairs > MAX_ACTION_REPAIRS {
+                        return Err(AgentLoopOutcome::InvalidModelOutput(format!(
+                            "model_action 修复 {MAX_ACTION_REPAIRS} 轮后仍非法"
+                        )));
+                    }
+                    self.append(
+                        ledger,
+                        AgentRef::Coordinator,
+                        EventPayload::TurnCompleted {
+                            run_id: run_id.clone(),
+                            turn: turn_no,
+                        },
+                    )
+                    .map_err(AgentLoopOutcome::Ledger)?;
+                    prompt = next_prompt;
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             match action {
                 Action::Message { text } => {
@@ -502,6 +730,7 @@ impl Orchestrator {
                     prompt = "plan is not allowed after planning; use tool or message.".into();
                 }
             }
+            // Tool/Plan 路径的收尾(Message 已提前 return;修复路径在分支内)
             self.append(
                 ledger,
                 AgentRef::Coordinator,
@@ -522,6 +751,12 @@ impl Orchestrator {
         result: Result<String, AgentLoopOutcome>,
     ) -> Result<TaskStatus, OrchestratorError> {
         match result {
+            // turn_action 返回 NeedsRepair 时由循环消化;到达 finish 视为不可达
+            Err(AgentLoopOutcome::NeedsRepair { next_prompt }) => self.fail_task(
+                ledger,
+                coord_run,
+                format!("model_action 未消化修复轮: {}", truncate(&next_prompt, 200)),
+            ),
             Ok(_) => {
                 self.append(
                     ledger,
@@ -552,6 +787,9 @@ impl Orchestrator {
                 coord_run,
                 format!("agent loop exceeded max turns ({max})"),
             ),
+            Err(AgentLoopOutcome::InvalidModelOutput(reason)) => {
+                self.fail_task(ledger, coord_run, reason)
+            }
             Err(AgentLoopOutcome::Ledger(e)) => Err(OrchestratorError::Ledger(e)),
         }
     }
@@ -641,6 +879,12 @@ impl Orchestrator {
 #[derive(Debug)]
 enum AgentLoopOutcome {
     Aborted,
+    /// 解析失败,需要修复轮;next_prompt 已附错误与 schema
+    NeedsRepair {
+        next_prompt: String,
+    },
+    /// 修复轮耗尽仍非法:当前 Run 以可解释原因失败(spec 70)
+    InvalidModelOutput(String),
     ProviderFailed(crate::provider::ProviderError),
     TooManyTurns(u64),
     Ledger(crate::ledger::LedgerError),
@@ -896,5 +1140,72 @@ mod tests {
             &e.payload,
             EventPayload::TaskInterrupted { reason } if reason == "process_restart"
         )));
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn bare_json_parses() {
+        let a = parse_action_strict(r#"{"action":"message","text":"hi"}"#).unwrap();
+        assert_eq!(a, Action::Message { text: "hi".into() });
+    }
+
+    #[test]
+    fn fenced_json_parses() {
+        let a =
+            parse_action_strict("```json\n{\"action\":\"message\",\"text\":\"hi\"}\n```").unwrap();
+        assert_eq!(a, Action::Message { text: "hi".into() });
+    }
+
+    #[test]
+    fn prose_plus_json_rejected() {
+        assert!(
+            parse_action_strict("好的,这是我的动作:{\"action\":\"message\",\"text\":\"hi\"}")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multiple_objects_rejected() {
+        assert!(parse_action_strict(
+            r#"{"action":"message","text":"a"} {"action":"message","text":"b"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_field_rejected() {
+        assert!(
+            parse_action_strict(r#"{"action":"message","text":"hi","confidence":0.9}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn missing_required_rejected() {
+        assert!(parse_action_strict(r#"{"action":"message"}"#).is_err());
+        assert!(parse_action_strict(r#"{"action":"tool","args":{}}"#).is_err());
+    }
+
+    #[test]
+    fn tool_args_must_be_object() {
+        assert!(
+            parse_action_strict(r#"{"action":"tool","tool":"read_file","args":"a.txt"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn workers_over_limit_rejected() {
+        assert!(
+            parse_action_strict(r#"{"action":"plan","plan":"p","workers":["a","b","c","d"]}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_action_rejected() {
+        assert!(parse_action_strict(r#"{"action":"deploy","target":"prod"}"#).is_err());
     }
 }

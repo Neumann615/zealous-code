@@ -544,11 +544,33 @@ mod tests {
             let Ok((mut stream, _)) = listener.accept() else {
                 break;
             };
-            let mut buf = [0u8; 16 * 1024];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+            // 读完完整请求(头部 + Content-Length 体),单次 read 可能截断
+            let mut raw: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                raw.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .split("\r\n")
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= header_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
             // 取请求体(空行之后)
-            let body = raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
             *captured2.lock().unwrap() = body;
             let resp = serde_json::json!({
                 "choices": [{ "message": { "content": "ok" } }]

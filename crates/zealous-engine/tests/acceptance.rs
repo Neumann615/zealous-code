@@ -443,3 +443,62 @@ fn agent_ref_is_usable() {
     let mut _w = std::io::sink();
     let _ = _w.write_all(b"");
 }
+
+// ---------- spec 70:修复轮 ----------
+
+#[test]
+fn s70_repair_round_recovers_after_illegal_output() {
+    setup_provider_env();
+    let repo = git_repo("s70-repair");
+    let ledger = create_task(&repo, "repair me");
+
+    let script = vec![
+        // 规划轮第 1 次:夹杂说明文字 → 解析失败,进入修复轮
+        act("好的,我的计划如下:{\"action\":\"plan\",\"plan\":\"p\",\"workers\":[]}"),
+        // 修复轮:合法
+        act(r#"{"action":"plan","plan":"p","workers":[]}"#),
+        act(r#"{"action":"message","text":"done after repair"}"#),
+    ];
+    let orch = orchestrator(
+        &repo,
+        script,
+        Arc::new(AutoApprove),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let status = orch.run_task(&ledger, "repair me").unwrap();
+    assert_eq!(status, TaskStatus::Completed);
+
+    // 修复过程落账:ErrorOccurred(scope=model_action)
+    let proj = assert_ledger_healthy(&repo, ledger.task_id());
+    let (_, msg) = proj.last_error.expect("修复错误应落账");
+    assert!(msg.contains("action 解析失败"), "{msg}");
+}
+
+#[test]
+fn s70_repair_exhaustion_fails_run_explainably() {
+    setup_provider_env();
+    let repo = git_repo("s70-exhaust");
+    let ledger = create_task(&repo, "unrepairable");
+
+    // 规划轮首轮 + 2 次修复全部非法 → Run Failed,原因可解释
+    let script = vec![
+        act("not json at all"),
+        act(r#"{"action":"message","text":"a"} {"action":"message","text":"b"}"#),
+        act(r#"{"action":"deploy","target":"prod"}"#),
+    ];
+    let orch = orchestrator(
+        &repo,
+        script,
+        Arc::new(AutoApprove),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let status = orch.run_task(&ledger, "unrepairable").unwrap();
+    assert_eq!(status, TaskStatus::Failed);
+
+    let proj = assert_ledger_healthy(&repo, ledger.task_id());
+    let (_, msg) = proj.last_error.expect("失败原因应落账");
+    assert!(
+        msg.contains("model_action") && msg.contains("修复"),
+        "原因应说明修复耗尽: {msg}"
+    );
+}
