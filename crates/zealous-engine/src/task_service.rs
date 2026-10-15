@@ -198,6 +198,22 @@ impl TaskService {
         Ok((ledger, projection, report))
     }
 
+    /// 读取任务全量事件(spec 90:TUI 等薄客户端经此审计,
+    /// 不直接触碰 .zealous/.../events.jsonl 路径)
+    pub fn events(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<(Vec<zealous_core::TaskEvent>, crate::ledger::ReadReport), ServiceError> {
+        let path = crate::ledger::events_path(&crate::ledger::task_dir(&self.repo_root, task_id));
+        crate::ledger::read_events(&path).map_err(ServiceError::Ledger)
+    }
+
+    /// 重新打开任务并返回投影(spec 90:TUI 刷新只重新 fold)
+    pub fn refresh(&self, task_id: &TaskId) -> Result<TaskProjection, ServiceError> {
+        let (_, projection, _) = self.open_task(task_id)?;
+        Ok(projection)
+    }
+
     /// 列出全部任务。单个账本损坏不阻塞列表:跳过并记录原因。
     pub fn list_tasks(&self) -> Result<TaskListing, ServiceError> {
         let root = self.repo_root.join(".zealous").join("tasks");

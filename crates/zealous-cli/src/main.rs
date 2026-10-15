@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+mod tui;
 use zealous_core::{ApprovalDecision, TaskStatus};
 use zealous_engine::approval::ApprovalSink;
 use zealous_engine::executor::ToolExecutor;
@@ -33,6 +34,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// 可视化任务工作台(spec 90)
+    Tui,
     /// 配置检查(Git 仓库 / Provider 配置;不回显密钥)
     Config {
         #[command(subcommand)]
@@ -208,6 +211,10 @@ fn main() {
     load_dotenv();
     let cli = Cli::parse();
     let code = match cli.cmd {
+        Cmd::Tui => match repo_root() {
+            Ok(root) => tui::run_command(root),
+            Err(e) => err(e),
+        },
         Cmd::Task { cmd } => match cmd {
             TaskCmd::New { title, brief_file } => cmd_new(&title, brief_file.as_deref()),
             TaskCmd::List => cmd_list(),
