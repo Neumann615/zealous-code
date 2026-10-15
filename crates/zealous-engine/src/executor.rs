@@ -127,7 +127,10 @@ impl ToolExecutor {
 
         // T1/T2:审批闸门
         if risk != RiskTier::T0 {
-            let summary = tool.summarize(raw_args);
+            let ctx = ToolContext {
+                repo_root: self.repo_root.clone(),
+            };
+            let summary = tool.summarize(raw_args, &ctx);
             ledger
                 .append(
                     agent.clone(),

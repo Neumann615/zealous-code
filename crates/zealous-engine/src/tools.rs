@@ -44,7 +44,7 @@ pub trait Tool: Send + Sync {
     /// 一句话语义说明(进模型 manifest)
     fn description(&self) -> &'static str;
     /// 审批摘要:T1/T2 挂起时必须完整展示将发生什么
-    fn summarize(&self, raw_args: &str) -> String;
+    fn summarize(&self, raw_args: &str, ctx: &ToolContext) -> String;
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
 }
 
@@ -177,7 +177,7 @@ impl Tool for ReadFile {
     fn description(&self) -> &'static str {
         "读取仓库内文本文件(<=512KB),返回文件全文"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 200)
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -213,7 +213,7 @@ impl Tool for ListDir {
     fn description(&self) -> &'static str {
         "列出目录条目,d 前缀为目录、f 前缀为文件"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 200)
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -258,7 +258,7 @@ impl Tool for SearchText {
     fn description(&self) -> &'static str {
         "在仓库文本文件中做子串搜索(跳过 .git/target 等),返回 file:line: 片段"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 200)
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -337,7 +337,7 @@ impl Tool for GitStatus {
     fn description(&self) -> &'static str {
         "返回 git status --porcelain 输出(只读)"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 120)
     }
     fn execute(&self, _raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -375,7 +375,7 @@ impl Tool for GitLog {
     fn description(&self) -> &'static str {
         "查看提交历史(默认 20 条,上限 100,可限定路径)"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 200)
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -420,7 +420,7 @@ impl Tool for GitDiff {
     fn description(&self) -> &'static str {
         "查看未提交改动(工作区或 staged),输出上限 64KiB"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 200)
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -467,18 +467,144 @@ impl Tool for WriteFile {
     fn description(&self) -> &'static str {
         "写入主工作区文件(T1:需审批;要求工作区干净;成功后自动 commit 作为回退点)"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, ctx: &ToolContext) -> String {
+        // spec 80 §4:完整展示目标路径、新建或覆盖、完整新内容
         let path = arg_str(raw_args, "path").unwrap_or_default();
-        let content_len = raw_args.len();
-        format!("write_file path={path} args_bytes={content_len}")
+        let content = arg_str(raw_args, "content").unwrap_or_default();
+        let kind = resolve_in_repo(&ctx.repo_root, &path)
+            .map(|p| {
+                if p.exists() {
+                    "覆盖现有文件"
+                } else {
+                    "新建文件"
+                }
+            })
+            .unwrap_or("路径不可解析");
+        format!("write_file {kind}: {path}\n--- 完整新内容 ---\n{content}\n--- 内容结束 ---")
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let path = resolve_in_repo(&ctx.repo_root, &arg_str(raw_args, "path")?)?;
         let content = arg_str(raw_args, "content")?;
         assert_clean_worktree(&ctx.repo_root)?;
-        apply_transactional(&ctx.repo_root, &path, &content)?;
+        apply_transactional(&ctx.repo_root, &path, &content, "apply")?;
         Ok(ToolOutput {
             summary: format!("written {} (committed as rollback point)", path.display()),
+        })
+    }
+}
+
+// ---------- T1:edit_file ----------
+
+struct EditFile;
+
+impl Tool for EditFile {
+    fn name(&self) -> &'static str {
+        "edit_file"
+    }
+    fn risk(&self) -> RiskTier {
+        RiskTier::T1
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"path\": \"relative/path\", \"old_text\": \"exact existing text\", \"new_text\": \"replacement\", \"replace_all\": false}"
+    }
+    fn description(&self) -> &'static str {
+        "精确文本替换修改现有文件(T1:需审批;old_text 必须精确匹配;默认唯一匹配;成功后自动 commit)"
+    }
+    fn summarize(&self, raw_args: &str, ctx: &ToolContext) -> String {
+        // spec 80 §4:完整展示路径、exact old/new、匹配策略
+        let parse = || -> Result<(String, String, String, bool), ToolError> {
+            let v = args_object(raw_args)?;
+            Ok((
+                v.get("path")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .into(),
+                v.get("old_text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .into(),
+                v.get("new_text")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .into(),
+                v.get("replace_all")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
+            ))
+        };
+        match parse() {
+            Ok((path, old_text, new_text, replace_all)) => {
+                let (count, policy) = resolve_in_repo(&ctx.repo_root, &path)
+                    .and_then(|p| {
+                        std::fs::read_to_string(p)
+                            .map_err(|e| ToolError::Failed(format!("read: {e}")))
+                    })
+                    .map(|content| {
+                        let count = content.matches(&old_text).count();
+                        let policy = if replace_all {
+                            "全部替换"
+                        } else {
+                            "唯一匹配(多处将拒绝)"
+                        };
+                        (count.to_string(), policy.to_string())
+                    })
+                    .unwrap_or_else(|_| ("?".into(), "文件不可读".into()));
+                format!(
+                    "edit_file 路径: {path} [当前匹配 {count} 处;策略: {policy}]\n\
+                     --- 原文(将被替换) ---\n{old_text}\n--- 新文本 ---\n{new_text}\n--- 结束 ---"
+                )
+            }
+            Err(e) => format!("edit_file 参数不可解析: {e}"),
+        }
+    }
+    fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let path = resolve_in_repo(&ctx.repo_root, &arg_str(raw_args, "path")?)?;
+        let v = args_object(raw_args)?;
+        let old_text = v
+            .get("old_text")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| ToolError::BadArgs("缺少 old_text".into()))?;
+        let new_text = v
+            .get("new_text")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        let replace_all = v
+            .get("replace_all")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        if old_text.is_empty() {
+            return Err(ToolError::BadArgs("old_text 不得为空".into()));
+        }
+        if old_text == new_text {
+            return Err(ToolError::BadArgs(
+                "old_text 与 new_text 相同,拒绝空操作".into(),
+            ));
+        }
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| ToolError::Failed(format!("read: {e}")))?;
+        let matches = content.matches(old_text).count();
+        if matches == 0 {
+            return Err(ToolError::Failed(
+                "old_text 在文件中零匹配(必须精确匹配现有内容)".into(),
+            ));
+        }
+        if matches > 1 && !replace_all {
+            return Err(ToolError::Failed(format!(
+                "old_text 匹配 {matches} 处但未指定 replace_all;请扩大上下文使匹配唯一,或显式 replace_all=true"
+            )));
+        }
+        let updated = if replace_all {
+            content.replace(old_text, new_text)
+        } else {
+            content.replacen(old_text, new_text, 1)
+        };
+        assert_clean_worktree(&ctx.repo_root)?;
+        apply_transactional(&ctx.repo_root, &path, &updated, "edit")?;
+        Ok(ToolOutput {
+            summary: format!(
+                "edited {} (replaced {matches} occurrence(s), committed as rollback point)",
+                path.display()
+            ),
         })
     }
 }
@@ -486,7 +612,12 @@ impl Tool for WriteFile {
 /// apply 事务(spec 70 §4):临时文件 → 原子替换 → git add → git commit;
 /// git 步骤失败则回滚文件与 index,ok=true 仅在提交成功后产生。
 /// 崩溃窗口(替换与 commit 之间)如实声明于 spec 70 §4,不做虚假事务保证。
-fn apply_transactional(repo_root: &Path, path: &Path, content: &str) -> Result<(), ToolError> {
+fn apply_transactional(
+    repo_root: &Path,
+    path: &Path,
+    content: &str,
+    verb: &str,
+) -> Result<(), ToolError> {
     // 回滚素材:原内容(新文件则为 None)
     let original = std::fs::read(path).ok();
 
@@ -505,7 +636,7 @@ fn apply_transactional(repo_root: &Path, path: &Path, content: &str) -> Result<(
         return Err(ToolError::Failed(format!("atomic replace: {e}")));
     }
 
-    match commit_applied(repo_root, path) {
+    match commit_applied(repo_root, path, verb) {
         Ok(summary) => {
             let _ = summary;
             Ok(())
@@ -547,7 +678,7 @@ fn rel_to_repo(repo_root: &Path, file: &Path) -> String {
 }
 
 /// 把刚写入的文件作为独立回退点提交;作者署名 zealous,与用户提交区分
-fn commit_applied(repo_root: &Path, file: &Path) -> Result<String, ToolError> {
+fn commit_applied(repo_root: &Path, file: &Path, verb: &str) -> Result<String, ToolError> {
     let rel = rel_to_repo(repo_root, file);
     let add = std::process::Command::new("git")
         .args(["add", "--", &rel])
@@ -569,7 +700,7 @@ fn commit_applied(repo_root: &Path, file: &Path) -> Result<String, ToolError> {
             "commit",
             "-q",
             "-m",
-            &format!("zealous: apply {rel}"),
+            &format!("zealous: {verb} {rel}"),
         ])
         .current_dir(repo_root)
         .output()
@@ -643,7 +774,7 @@ impl Tool for Shell {
     fn description(&self) -> &'static str {
         "经 cmd /C 执行命令(T2:需审批;完整命令会展示给用户)"
     }
-    fn summarize(&self, raw_args: &str) -> String {
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         format!(
             "shell: {}",
             truncate_for_display(&arg_str(raw_args, "command").unwrap_or_default(), 300)
@@ -684,6 +815,7 @@ pub fn builtin_registry() -> Vec<Box<dyn Tool>> {
         Box::new(GitLog),
         Box::new(GitDiff),
         Box::new(WriteFile),
+        Box::new(EditFile),
         Box::new(Shell),
     ]
 }
@@ -855,7 +987,7 @@ mod apply_tx_tests {
     use super::*;
 
     /// 真实 git 仓库 + 初始 commit(spec 60 §4:脏工作区保护与回退点都依赖)
-    fn real_git_fixture(tag: &str) -> PathBuf {
+    pub(crate) fn real_git_fixture(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "zealous-apply-{tag}-{}-{}",
             std::process::id(),
@@ -1070,5 +1202,172 @@ mod git_tools_tests {
         let reg = builtin_registry();
         assert_eq!(risk_of(&reg, "git_log"), Some(RiskTier::T0));
         assert_eq!(risk_of(&reg, "git_diff"), Some(RiskTier::T0));
+    }
+}
+
+#[cfg(test)]
+mod edit_file_tests {
+    use super::apply_tx_tests::real_git_fixture;
+    use super::*;
+
+    #[test]
+    fn edit_unique_match_replaces_and_commits() {
+        let dir = real_git_fixture("edit-unique");
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        let edit = EditFile;
+        edit.execute(
+            r#"{"path":"README.md","old_text":"fixture","new_text":"fixture edited"}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "fixture edited\n"
+        );
+        let log = std::process::Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&log.stdout).contains("zealous: edit README.md"));
+    }
+
+    #[test]
+    fn edit_multiple_matches_without_replace_all_rejected() {
+        let dir = real_git_fixture("edit-multi");
+        std::fs::write(dir.join("README.md"), "dup line\ndup line\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        let err = EditFile
+            .execute(
+                r#"{"path":"README.md","old_text":"dup line","new_text":"x"}"#,
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed(m) if m.contains("2 处")),
+            "{err}"
+        );
+        // 文件未被修改
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "dup line\ndup line\n"
+        );
+    }
+
+    #[test]
+    fn edit_replace_all_updates_every_occurrence() {
+        let dir = real_git_fixture("edit-all");
+        std::fs::write(dir.join("README.md"), "dup line\ndup line\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "dup fixture",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        EditFile
+            .execute(
+                r#"{"path":"README.md","old_text":"dup line","new_text":"new line","replace_all":true}"#,
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "new line\nnew line\n"
+        );
+    }
+
+    #[test]
+    fn edit_zero_match_empty_old_and_same_args_rejected() {
+        let dir = real_git_fixture("edit-bad");
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        let edit = EditFile;
+
+        let err = edit
+            .execute(
+                r#"{"path":"README.md","old_text":"not present","new_text":"x"}"#,
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed(m) if m.contains("零匹配")),
+            "{err}"
+        );
+
+        let err = edit
+            .execute(r#"{"path":"README.md","old_text":"","new_text":"x"}"#, &ctx)
+            .unwrap_err();
+        assert!(matches!(&err, ToolError::BadArgs(m) if m.contains("不得为空")));
+
+        let err = edit
+            .execute(
+                r#"{"path":"README.md","old_text":"same","new_text":"same"}"#,
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(matches!(&err, ToolError::BadArgs(m) if m.contains("相同")));
+
+        let err = edit
+            .execute(
+                r#"{"path":"../outside.txt","old_text":"a","new_text":"b"}"#,
+                &ctx,
+            )
+            .unwrap_err();
+        assert!(matches!(&err, ToolError::BadArgs(m) if m.contains("越界")));
+    }
+
+    #[test]
+    fn approval_summaries_show_full_content_and_new_or_overwrite() {
+        let dir = real_git_fixture("summary");
+        let ctx = ToolContext {
+            repo_root: dir.clone(),
+        };
+        let write = WriteFile;
+
+        // 新建
+        let s = write.summarize(r#"{"path":"brand-new.txt","content":"full body"}"#, &ctx);
+        assert!(s.contains("新建文件"), "{s}");
+        assert!(s.contains("full body"), "摘要须含完整新内容: {s}");
+
+        // 覆盖
+        std::fs::write(dir.join("exists.txt"), "old").unwrap();
+        let s = write.summarize(r#"{"path":"exists.txt","content":"new body"}"#, &ctx);
+        assert!(s.contains("覆盖现有文件"), "{s}");
+        assert!(s.contains("new body"), "{s}");
+
+        // edit_file:exact old/new + 匹配策略
+        let edit = EditFile;
+        let s = edit.summarize(
+            r#"{"path":"README.md","old_text":"fixture","new_text":"fixture v2","replace_all":false}"#,
+            &ctx,
+        );
+        assert!(s.contains("fixture") && s.contains("fixture v2"), "{s}");
+        assert!(s.contains("唯一匹配"), "{s}");
     }
 }
