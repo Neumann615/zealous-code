@@ -8,6 +8,7 @@
 pub mod approval;
 pub mod executor;
 pub mod ledger;
+pub mod orchestrator;
 pub mod provider;
 pub mod task_service;
 pub mod tools;
