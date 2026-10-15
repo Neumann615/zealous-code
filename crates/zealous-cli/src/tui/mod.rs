@@ -90,30 +90,7 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
     loop {
         // 1) 消费 engine 事件
         while let Ok(ev) = event_rx.try_recv() {
-            match ev {
-                TuiEvent::Approval(req) => state.approval_arrived(state::ApprovalRequestUi {
-                    call_id: req.call_id,
-                    summary: req.summary,
-                }),
-                TuiEvent::Finished(status) => {
-                    state.task_finished(status);
-                    decision_tx = None;
-                    // 运行结束即刷新投影与列表
-                    if let Some(t) = state.selected_task() {
-                        let id = t.task_id.clone();
-                        if let Ok(p) = svc.refresh(&id) {
-                            if let Ok((evs, _)) = svc.events(&id) {
-                                state.set_detail(p, evs);
-                            }
-                        }
-                        state.refresh_tasks(list_tasks(&svc));
-                    }
-                }
-                TuiEvent::Failure(msg) => {
-                    state.running = false;
-                    state.set_error(msg);
-                }
-            }
+            apply_event(&mut state, &svc, &mut decision_tx, ev);
         }
         // 2) 消费进度通道(runner 的 sink 适配层)
         while let Ok(msg) = progress_rx.try_recv() {
@@ -158,6 +135,40 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
 
 fn list_tasks(svc: &TaskService) -> Vec<zealous_engine::task_service::TaskSummary> {
     svc.list_tasks().map(|(items, _)| items).unwrap_or_default()
+}
+
+/// engine 事件 → TUI 状态的应用逻辑(spec 90:控制器与渲染分离,
+/// 集成测试直接驱动本函数,与终端循环共享同一实现)
+pub(crate) fn apply_event(
+    state: &mut TuiState,
+    svc: &TaskService,
+    decision_tx: &mut Option<mpsc::Sender<ApprovalDecision>>,
+    ev: TuiEvent,
+) {
+    match ev {
+        TuiEvent::Approval(req) => state.approval_arrived(state::ApprovalRequestUi {
+            call_id: req.call_id,
+            summary: req.summary,
+        }),
+        TuiEvent::Finished(status) => {
+            state.task_finished(status);
+            *decision_tx = None;
+            // 运行结束即刷新投影与列表(事实只来自 TaskService)
+            let id = state.selected_task().map(|t| t.task_id.clone());
+            if let Some(id) = id {
+                if let Ok(p) = svc.refresh(&id) {
+                    if let Ok((evs, _)) = svc.events(&id) {
+                        state.set_detail(p, evs);
+                    }
+                }
+                state.refresh_tasks(list_tasks(svc));
+            }
+        }
+        TuiEvent::Failure(msg) => {
+            state.running = false;
+            state.set_error(msg);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -285,5 +296,241 @@ fn handle_key(
             }
             _ => {}
         },
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+    use zealous_core::TaskStatus;
+
+    /// 本地 mock /chat/completions:按请求顺序返回脚本(spec 60 §6 同款)
+    fn mock_endpoint(script: Vec<String>) -> String {
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let script = std::sync::Mutex::new(script);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut raw: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                raw.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text
+                        .split("\r\n")
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let idx = counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let content = {
+                let script = script.lock().unwrap();
+                if idx < script.len() {
+                    script[idx].clone()
+                } else {
+                    "guard".into()
+                }
+            };
+            let body = serde_json::json!({
+                "choices": [{ "message": { "content": content } }]
+            })
+            .to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            );
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+    }
+
+    #[test]
+    fn tui_controller_drives_mock_run_to_completed() {
+        // ---- 夹具:真实 git 仓库 + 初始 commit + README ----
+        let repo = std::env::temp_dir().join(format!(
+            "zealous-tui-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+
+        // ---- Provider 配置指向 mock endpoint ----
+        let endpoint = mock_endpoint(vec![
+            r#"{"action":"plan","plan":"read then edit","workers":[]}"#.into(),
+            r#"{"action":"tool","tool":"read_file","args":{"path":"README.md"}}"#.into(),
+            r#"{"action":"tool","tool":"edit_file","args":{"path":"README.md","old_text":"fixture","new_text":"fixture by tui"}}"#.into(),
+            r#"{"action":"message","text":"tui run done"}"#.into(),
+        ]);
+        std::env::set_var("ZEALOUS_BASE_URL", &endpoint);
+        std::env::set_var("ZEALOUS_API_KEY", "tui-secret-key");
+        std::env::set_var("ZEALOUS_MODEL", "mock-model");
+
+        let svc = TaskService::new(&repo);
+        let task_id = match svc.create_task("tui: read then edit README").unwrap() {
+            zealous_engine::task_service::CreateOutcome::Ready { task_id, .. } => task_id,
+            other => panic!("expected Ready: {other:?}"),
+        };
+
+        // ---- TUI 控制器接线(与 run_command 循环同构,无终端)----
+        let abort = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (approval_sink, request_rx, decision_tx) = approval::channel(abort.clone());
+        let (progress_sink, progress_rx) = progress::channel();
+        // 审批请求转发(同 run_command 内的转发线程)
+        {
+            let tx = event_tx.clone();
+            std::thread::spawn(move || {
+                for req in request_rx {
+                    if tx.send(TuiEvent::Approval(req)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        let mut state = TuiState::new();
+        state.refresh_tasks(list_tasks(&svc));
+        state.select_next();
+        let selected_id = state.selected_task().unwrap().task_id.clone();
+        assert_eq!(selected_id, task_id);
+
+        // ---- 模拟 R:启动运行 ----
+        state.running = true;
+        runner::spawn_run(
+            TaskService::new(&repo),
+            task_id.clone(),
+            event_tx.clone(),
+            Arc::new(approval_sink),
+            Arc::new(progress_sink),
+            abort.clone(),
+        );
+
+        // ---- 消费事件循环(同 apply_event),审批到达时模拟按键 a ----
+        let mut decision_tx = Some(decision_tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            while let Ok(ev) = event_rx.try_recv() {
+                apply_event(&mut state, &svc, &mut decision_tx, ev);
+            }
+            while let Ok(msg) = progress_rx.try_recv() {
+                match msg {
+                    progress::ProgressMsg::Progress(l) => state.push_progress(l),
+                    progress::ProgressMsg::Important(l) => state.push_important(&l),
+                }
+            }
+            if state.pending_approval.is_some() {
+                if let Some(_req) = state.take_pending_approval() {
+                    if let Some(tx) = &decision_tx {
+                        let _ = tx.send(zealous_core::ApprovalDecision::Approve);
+                    }
+                }
+            }
+            if !state.running {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("TUI run 30s 未完成");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            state.last_status,
+            Some(TaskStatus::Completed),
+            "最终状态: {:?}",
+            state.error
+        );
+
+        // ---- 断言:文件修改 / 审批进账本 / seq 连续 / 投影 Completed ----
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "fixture by tui\n"
+        );
+        let (events, report) = svc.events(&task_id).unwrap();
+        assert!(!report.torn_tail);
+        for (i, e) in events.iter().enumerate() {
+            assert_eq!(e.seq, (i + 1) as u64, "seq 跳号");
+        }
+        assert!(
+            events.iter().any(|e| matches!(
+                e.payload,
+                zealous_core::EventPayload::ApprovalDecided {
+                    decision: zealous_core::ApprovalDecision::Approve,
+                    ..
+                }
+            )),
+            "审批决策应进入账本"
+        );
+        // 最终状态来自投影(而非 TUI 私有状态)
+        let proj = svc.refresh(&task_id).unwrap();
+        assert_eq!(proj.status, TaskStatus::Completed);
+        assert_eq!(state.detail.as_ref().unwrap().status, TaskStatus::Completed);
+        assert!(state
+            .detail
+            .as_ref()
+            .unwrap()
+            .tool_calls
+            .iter()
+            .any(|c| c.tool == "edit_file"));
+
+        // 密钥不落账
+        let text = std::fs::read_to_string(zealous_engine::ledger::events_path(
+            &zealous_engine::ledger::task_dir(&repo, &task_id),
+        ))
+        .unwrap();
+        assert!(!text.contains("tui-secret-key"));
+        std::env::remove_var("ZEALOUS_BASE_URL");
+        std::env::remove_var("ZEALOUS_API_KEY");
+        std::env::remove_var("ZEALOUS_MODEL");
+        let _ = std::fs::remove_dir_all(repo);
     }
 }
