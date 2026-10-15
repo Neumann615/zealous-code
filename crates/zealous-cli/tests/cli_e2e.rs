@@ -114,9 +114,10 @@ fn e2e_real_binary_plan_write_approve_complete() {
         "init",
     ]);
 
-    // ---- mock endpoint:plan → write → message ----
+    // ---- mock endpoint:plan → read → write → message(spec 70 要求 read 步骤)----
     let endpoint = mock_endpoint(vec![
-        r#"{"action":"plan","plan":"create hello.txt","workers":[]}"#.into(),
+        r#"{"action":"plan","plan":"read README then create hello.txt","workers":[]}"#.into(),
+        r#"{"action":"tool","tool":"read_file","args":{"path":"README.md"}}"#.into(),
         r#"{"action":"tool","tool":"write_file","args":{"path":"hello.txt","content":"hello from e2e"}}"#.into(),
         r#"{"action":"message","text":"e2e done"}"#.into(),
     ]);
@@ -210,7 +211,192 @@ fn e2e_real_binary_plan_write_approve_complete() {
     ] {
         assert!(types.contains(&expected), "缺少事件 {expected}: {types:?}");
     }
+    // spec 70:脚本必须包含 read_file 步骤(先读后写)
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "ToolCallRequested" && e["tool"] == "read_file"),
+        "缺少 read_file 调用"
+    );
     let last = events.last().unwrap();
     assert_eq!(last["type"], "TaskStatusChanged");
     assert_eq!(last["to"], "Completed");
+}
+
+/// 读取仓库根 .env(真实 smoke 专用);不打印任何值
+fn load_repo_dotenv() -> Vec<(String, String)> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.env");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("real_model_smoke 需要仓库根 .env({path:?}): {e}"));
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.is_empty() || l.starts_with('#') {
+                return None;
+            }
+            let (k, v) = l.split_once('=')?;
+            let v = v.trim().trim_matches('"').to_string();
+            if v.is_empty() {
+                return None;
+            }
+            Some((k.trim().to_string(), v))
+        })
+        .collect()
+}
+
+/// 真实端点 smoke(spec 70 §5):默认 ignored,显式执行:
+///   cargo test --test cli_e2e real_model_smoke -- --ignored --nocapture
+/// 配置来自仓库根 .env;不复制 .env 进临时仓库,只注入必要环境变量;
+/// 任何输出不得包含密钥。
+#[test]
+#[ignore = "真实端点 smoke:消耗模型额度,须显式执行(见 spec 70 §5)"]
+fn real_model_smoke() {
+    let cfg = load_repo_dotenv();
+    assert!(
+        cfg.iter().any(|(k, _)| k == "ZEALOUS_BASE_URL"),
+        ".env 缺 ZEALOUS_BASE_URL"
+    );
+    let api_key = cfg
+        .iter()
+        .find(|(k, _)| k == "ZEALOUS_API_KEY")
+        .map(|(_, v)| v.clone())
+        .expect(".env 缺 ZEALOUS_API_KEY");
+
+    // ---- 夹具:临时 git 仓库 + 初始 commit + README ----
+    let repo = unique_dir("smoke");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+    };
+    git(&["init", "-q"]);
+    let readme_first_line = "alpha smoke fixture line one";
+    std::fs::write(
+        repo.join("README.md"),
+        format!("{readme_first_line}\nfixture body\n"),
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+
+    // ---- 创建任务(注入 env,不复制 .env)----
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let with_env = |cmd: &mut Command| {
+        for (k, v) in &cfg {
+            cmd.env(k, v);
+        }
+    };
+    let mut new_cmd = Command::new(zealous);
+    new_cmd
+        .args(["task", "new", "smoke: read README then create alpha.txt"])
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    with_env(&mut new_cmd);
+    let out = new_cmd.output().expect("spawn task new");
+    assert!(out.status.success(), "task new failed: {:?}", out.stderr);
+    let task_id = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("task created: "))
+        .expect("task id")
+        .trim()
+        .to_string();
+
+    // ---- 运行:stdin 注入 y 审批写入(spec 70:不用 --yes,走真实审批)----
+    let mut run_cmd = Command::new(zealous);
+    run_cmd
+        .args(["task", "run", &task_id])
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    with_env(&mut run_cmd);
+    let mut child = run_cmd.spawn().expect("spawn task run");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        // 审批可能不止一个(写入 + 模型自行追加的验证命令):预写足量 y,
+        // 多余行被 reader 消费后无害
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        for _ in 0..6 {
+            stdin.write_all(b"y\n").expect("write approval");
+            stdin.flush().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+    // 先取走管道再等待退出(wait_exit 消费 Child)
+    let mut stdout_pipe = child.stdout.take().expect("stdout");
+    let mut stderr_pipe = child.stderr.take().expect("stderr");
+    let status = wait_exit(child, 600);
+    let mut run_stdout = String::new();
+    let _ = stdout_pipe.read_to_string(&mut run_stdout);
+    let mut run_stderr = String::new();
+    let _ = stderr_pipe.read_to_string(&mut run_stderr);
+
+    // 脱敏断言:输出不含凭据(spec 70 §5)
+    for output in [&run_stdout, &run_stderr] {
+        assert!(!output.contains(&api_key), "输出泄漏 API key");
+        assert!(!output.contains("Authorization"), "输出泄漏请求头名");
+    }
+    assert!(
+        status.success(),
+        "task run exit: {status}\n{run_stdout}\n{run_stderr}"
+    );
+
+    // ---- 断言:产物 + 账本 + 回退 commit ----
+    let alpha = std::fs::read_to_string(repo.join("alpha.txt")).unwrap();
+    assert_eq!(
+        alpha.trim(),
+        readme_first_line,
+        "alpha.txt 应为 README 首行"
+    );
+
+    let ledger_path = repo
+        .join(".zealous")
+        .join("tasks")
+        .join(&task_id)
+        .join("events.jsonl");
+    let text = std::fs::read_to_string(&ledger_path).unwrap();
+    for needle in [&api_key, "Authorization", "Bearer "] {
+        assert!(!text.contains(needle), "账本泄漏敏感串: {needle}");
+    }
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(ev["seq"].as_u64().unwrap(), (i + 1) as u64, "seq 跳号");
+    }
+    for expected in ["read_file", "write_file"] {
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "ToolCallRequested" && e["tool"] == expected),
+            "缺少 {expected} 调用"
+        );
+    }
+    assert_eq!(events.last().unwrap()["to"], "Completed");
+
+    let log = Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("zealous: apply alpha.txt"),
+        "缺少 zealous 回退 commit"
+    );
 }
