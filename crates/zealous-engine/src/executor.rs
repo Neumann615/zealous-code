@@ -187,6 +187,30 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join("a.txt"), "content-a").unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output();
+        // 脏工作区保护要求夹具有初始 commit(spec 60 §4)
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output();
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "commit failed: {:?}", out.stderr);
         dir
     }
 

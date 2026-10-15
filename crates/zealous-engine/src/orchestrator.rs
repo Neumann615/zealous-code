@@ -261,7 +261,30 @@ impl Orchestrator {
         task_prompt: &str,
     ) -> Result<TaskStatus, OrchestratorError> {
         let proj = ledger.fold_now().map_err(OrchestratorError::Ledger)?;
-        let from = proj.status;
+        let mut from = proj.status;
+
+        // 崩溃规范化(spec 60 §2):投影为 Running = 上次进程异常终止。
+        // TaskInterrupted 的 fold 语义自动把 dangling pending approval 收为
+        // Rejected(Rejected 是 ToolCall 终态,失败结果由投影承载给新 Run)。
+        if from == TaskStatus::Running {
+            self.append(
+                ledger,
+                AgentRef::User,
+                EventPayload::TaskInterrupted {
+                    reason: "process_restart".into(),
+                },
+            )?;
+            self.append(
+                ledger,
+                AgentRef::User,
+                EventPayload::TaskStatusChanged {
+                    from: TaskStatus::Running,
+                    to: TaskStatus::Interrupted,
+                    reason: Some("process_restart".into()),
+                },
+            )?;
+            from = TaskStatus::Interrupted;
+        }
 
         // resume 语义(spec 10):非 Queued 进入时记 TaskResumed;终态/中断都可 resume
         if from != TaskStatus::Queued {
@@ -735,5 +758,138 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::AutoApprove;
+    use crate::executor::ToolExecutor;
+    use crate::ledger::{read_events, Ledger};
+    use crate::tools::builtin_registry;
+    use std::path::Path;
+    use zealous_core::{projection, EventPayload, RiskTier, TaskId};
+
+    fn fixture_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zealous-orch-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn msg(text: &str) -> Result<String, String> {
+        Ok(format!("{{\"action\":\"message\",\"text\":\"{text}\"}}"))
+    }
+
+    /// 模拟一次"进程被 kill"的账本:任务 Running + 挂起审批,无收尾事件
+    fn crashed_running_ledger(dir: &Path) -> Arc<Ledger> {
+        let task_id = TaskId::generate();
+        let ledger = Arc::new(Ledger::create(dir, &task_id).unwrap());
+        ledger
+            .append(
+                AgentRef::User,
+                EventPayload::TaskCreated {
+                    title: "t".into(),
+                    repo_root: dir.display().to_string(),
+                },
+            )
+            .unwrap();
+        ledger
+            .append(
+                AgentRef::User,
+                EventPayload::TaskStatusChanged {
+                    from: TaskStatus::Queued,
+                    to: TaskStatus::Running,
+                    reason: None,
+                },
+            )
+            .unwrap();
+        let run = AgentRunId::generate();
+        ledger
+            .append(
+                AgentRef::Coordinator,
+                EventPayload::AgentRunStarted {
+                    run_id: run.clone(),
+                    role: AgentRole::Coordinator,
+                },
+            )
+            .unwrap();
+        let call = zealous_core::ToolCallId::generate();
+        ledger
+            .append(
+                AgentRef::Coordinator,
+                EventPayload::ToolCallRequested {
+                    call_id: call.clone(),
+                    run_id: run,
+                    tool: "shell".into(),
+                    args_json: "{}".into(),
+                    risk: RiskTier::T2,
+                },
+            )
+            .unwrap();
+        ledger
+            .append(
+                AgentRef::Coordinator,
+                EventPayload::ApprovalRequested {
+                    call_id: call,
+                    summary: "echo".into(),
+                },
+            )
+            .unwrap();
+        ledger
+    }
+
+    #[test]
+    fn resume_normalizes_crashed_running_and_rejects_dangling_approval() {
+        let dir = fixture_dir("crash");
+        let ledger = crashed_running_ledger(&dir);
+        // 前置:确实挂着一个审批
+        let proj = ledger.fold_now().unwrap();
+        assert_eq!(proj.status, TaskStatus::Running);
+        assert_eq!(proj.pending_approvals.len(), 1);
+
+        let orch = Orchestrator {
+            provider: Arc::new(crate::provider::MockProvider::scripted(vec![
+                msg("straight answer"),
+                msg("recovered after restart"),
+            ])),
+            executor: Arc::new(ToolExecutor::new(
+                &dir,
+                builtin_registry(),
+                Arc::new(AutoApprove),
+            )),
+            abort: Arc::new(AtomicBool::new(false)),
+            max_turns: 8,
+            model: "mock".into(),
+        };
+        let status = orch.run_task(&ledger, "t").unwrap();
+        assert_eq!(status, TaskStatus::Completed);
+
+        // 从磁盘全量重读:seq 连续、可折叠(审计链合法)
+        let (events, report) =
+            read_events(&crate::ledger::events_path(ledger.path().parent().unwrap())).unwrap();
+        assert!(!report.torn_tail);
+        let proj = projection::fold(ledger.task_id(), &events).unwrap();
+        assert_eq!(proj.status, TaskStatus::Completed);
+        // dangling approval 被规范化为 Rejected(spec 60 §2)
+        assert_eq!(
+            proj.tool_calls[0].state,
+            projection::ToolCallState::Rejected
+        );
+        assert!(proj.pending_approvals.is_empty());
+        // 至少:原 Run + 规范化中断 + 新 Coordinator Run
+        assert!(proj.runs.len() >= 2);
+        assert!(proj.interrupted_count >= 1);
+        assert!(events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::TaskInterrupted { reason } if reason == "process_restart"
+        )));
     }
 }

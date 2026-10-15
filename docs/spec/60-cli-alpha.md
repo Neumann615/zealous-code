@@ -36,7 +36,8 @@ open ledger
 
 ## 4. 脏 Git 工作区保护
 
-- `write_file`(主工作区写入)执行前运行 `git status --porcelain`;输出非空 → 拒绝写入,提示用户先 commit/stash。
+- `write_file`(主工作区写入)执行前运行 `git status --porcelain`;存在**用户改动**(排除 `.zealous/` 运行时数据)→ 拒绝写入,提示用户先 commit/stash。
+- 写入成功后由框架立即 `git add <file>` + `git commit`(作者署名 `zealous`,与用户提交明确区分):串行 apply 多个补丁时工作区始终回到干净状态,且每次 apply 都是一个可回退的 commit(spec 00:Git commit 作为安全回退边界)。
 - 测试夹具必须带初始 commit。
 
 ## 5. 工具 manifest(模型契约)

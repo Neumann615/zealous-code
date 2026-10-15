@@ -303,15 +303,95 @@ impl Tool for WriteFile {
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let path = resolve_in_repo(&ctx.repo_root, &arg_str(raw_args, "path")?)?;
         let content = arg_str(raw_args, "content")?;
+        assert_clean_worktree(&ctx.repo_root)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| ToolError::Failed(format!("mkdir: {e}")))?;
         }
         std::fs::write(&path, content).map_err(|e| ToolError::Failed(format!("write: {e}")))?;
+        // spec 60 §4:apply 即回退点——写入成功后框架立即提交(zealous 署名),
+        // 串行 apply 时工作区回到干净状态
+        commit_applied(&ctx.repo_root, &path)?;
         Ok(ToolOutput {
-            summary: format!("written {}", path.display()),
+            summary: format!("written {} (committed as rollback point)", path.display()),
         })
     }
+}
+
+/// 把刚写入的文件作为独立回退点提交;作者署名 zealous,与用户提交区分
+fn commit_applied(repo_root: &Path, file: &Path) -> Result<(), ToolError> {
+    let rel = file
+        .strip_prefix(repo_root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| file.display().to_string());
+    let add = std::process::Command::new("git")
+        .args(["add", "--", &rel])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| ToolError::Failed(format!("spawn git add: {e}")))?;
+    if !add.status.success() {
+        return Err(ToolError::Failed(format!(
+            "git add 失败: {}",
+            String::from_utf8_lossy(&add.stderr)
+        )));
+    }
+    let commit = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=zealous",
+            "-c",
+            "user.email=zealous@local",
+            "commit",
+            "-q",
+            "-m",
+            &format!("zealous: apply {rel}"),
+        ])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| ToolError::Failed(format!("spawn git commit: {e}")))?;
+    if !commit.status.success() {
+        return Err(ToolError::Failed(format!(
+            "apply 后自动 commit 失败(文件已写入,请手动提交): {}",
+            String::from_utf8_lossy(&commit.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// 主工作区写入保护(spec 60 §4):apply 前工作区必须干净,
+/// Git commit/status 是安全回退边界(spec 00 硬性前提)。
+fn assert_clean_worktree(repo_root: &Path) -> Result<(), ToolError> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| ToolError::Failed(format!("spawn git: {e}")))?;
+    if !out.status.success() {
+        return Err(ToolError::Failed(format!(
+            "git status 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let dirty = String::from_utf8_lossy(&out.stdout);
+    // `.zealous/` 是本工具自己的运行时数据(账本/提案),不算用户的脏工作区
+    let user_dirty: Vec<&str> = dirty
+        .lines()
+        .filter(|l| {
+            let path = l.get(3..).unwrap_or("").trim_start_matches('"');
+            !path.starts_with(".zealous/")
+        })
+        .collect();
+    if !user_dirty.is_empty() {
+        let preview: String = user_dirty
+            .iter()
+            .take(5)
+            .map(|l| format!("\n  {l}"))
+            .collect();
+        return Err(ToolError::Failed(format!(
+            "Git 工作区有未提交改动,拒绝写入主工作区。请先 commit/stash:{preview}"
+        )));
+    }
+    Ok(())
 }
 
 // ---------- T2:shell ----------
@@ -393,7 +473,35 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
+        // 脏工作区保护要求夹具有初始 commit(spec 60 §4)
+        let _ = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .output();
+        commit_all(&dir);
         (dir.clone(), ToolContext { repo_root: dir })
+    }
+
+    fn commit_all(dir: &Path) {
+        let _ = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output();
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "commit failed: {:?}", out.stderr);
     }
 
     #[test]
@@ -444,5 +552,21 @@ mod tests {
         assert_eq!(risk_of(&reg, "write_file"), Some(RiskTier::T1));
         assert_eq!(risk_of(&reg, "shell"), Some(RiskTier::T2));
         assert_eq!(risk_of(&reg, "nope"), None);
+    }
+
+    #[test]
+    fn dirty_worktree_blocks_write() {
+        let (dir, ctx) = fixture();
+        // 提交后制造脏状态:未跟踪文件让 porcelain 非空
+        std::fs::write(dir.join("untracked.txt"), "dirty").unwrap();
+        let write = WriteFile;
+        let err = write
+            .execute(r#"{"path":"new.txt","content":"x"}"#, &ctx)
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Failed(ref m) if m.contains("拒绝写入")),
+            "{err:?}"
+        );
+        assert!(!dir.join("new.txt").exists());
     }
 }

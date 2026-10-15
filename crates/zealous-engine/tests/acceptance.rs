@@ -36,6 +36,29 @@ fn unique_dir(tag: &str) -> PathBuf {
 }
 
 /// 真实 git 仓库夹具(spec 40 A7:Windows 可用)
+/// 初始 commit:脏工作区保护要求 apply 前工作区干净(spec 60 §4)
+fn commit_all(dir: &Path) {
+    let _ = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(dir)
+        .output();
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("git commit");
+    assert!(out.status.success(), "commit failed: {:?}", out.stderr);
+}
+
 fn git_repo(tag: &str) -> PathBuf {
     let dir = unique_dir(tag);
     let out = std::process::Command::new("git")
@@ -100,6 +123,7 @@ fn a1_full_loop_plan_analyze_apply_verify_report() {
     setup_provider_env();
     let repo = git_repo("a1");
     std::fs::write(repo.join("a.txt"), "content-a\n").unwrap();
+    commit_all(&repo);
     let ledger = create_task(&repo, "copy a.txt to out.txt and verify");
 
     let script = vec![
@@ -269,6 +293,7 @@ fn a4_two_workers_readonly_then_serial_apply() {
     let repo = git_repo("a4");
     std::fs::write(repo.join("x.txt"), "x").unwrap();
     std::fs::write(repo.join("y.txt"), "y").unwrap();
+    commit_all(&repo);
     let ledger = create_task(&repo, "analyze x and y");
 
     let script = vec![
