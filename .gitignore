@@ -9,6 +9,7 @@ node_modules/
 dist/
 build/
 out/
+/target/
 
 # 缓存
 .cache/
@@ -21,6 +22,8 @@ tmp/
 
 # 工具目录
 .zcode/
+# 任务运行时数据(开发/测试时在本仓库内产生)
+.zealous/
 
 # 操作系统 / 编辑器
 .DS_Store

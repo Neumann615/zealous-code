@@ -1,8 +1,16 @@
 # zealous-code
 
-本仓库是从零重建的新产品主线:`main` 分支为 orphan 分支,当前尚无产品代码。
+本仓库是从零重建的新产品主线:`main` 分支为 orphan 分支。
 旧工程完整快照保存在归档分支 `archive/pre-agent-assets-20261015`(基于原 master 及其历史),
 不再随主线演进。
+
+## 产品
+
+本地优先的 CLI/TUI 多 Agent 编程助手:任务可拆解、执行可控、风险可审批、过程可恢复。
+产品定义、领域模型、事件账本、权限分级与验收场景见 **`docs/spec/`**(spec 先于代码修订)。
+
+Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编排/工具/权限/Provider)→ `zealous-cli`(二进制 `zealous` + TUI)。
+桌面 app 演进路线(Tauri 内嵌 / app-server 协议)见 `docs/spec/50-architecture.md`。
 
 ## agent-assets/ 参考源码区
 
@@ -29,7 +37,7 @@ node scripts/update-agent-assets.mjs
 脚本行为:缺失则 clone;已存在则要求工作区干净,执行 `git fetch --prune origin`,
 并 detach 到 origin 默认分支的最新 commit;最后输出各仓库当前 commit 便于引用。
 
-## 后续原则
+## 开发原则
 
-- 产品模块、包结构与架构策略在新需求确定后另行建立,不迁移旧仓库的默认架构。
+- 先改 `docs/spec/`,再改代码;spec 与实现不一致视为 bug。
 - 上游参考代码只读,不在 `agent-assets/` 内进行开发或提交本地修改。
