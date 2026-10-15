@@ -56,8 +56,12 @@ pub struct ReadReport {
 }
 
 /// task 目录布局:`<repo_root>/.zealous/tasks/<task_id>/`
+/// task_id 必经 `TaskId::parse` 构造,目录名不可能包含路径分隔符(spec 60)。
 pub fn task_dir(repo_root: &Path, task_id: &TaskId) -> PathBuf {
-    repo_root.join(".zealous").join("tasks").join(&task_id.0)
+    repo_root
+        .join(".zealous")
+        .join("tasks")
+        .join(task_id.as_str())
 }
 
 pub fn events_path(task_dir: &Path) -> PathBuf {
@@ -402,7 +406,7 @@ mod tests {
         }
         let (_, proj, _) = Ledger::open(&repo, &tid).unwrap();
         assert_eq!(proj.tool_calls.len(), 1);
-        assert_eq!(proj.tool_calls[0].call_id, call.0);
+        assert_eq!(proj.tool_calls[0].call_id, call.as_str());
         let _ = fs::remove_dir_all(repo);
     }
 }

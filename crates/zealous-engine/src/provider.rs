@@ -180,6 +180,8 @@ impl RetryPolicy {
 pub struct OpenAiCompatProvider {
     config: ProviderConfig,
     retry: RetryPolicy,
+    /// 实际发起的 HTTP 尝试次数(观测/测试用)
+    pub attempts: std::sync::atomic::AtomicU32,
 }
 
 impl OpenAiCompatProvider {
@@ -187,6 +189,7 @@ impl OpenAiCompatProvider {
         Self {
             config,
             retry: RetryPolicy::default_policy(),
+            attempts: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -202,6 +205,8 @@ impl OpenAiCompatProvider {
     }
 
     fn once(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut messages = Vec::new();
         if let Some(sys) = &req.system {
             messages.push(serde_json::json!({ "role": "system", "content": sys }));
@@ -421,6 +426,16 @@ mod tests {
                     "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                 };
                 let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                // 优雅关闭:带未读数据直接 drop 会触发 RST(os 10054),
+                // 客户端偶发丢响应。先关发送方向,再把对端剩余字节读净。
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                let mut sink = [0u8; 4096];
+                while let Ok(n) = stream.read(&mut sink) {
+                    if n == 0 {
+                        break;
+                    }
+                }
             });
             addr
         })
@@ -483,6 +498,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resp.text, "hello from server");
+        // 两次 5xx + 至少一次成功;偶发网络抖动可能多消耗一次重试,语义不变
+        let attempts = provider.attempts.load(std::sync::atomic::Ordering::Relaxed);
+        assert!((3..=4).contains(&attempts), "attempts={attempts}");
     }
 
     #[test]

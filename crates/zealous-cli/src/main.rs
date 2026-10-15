@@ -141,10 +141,10 @@ fn cmd_list() -> i32 {
         return 0;
     }
     for s in &items {
-        println!("{:<40} {:?} {}", s.task_id.0, s.status, s.title);
+        println!("{:<40} {:?} {}", s.task_id.as_str(), s.status, s.title);
     }
     for (id, why) in &skipped {
-        println!("{:<40} CORRUPT {}", id.0, why);
+        println!("{:<40} CORRUPT {}", id.as_str(), why);
     }
     0
 }
@@ -154,13 +154,16 @@ fn cmd_status(task_id: &str) -> i32 {
         Ok(s) => s,
         Err(e) => return err(e),
     };
-    let tid = zealous_core::TaskId(task_id.to_string());
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
     match svc.open_task(&tid) {
         Ok((_, proj, report)) => {
             if report.torn_tail {
                 println!("[warn] 账本存在残缺尾行(上次进程中断残留),已忽略");
             }
-            println!("task:   {}", proj.task_id.0);
+            println!("task:   {}", proj.task_id.as_str());
             println!("title:  {}", proj.title);
             println!("status: {:?}", proj.status);
             if let Some(plan) = &proj.plan {
@@ -185,7 +188,10 @@ fn cmd_run(task_id: &str, yes: bool, no: bool) -> i32 {
         Ok(s) => s,
         Err(e) => return err(e),
     };
-    let tid = zealous_core::TaskId(task_id.to_string());
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
     let (ledger, proj, _) = match svc.open_task(&tid) {
         Ok(x) => x,
         Err(e) => return err(e.to_string()),
@@ -244,7 +250,10 @@ fn cmd_events(task_id: &str) -> i32 {
         Ok(r) => r,
         Err(e) => return err(e),
     };
-    let tid = zealous_core::TaskId(task_id.to_string());
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
     let path = zealous_engine::ledger::events_path(&zealous_engine::ledger::task_dir(&repo, &tid));
     match zealous_engine::ledger::read_events(&path) {
         Ok((events, report)) => {

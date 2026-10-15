@@ -159,7 +159,11 @@ impl TaskService {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().into_owned();
-            let task_id = TaskId(dir_name);
+            // 目录名即 ID:非法目录名视为外部污染,跳过(spec 60)
+            let task_id = match TaskId::parse(&dir_name) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
             let path = crate::ledger::events_path(&entry.path());
             match std::fs::read_to_string(&path)
                 .map_err(LedgerError::Io)
@@ -185,7 +189,7 @@ impl TaskService {
                 Err(e) => skipped.push((task_id.clone(), e.to_string())),
             }
         }
-        summaries.sort_by(|a, b| a.task_id.0.cmp(&b.task_id.0));
+        summaries.sort_by(|a, b| a.task_id.as_str().cmp(b.task_id.as_str()));
         Ok((summaries, skipped))
     }
 }

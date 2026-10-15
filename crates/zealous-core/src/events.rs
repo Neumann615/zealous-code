@@ -251,7 +251,7 @@ mod tests {
         let e = TaskEvent::new(
             1,
             "2026-10-15T00:00:00.000Z".into(),
-            TaskId("task_x".into()),
+            TaskId::generate(),
             AgentRef::User,
             EventPayload::TaskCreated {
                 title: "t".into(),

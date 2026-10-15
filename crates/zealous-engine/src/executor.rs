@@ -137,7 +137,7 @@ impl ToolExecutor {
                     },
                 )
                 .map_err(ExecutorError::LedgerIo)?;
-            let decision = self.sink.decide(&call_id.0, &summary);
+            let decision = self.sink.decide(call_id.as_str(), &summary);
             ledger
                 .append(
                     AgentRef::User,

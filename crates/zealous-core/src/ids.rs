@@ -3,7 +3,7 @@
 //! 随机性来源:进程启动时的纳秒时钟 + 静态变量地址(ASLR)混合出一个进程种子,
 //! 进程内由单调计数器保证不重复;跨进程靠毫秒时间戳区分(spec 20:无需中心分配器)。
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -61,10 +61,32 @@ fn encode_ulid(time_ms: u64, rand_hi: u64, rand_lo: u64) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// ID 解析错误(spec 60:非法输入必须在触达文件系统前被拒绝)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdError {
+    pub raw: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for IdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid id {:?}: {}", self.raw, self.reason)
+    }
+}
+
+impl std::error::Error for IdError {}
+
+/// ULID 尾段:26 位 Crockford Base32 字符
+fn is_crockford_ulid_tail(s: &str) -> bool {
+    s.len() == 26
+        && s.bytes()
+            .all(|b| CROCKFORD.contains(&b.to_ascii_uppercase()))
+}
+
 macro_rules! define_id {
     ($name:ident, $prefix:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(pub String);
+        pub struct $name(pub(crate) String);
 
         impl $name {
             pub fn generate() -> Self {
@@ -72,6 +94,27 @@ macro_rules! define_id {
                 let hi = next_random();
                 let lo = next_random();
                 Self(format!($prefix, encode_ulid(t, hi & 0xFFFF, lo)))
+            }
+
+            /// 唯一合法的外部构造入口:prefix + 26 位 Crockford ULID。
+            /// 防路径穿越(spec 60):`../x`、任意字符串都在这里被拒绝。
+            pub fn parse(s: &str) -> Result<Self, crate::ids::IdError> {
+                // $prefix 是 format! 模板(如 "task_{}"),剥掉占位符得到纯前缀
+                let plain: &str = $prefix.trim_end_matches("{}");
+                let expected_len = plain.len() + 26;
+                let reason = if !s.starts_with(plain) {
+                    format!("must start with {plain:?}")
+                } else if s.len() != expected_len {
+                    format!("length must be {expected_len}")
+                } else if !is_crockford_ulid_tail(&s[plain.len()..]) {
+                    "tail must be 26 Crockford base32 chars".to_string()
+                } else {
+                    return Ok(Self(s.to_string()));
+                };
+                Err(crate::ids::IdError {
+                    raw: s.to_string(),
+                    reason,
+                })
             }
 
             pub fn as_str(&self) -> &str {
@@ -93,7 +136,8 @@ macro_rules! define_id {
 
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                String::deserialize(d).map($name)
+                let s = String::deserialize(d)?;
+                Self::parse(&s).map_err(de::Error::custom)
             }
         }
     };
@@ -122,5 +166,25 @@ mod tests {
         let json = serde_json::to_string(&id).unwrap();
         assert_eq!(json, format!("\"{id}\""));
         assert_eq!(serde_json::from_str::<ToolCallId>(&json).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_rejects_path_traversal_and_garbage() {
+        for bad in [
+            "../evil",
+            "task_../evil",
+            "task_",
+            "task_ABCDEFGHIJKLMNOPQRSTU111",   // 25 位
+            "task_ABCDEFGHIJKLMNOPQRSTU11111", // 27 位
+            "task_abcdefghijklmnopqrstuv1111", // 非法字符 小写 i/l/o/u 不在 CROCKFORD
+            "run_ABCDEFGHIJKLMNOPQRSTUV1111",  // 前缀不符
+            "",
+        ] {
+            let err = TaskId::parse(bad).expect_err(bad);
+            assert!(!err.reason.is_empty());
+        }
+        // 合法:generate 产物必须能被 parse 接受
+        let good = TaskId::generate();
+        assert_eq!(TaskId::parse(good.as_str()).unwrap(), good);
     }
 }
