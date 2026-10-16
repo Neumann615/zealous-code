@@ -133,12 +133,19 @@ impl StdinApproval {
 }
 
 impl ApprovalSink for StdinApproval {
-    fn decide(&self, call_id: &str, summary: &str) -> ApprovalDecision {
+    fn decide(&self, info: &zealous_engine::approval::ApprovalRequestInfo) -> ApprovalDecision {
+        let (call_id, summary) = (info.call_id.as_str(), info.summary.as_str());
         if let Some(d) = self.auto {
-            println!("[approval auto-{:?}] {call_id}: {summary}", d);
+            println!(
+                "[approval auto-{:?}] {call_id}(工具 {} 风险 {:?}): {summary}",
+                d, info.tool, info.risk
+            );
             return d;
         }
-        println!("\n=== 审批请求 {call_id} ===\n{summary}\n批准? [y/N](Ctrl-C 中断任务)");
+        println!(
+            "\n=== 审批请求 {call_id}(工具 {} 风险 {:?})===\n{summary}\n批准? [y/N](Ctrl-C 中断任务)",
+            info.tool, info.risk
+        );
         let _ = std::io::stdout().flush();
         let rx = self.rx.lock().unwrap();
         loop {
@@ -516,7 +523,15 @@ mod approval_tests {
         let sink = StdinApproval::with_rx(rx, abort.clone());
         let sink = Arc::new(sink);
         let s2 = sink.clone();
-        let handle = std::thread::spawn(move || s2.decide("c1", "shell: echo"));
+        let handle = std::thread::spawn(move || {
+            let info = zealous_engine::approval::ApprovalRequestInfo {
+                call_id: "c1".into(),
+                tool: "shell".into(),
+                risk: zealous_core::RiskTier::T2,
+                summary: "shell: echo".into(),
+            };
+            s2.decide(&info)
+        });
         std::thread::sleep(Duration::from_millis(150));
         assert!(!handle.is_finished(), "无决策且无 abort 时应保持阻塞");
         abort.store(true, Ordering::Relaxed);
@@ -529,11 +544,17 @@ mod approval_tests {
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let sink = StdinApproval::with_rx(rx, abort.clone());
+        let info = zealous_engine::approval::ApprovalRequestInfo {
+            call_id: "c".into(),
+            tool: "shell".into(),
+            risk: zealous_core::RiskTier::T2,
+            summary: "s".into(),
+        };
         tx.send("y".into()).unwrap();
-        assert_eq!(sink.decide("c", "s"), ApprovalDecision::Approve);
+        assert_eq!(sink.decide(&info), ApprovalDecision::Approve);
         let (tx2, rx2) = mpsc::channel();
         let sink2 = StdinApproval::with_rx(rx2, abort.clone());
         tx2.send("n".into()).unwrap();
-        assert_eq!(sink2.decide("c", "s"), ApprovalDecision::Reject);
+        assert_eq!(sink2.decide(&info), ApprovalDecision::Reject);
     }
 }

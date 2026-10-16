@@ -241,7 +241,7 @@ struct BlockUntilAbort {
 }
 
 impl ApprovalSink for BlockUntilAbort {
-    fn decide(&self, _call_id: &str, _summary: &str) -> ApprovalDecision {
+    fn decide(&self, _req: &zealous_engine::approval::ApprovalRequestInfo) -> ApprovalDecision {
         while !self.abort.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -545,8 +545,14 @@ fn s110_direct_execution_mode_first_turn_tool() {
         .unwrap();
     std::process::Command::new("git")
         .args([
-            "-c", "user.name=t", "-c", "user.email=t@t",
-            "commit", "-q", "-m", "add a.txt",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "add a.txt",
         ])
         .current_dir(&repo)
         .output()

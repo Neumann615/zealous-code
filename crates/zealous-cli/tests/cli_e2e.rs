@@ -301,13 +301,14 @@ fn e2e_real_binary_plan_write_approve_complete() {
     assert!(quiet_status.success(), "quiet run exit: {quiet_status}");
     let mut quiet_out = String::new();
     let _ = quiet_stdout_pipe.read_to_string(&mut quiet_out);
+    // 精确标记:turn 进度以 "· [" 开头;审批行与最终状态保留
     assert!(
-        !quiet_out.contains("· [") && !quiet_out.contains("工具 "),
+        !quiet_out.contains("· [") && !quiet_out.contains("完成"),
         "--quiet 不应输出 turn/工具进度: {quiet_out}"
     );
     assert!(
-        quiet_out.contains("任务最终状态"),
-        "--quiet 保留最终结果: {quiet_out}"
+        quiet_out.contains("审批请求") && quiet_out.contains("任务最终状态"),
+        "--quiet 保留审批与最终结果: {quiet_out}"
     );
     assert_eq!(
         std::fs::read_to_string(repo.join("README.md")).unwrap(),

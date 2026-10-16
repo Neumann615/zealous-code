@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use zealous_core::{AgentRef, AgentRunId, ApprovalDecision, EventPayload, RiskTier, ToolCallId};
 
-use crate::approval::ApprovalSink;
+use crate::approval::{ApprovalRequestInfo, ApprovalSink};
 use crate::ledger::Ledger;
 use crate::tools::{ToolContext, ToolError};
 
@@ -136,6 +136,12 @@ impl ToolExecutor {
                 repo_root: self.repo_root.clone(),
             };
             let summary = tool.summarize(raw_args, &ctx);
+            let info = ApprovalRequestInfo {
+                call_id: call_id.to_string(),
+                tool: tool_name.to_string(),
+                risk,
+                summary: summary.clone(),
+            };
             ledger
                 .append(
                     agent.clone(),
@@ -145,7 +151,7 @@ impl ToolExecutor {
                     },
                 )
                 .map_err(ExecutorError::LedgerIo)?;
-            let decision = self.sink.decide(call_id.as_str(), &summary);
+            let decision = self.sink.decide(&info);
             ledger
                 .append(
                     AgentRef::User,
