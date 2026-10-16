@@ -67,6 +67,32 @@ fn git_repo(tag: &str) -> PathBuf {
         .output()
         .expect("git init");
     assert!(out.status.success(), "git init failed: {:?}", out.stderr);
+    // 初始 commit:脏工作区守卫(spec 60 §4)要求 apply 前工作区干净
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+                "--allow-empty",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "initial commit failed"
+    );
     dir
 }
 
@@ -502,4 +528,147 @@ fn s70_repair_exhaustion_fails_run_explainably() {
         msg.contains("model_action") && msg.contains("修复"),
         "原因应说明修复耗尽: {msg}"
     );
+}
+
+// ---------- spec 110:Direct Execution Mode ----------
+
+#[test]
+fn s110_direct_execution_mode_first_turn_tool() {
+    setup_provider_env();
+    let repo = git_repo("s110-direct");
+    std::fs::write(repo.join("a.txt"), "content-a\n").unwrap();
+    // a.txt 入库:脏工作区守卫要求 apply 前工作区干净
+    std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c", "user.name=t", "-c", "user.email=t@t",
+            "commit", "-q", "-m", "add a.txt",
+        ])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let ledger = create_task(&repo, "direct: copy a.txt to out.txt");
+
+    // 规划轮直接返回 tool(无 plan)—— 真实模型常见形态
+    let script = vec![
+        act(r#"{"action":"tool","tool":"read_file","args":{"path":"a.txt"}}"#),
+        act(
+            r#"{"action":"tool","tool":"write_file","args":{"path":"out.txt","content":"content-a\n"}}"#,
+        ),
+        act(r#"{"action":"message","text":"direct execution done"}"#),
+    ];
+    let orch = orchestrator(
+        &repo,
+        script,
+        Arc::new(AutoApprove),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let status = orch
+        .run_task(&ledger, "direct: copy a.txt to out.txt")
+        .unwrap();
+    assert_eq!(status, TaskStatus::Completed);
+
+    // 文件修改存在
+    assert_eq!(
+        std::fs::read_to_string(repo.join("out.txt")).unwrap(),
+        "content-a\n"
+    );
+
+    // 隐式 plan 落账;无 Worker(spec 110 §1)
+    let proj = assert_ledger_healthy(&repo, ledger.task_id());
+    assert!(proj
+        .plan
+        .as_deref()
+        .unwrap_or_default()
+        .starts_with("Direct execution:"));
+    assert!(
+        proj.runs
+            .iter()
+            .all(|r| r.role == zealous_core::AgentRole::Coordinator),
+        "Direct 模式不创建 Worker"
+    );
+
+    // 事件顺序(spec 110 §1):coordinator run 内
+    // TS → TCR → TCC → TS → … 且 turn 编号单调递增、成对不重复
+    let (events, _) = svc::events_for_test(&repo, ledger.task_id());
+    let coord_run = proj
+        .runs
+        .first()
+        .expect("应有 coordinator run")
+        .run_id
+        .clone();
+    let mut started: std::collections::BTreeMap<u64, bool> = std::collections::BTreeMap::new();
+    let mut completed: std::collections::BTreeMap<u64, bool> = std::collections::BTreeMap::new();
+    let mut prev_turn = 0u64;
+    for e in &events {
+        if e.agent.as_str() != "coordinator" {
+            continue;
+        }
+        match &e.payload {
+            zealous_core::EventPayload::TurnStarted { run_id, turn }
+                if run_id.as_str() == coord_run =>
+            {
+                assert!(!started.contains_key(turn), "turn {turn} 重复开始");
+                assert!(*turn > prev_turn, "turn 编号应单调递增");
+                started.insert(*turn, true);
+                prev_turn = *turn;
+            }
+            zealous_core::EventPayload::TurnCompleted { run_id, turn }
+                if run_id.as_str() == coord_run =>
+            {
+                assert!(started.contains_key(turn), "TC 前必须有 TS");
+                assert!(!completed.contains_key(turn), "turn {turn} 重复完成");
+                completed.insert(*turn, true);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(started.len(), 3, "3 个 turn(读/写/汇报)");
+    assert_eq!(completed.len(), 3);
+}
+
+// 供测试使用的账本读取(封装自 engine 公开 API)
+mod svc {
+    pub fn events_for_test(
+        repo: &std::path::Path,
+        task_id: &zealous_core::TaskId,
+    ) -> (
+        Vec<zealous_core::TaskEvent>,
+        zealous_engine::ledger::ReadReport,
+    ) {
+        zealous_engine::ledger::read_events(&zealous_engine::ledger::events_path(
+            &zealous_engine::ledger::task_dir(repo, task_id),
+        ))
+        .unwrap()
+    }
+}
+
+#[test]
+fn s110_plan_in_execution_phase_enters_repair() {
+    setup_provider_env();
+    let repo = git_repo("s110-plan-repair");
+    let ledger = create_task(&repo, "plan in exec phase");
+
+    let script = vec![
+        act(r#"{"action":"plan","plan":"p","workers":[]}"#),
+        // 执行阶段再返回 plan → 修复轮
+        act(r#"{"action":"plan","plan":"again","workers":[]}"#),
+        act(r#"{"action":"message","text":"done after repair"}"#),
+    ];
+    let orch = orchestrator(
+        &repo,
+        script,
+        Arc::new(AutoApprove),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let status = orch.run_task(&ledger, "plan in exec phase").unwrap();
+    assert_eq!(status, TaskStatus::Completed);
+
+    let proj = assert_ledger_healthy(&repo, ledger.task_id());
+    let (_, msg) = proj.last_error.expect("修复错误应落账");
+    assert!(msg.contains("plan 动作不允许在此阶段"), "{msg}");
 }

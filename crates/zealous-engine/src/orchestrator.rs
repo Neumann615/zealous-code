@@ -546,6 +546,11 @@ impl Orchestrator {
         let mut ctx = LoopCtx {
             transcript: Vec::new(),
         };
+        // Direct Execution Mode(spec 110):首轮返回 tool 时其结果作为
+        // 下一轮 prompt 的起点
+        let mut direct_first_result: Option<String> = None;
+        // 隐式 plan 已在 Direct 分支落账时置位,避免外层重复落账
+        let mut plan_already_logged = false;
         // 规划轮同样受修复轮约束(spec 70):首轮 + ≤2 次修复;
         // turn 编号从此处起算,apply 阶段接续(spec 20:run 内 turn 单调)
         let action = {
@@ -564,6 +569,68 @@ impl Orchestrator {
                 };
                 match self.turn_action(&env, &mut ctx, &coord_system, &prompt, turn_no) {
                     Ok(a) => {
+                        // Direct Execution Mode(spec 110):规划轮返回合法
+                        // tool 动作时不再失败——生成隐式 plan,并在同一轮内
+                        // 执行该工具(TurnStarted → ToolCall* → TurnCompleted),
+                        // 不创建 Worker。
+                        if let Action::Tool { tool, args_json } = &a {
+                            let implicit_plan = format!("Direct execution: {task_prompt}");
+                            self.append(
+                                ledger,
+                                AgentRef::Coordinator,
+                                EventPayload::TaskPlanUpdated {
+                                    plan: implicit_plan.clone(),
+                                },
+                            )?;
+                            plan_already_logged = true;
+                            let outcome = self
+                                .executor
+                                .run_tool(
+                                    ledger,
+                                    &coord_run,
+                                    AgentRef::Coordinator,
+                                    args_json,
+                                    tool,
+                                )
+                                .map_err(|e| match e {
+                                    crate::executor::ExecutorError::LedgerIo(le) => le,
+                                    crate::executor::ExecutorError::Ledger(fe, _) => {
+                                        crate::ledger::LedgerError::Fold(fe)
+                                    }
+                                })
+                                .map_err(OrchestratorError::Ledger)?;
+                            self.emit(
+                                !outcome.ok,
+                                format!(
+                                    "工具 {}({:?}) {}",
+                                    tool,
+                                    outcome.risk,
+                                    if outcome.ok {
+                                        "完成"
+                                    } else {
+                                        "失败/被拒"
+                                    }
+                                ),
+                            );
+                            self.append(
+                                ledger,
+                                AgentRef::Coordinator,
+                                EventPayload::TurnCompleted {
+                                    run_id: coord_run.clone(),
+                                    turn: turn_no,
+                                },
+                            )?;
+                            parsed = Some(Action::Plan {
+                                plan: implicit_plan,
+                                workers: vec![],
+                            });
+                            direct_first_result = Some(format!(
+                                "tool `{tool}` result (ok={}):\n{}\n\n继续:返回下一个 JSON 动作。",
+                                outcome.ok,
+                                truncate(&outcome.text, 2000)
+                            ));
+                            break;
+                        }
                         // 成功路径的 TurnCompleted 由本循环补齐(break 前恰好一次)
                         self.append(
                             ledger,
@@ -618,20 +685,17 @@ impl Orchestrator {
                 // 模型直接给结论而无拆解:V1 允许(单 Agent 任务),作为方案落地
                 (text, Vec::new())
             }
-            Action::Tool { tool, args_json } => {
-                // 规划轮不允许直接动工具:记录并失败(可解释)
-                return self.fail_task(
-                    ledger,
-                    &coord_run,
-                    format!("planning turn returned tool action: {tool} {args_json}"),
-                );
-            }
+            // Direct Execution Mode 已在规划循环内落账并执行;
+            // 正常流不会到达此臂(防御性直通)
+            Action::Tool { .. } => (String::new(), Vec::new()),
         };
-        self.append(
-            ledger,
-            AgentRef::Coordinator,
-            EventPayload::TaskPlanUpdated { plan: plan.clone() },
-        )?;
+        if !plan_already_logged {
+            self.append(
+                ledger,
+                AgentRef::Coordinator,
+                EventPayload::TaskPlanUpdated { plan: plan.clone() },
+            )?;
+        }
 
         if self.aborted() {
             return self.interrupt(ledger, &coord_run, "aborted after planning");
@@ -706,12 +770,17 @@ impl Orchestrator {
         ctx.transcript.push(crate::provider::ChatMessage::assistant(
             serde_json::json!({"action":"plan","plan":plan}).to_string(),
         ));
+        // Direct Execution Mode:首 prompt 为首轮工具结果
+        let continue_prompt = match &direct_first_result {
+            Some(p) => p.clone(),
+            None => apply_prompt,
+        };
         let run = self.agent_loop_continue(
             ledger,
             &coord_run,
             &mut ctx,
             &coord_system,
-            &apply_prompt,
+            &continue_prompt,
             planning_turns + 1,
         );
         self.finish_task(ledger, &coord_run, run)
@@ -813,7 +882,36 @@ impl Orchestrator {
                     );
                 }
                 Action::Plan { .. } => {
-                    prompt = "plan is not allowed after planning; use tool or message.".into();
+                    // 执行阶段不允许 plan(spec 110):视为非法动作进修复轮
+                    repairs += 1;
+                    self.append(
+                        ledger,
+                        AgentRef::Coordinator,
+                        EventPayload::ErrorOccurred {
+                            scope: "model_action".into(),
+                            message: "plan 动作不允许在此阶段".into(),
+                        },
+                    )
+                    .map_err(AgentLoopOutcome::Ledger)?;
+                    if repairs > MAX_ACTION_REPAIRS {
+                        return Err(AgentLoopOutcome::InvalidModelOutput(
+                            "plan 在执行阶段被拒绝且修复耗尽".into(),
+                        ));
+                    }
+                    self.append(
+                        ledger,
+                        AgentRef::Coordinator,
+                        EventPayload::TurnCompleted {
+                            run_id: run_id.clone(),
+                            turn: turn_no,
+                        },
+                    )
+                    .map_err(AgentLoopOutcome::Ledger)?;
+                    prompt = format!(
+                        "plan 动作不允许在此阶段。
+{ACTION_SCHEMA}"
+                    );
+                    continue;
                 }
             }
             // Tool/Plan 路径的收尾(Message 已提前 return;修复路径在分支内)
