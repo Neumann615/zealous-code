@@ -32,7 +32,7 @@
 | create_task | `{title, brief?}` | brief 为**文本**(非文件);复用 TaskService |
 | run_task | `{task_id}` | 启动 engine worker;V1 同时只允许一个运行中任务 |
 | interrupt_task | `{task_id}` | 设置 abort,不直接改状态 |
-| decide_approval | `{decision}` | 仅针对当前 pending;无 pending/未知 → 协议错误 |
+| decide_approval | `{task_id, call_id, decision}` | task 须匹配运行任务、call_id 须匹配当前 pending(未知/重复/过期 → `no_pending_approval`);决策后清除绑定 |
 | shutdown | `{}` | 等待 worker 完成后退出 |
 
 ## 4. 响应与通知
