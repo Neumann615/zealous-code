@@ -3,14 +3,15 @@
 //! 同步 IO + 线程 + channel;broken pipe 干净退出;EOF 等待 worker。
 
 pub mod protocol;
+pub mod runner;
 pub mod session;
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use protocol::{parse_error_response, parse_request, ErrorResponse, Notification, Response};
+use protocol::{parse_request, Notification};
 use session::Session;
 
 pub fn run_command(repo_root: PathBuf) -> i32 {
@@ -44,8 +45,15 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
             && out.flush().is_ok()
     }
 
+    let mut last_poll = Instant::now();
     loop {
-        // 1) 先冲刷通知(保持顺序:通知先于后续响应)
+        // 1) 订阅轮询(spec 110 §2):周期推送 cursor 之后的新账本事件
+        if last_poll.elapsed() >= Duration::from_millis(400) {
+            session.poll_subscription();
+            last_poll = Instant::now();
+        }
+
+        // 2) 冲刷通知(保持顺序:通知先于后续响应)
         while let Ok(note) = notif_rx.try_recv() {
             let Ok(json) = serde_json::to_string(&note) else {
                 break;
@@ -55,30 +63,42 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
             }
         }
 
-        // 2) 请求(非阻塞轮询,通知得以在无请求时持续推送)
+        // 3) 请求(非阻塞轮询,通知得以在无请求时持续推送)
         match request_rx.try_recv() {
             Ok(line) => {
-                let resp: Response = match parse_request(&line) {
+                let handled = match parse_request(&line) {
                     Ok(req) => session.handle(req),
-                    Err(_) => parse_error_response(&line),
+                    Err(e) => session::Handled::ParseError(protocol::parse_error_response(
+                        &format!("{line}{e}"),
+                    )),
                 };
-                let Ok(json) = serde_json::to_string(&resp) else {
+                let (json, shutdown) = match handled {
+                    session::Handled::Response(resp) => (serde_json::to_string(&resp), false),
+                    session::Handled::ParseError(resp) => (serde_json::to_string(&resp), false),
+                    session::Handled::Shutdown(resp) => {
+                        // shutdown:等待 worker(join)后输出响应并干净退出
+                        session.worker_finished();
+                        (serde_json::to_string(&resp), true)
+                    }
+                };
+                let Ok(json) = json else {
                     continue;
                 };
                 if !write_line(&mut out, &json) {
                     return 1;
                 }
-                // shutdown:等待 worker(join),随后进程退出;
-                // stdin 读取线程是 IO 管道,随进程结束,不 join(否则
-                // 客户端不关 stdin 会永远挂起)
-                if resp.ok && line.contains("\"shutdown\"") {
-                    session.worker_finished();
+                if shutdown {
                     return 0;
                 }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                // stdin EOF:等待当前 worker 完成
+                // stdin EOF:等待当前 worker 完成后冲刷退出
                 session.worker_finished();
+                while let Ok(note) = notif_rx.try_recv() {
+                    if let Ok(json) = serde_json::to_string(&note) {
+                        let _ = write_line(&mut out, &json);
+                    }
+                }
                 break;
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -95,7 +115,3 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
     }
     0
 }
-
-// 保留 ErrorResponse 导入使用(parse_error_response 内部使用)
-#[allow(dead_code)]
-fn _assert_types(_: ErrorResponse, _: Response, _: Notification) {}

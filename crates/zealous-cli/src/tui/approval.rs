@@ -80,6 +80,7 @@ impl ApprovalSink for ChannelApprovalSink {
 /// 建立审批通道(每次运行一对);返回:
 /// (engine 侧 sink, TUI 收请求, TUI 发决策)
 pub fn channel(
+    task_id: String,
     abort: Arc<AtomicBool>,
 ) -> (
     ChannelApprovalSink,
@@ -89,7 +90,7 @@ pub fn channel(
     let (request_tx, request_rx) = mpsc::channel();
     let (decision_tx, decision_rx) = mpsc::channel();
     (
-        ChannelApprovalSink::new(String::new(), request_tx, decision_rx, abort),
+        ChannelApprovalSink::new(task_id, request_tx, decision_rx, abort),
         request_rx,
         decision_tx,
     )
@@ -111,7 +112,7 @@ mod tests {
     #[test]
     fn decision_roundtrip() {
         let abort = Arc::new(AtomicBool::new(false));
-        let (sink, request_rx, decision_tx) = channel(abort);
+        let (sink, request_rx, decision_tx) = channel("task_x".into(), abort);
         let sink = Arc::new(sink);
         let h = {
             let sink = sink.clone();
@@ -133,7 +134,7 @@ mod tests {
     #[test]
     fn abort_returns_reject() {
         let abort = Arc::new(AtomicBool::new(false));
-        let (sink, request_rx, decision_tx) = channel(abort.clone());
+        let (sink, request_rx, decision_tx) = channel("task_x".into(), abort.clone());
         let sink = Arc::new(sink);
         let h = {
             let sink = sink.clone();
@@ -153,7 +154,7 @@ mod tests {
     #[test]
     fn disconnected_channel_fails_closed() {
         let abort = Arc::new(AtomicBool::new(false));
-        let (sink, request_rx, decision_tx) = channel(abort);
+        let (sink, request_rx, decision_tx) = channel("task_x".into(), abort);
         // TUI 侧先全部断开
         drop(request_rx);
         drop(decision_tx);

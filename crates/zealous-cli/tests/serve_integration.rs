@@ -248,15 +248,23 @@ fn serve_protocol_full_flow_with_mock_model() {
         };
         let v: serde_json::Value = serde_json::from_str(&line).expect("合法 JSON 行");
         if v.get("event").and_then(|e| e.as_str()) == Some("approval_requested") {
-            // 断言摘要含 exact old/new(spec 80 §4)
-            let summary = v["params"]["summary"].as_str().unwrap();
+            // 断言摘要含 exact old/new + 绑定要素(spec 110 §3)
+            let params = &v["params"];
+            let summary = params["summary"].as_str().unwrap();
             assert!(summary.contains("fixture"), "{summary}");
             assert!(summary.contains("edited by serve"), "{summary}");
+            assert!(params["task_id"].as_str().is_some());
+            assert!(params["tool"].as_str().is_some());
+            assert!(params["risk"].as_str().is_some());
             let id = next_id;
             next_id += 1;
             proc.send(&serde_json::json!({
                 "id": id, "cmd": "decide_approval",
-                "params": {"decision": "approve"}
+                "params": {
+                    "task_id": params["task_id"].clone(),
+                    "call_id": params["call_id"].clone(),
+                    "decision": "approve",
+                }
             }));
             approved = true;
         }

@@ -48,6 +48,12 @@ impl ProtocolError {
     }
 }
 
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
 impl Response {
     pub fn ok(id: u64, result: serde_json::Value) -> Self {
         Self {
@@ -97,10 +103,22 @@ impl Notification {
         }
     }
 
-    pub fn approval_requested(call_id: &str, summary: &str) -> Self {
+    pub fn approval_requested(
+        task_id: &str,
+        call_id: &str,
+        tool: &str,
+        risk: &str,
+        summary: &str,
+    ) -> Self {
         Self {
             event: "approval_requested",
-            params: serde_json::json!({ "call_id": call_id, "summary": summary }),
+            params: serde_json::json!({
+                "task_id": task_id,
+                "call_id": call_id,
+                "tool": tool,
+                "risk": risk,
+                "summary": summary,
+            }),
         }
     }
 
@@ -182,7 +200,8 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""id":3"#) && json.contains(r#""ok":true"#));
 
-        let note = Notification::approval_requested("call_1", "write x");
+        let note =
+            Notification::approval_requested("task_1", "call_1", "write_file", "T1", "write x");
         let json = serde_json::to_string(&note).unwrap();
         assert!(json.contains(r#""event":"approval_requested""#));
         // 通知不携带 id 字段(注意 call_id 尾部含 id 子串,须带引号匹配)

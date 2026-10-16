@@ -288,7 +288,7 @@ fn handle_key(
                         state.abort_requested = false;
                         abort.store(false, Ordering::Relaxed);
                         let (approval_sink, request_rx, decision_tx_ch) =
-                            approval::channel(abort.clone());
+                            approval::channel(id.as_str().to_string(), abort.clone());
                         // 审批请求转发进统一事件流
                         let fwd_tx = event_tx.clone();
                         std::thread::spawn(move || {
@@ -453,7 +453,8 @@ mod integration_tests {
         // ---- TUI 控制器接线(与 run_command 循环同构,无终端)----
         let abort = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel();
-        let (approval_sink, request_rx, decision_tx) = approval::channel(abort.clone());
+        let (approval_sink, request_rx, decision_tx) =
+            approval::channel("tui-it".into(), abort.clone());
         let (progress_sink, progress_rx) = progress::channel();
         // 审批请求转发(同 run_command 内的转发线程)
         {
