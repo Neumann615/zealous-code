@@ -3,7 +3,7 @@
 ## Traceability (all values measured at build time)
 
 - Runtime source commit: 66cad6f63f77adc886ff1b92b23b7709a335f32a
-- RC record commit: 0f7218ca8706a32e11b326f3a1ae769982877706
+- RC record commit: 3e9426a0663f2246a31762cac011dfb46970a514 (记录首落点;本字段更新为最后一笔修正)
 - Rustc release: 1.99.0 (measured via rustc -vV)
 - Host triple: x86_64-pc-windows-gnu (measured via rustc -vV)
 - Build time: 2026-10-17 10:55:47 UTC
