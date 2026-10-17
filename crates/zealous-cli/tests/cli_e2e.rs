@@ -441,7 +441,10 @@ fn real_model_smoke() {
     // 脱敏断言:输出不含凭据(spec 70 §5)
     for output in [&run_stdout, &run_stderr] {
         assert!(!output.contains(&api_key), "输出泄漏 API key");
-        assert!(!output.contains("Authorization"), "输出泄漏请求头名");
+        assert!(
+            !output.contains(&format!("Bearer {api_key}")),
+            "输出泄漏 Authorization 头值"
+        );
     }
     assert!(
         status.success(),
@@ -462,9 +465,14 @@ fn real_model_smoke() {
         .join(&task_id)
         .join("events.jsonl");
     let text = std::fs::read_to_string(&ledger_path).unwrap();
-    for needle in [&api_key, "Authorization", "Bearer "] {
-        assert!(!text.contains(needle), "账本泄漏敏感串: {needle}");
-    }
+    // 凭据泄漏检查:密钥值本身与带密钥的 Authorization 头值形式。
+    // 不查裸 "Authorization" 头名——合法文件名(如
+    // Microsoft.AspNetCore.Authorization.dll)会出现在工具输出里。
+    assert!(!text.contains(api_key.as_str()), "账本泄漏 API key");
+    assert!(
+        !text.contains(&format!("Bearer {api_key}")),
+        "账本泄漏 Authorization 头值"
+    );
     let events: Vec<serde_json::Value> = text
         .lines()
         .filter(|l| !l.is_empty())
