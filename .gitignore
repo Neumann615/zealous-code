@@ -32,3 +32,5 @@ dist/
 # 操作系统 / 编辑器
 .DS_Store
 Thumbs.db
+# Windows reserved device name
+NUL
