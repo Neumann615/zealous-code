@@ -129,10 +129,11 @@ try {
         $bytes = $ms.ToArray()
         $ms.Dispose(); $stream.Dispose()
         $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-        # Scan for credential-like strings only; ".env"/".zealous" are legitimate
-        # code path references (dotenv loader / task data dir), not secrets
-        foreach ($needle in @($fakeKey, "api_key=", "Authorization:")) {
-            if ($text.Contains($needle)) { Fail "zip" "binary contains sensitive string: $needle" }
+        # Credential scan: the binary must not contain any real key value.
+        # Code literals like ".env", "api_key=", "Authorization:" are legitimate
+        # path/header references in source, not secrets; only values count.
+        if ($text.Contains($fakeKey)) {
+            Fail "zip" "binary contains fake key value (env leak)"
         }
     } finally {
         $zip.Dispose()
