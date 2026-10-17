@@ -18,9 +18,9 @@
 | 4 | 审批大型 edit_file 内容并完整滚动查看 | PASS | 功能层:审批摘要含 exact old/new(CLI E2E 断言 fixture→edited);滚动钳制与"已完整查看"标记由单测覆盖(approval_scroll_clamps_and_reports_end / approval_arrived_resets_scroll);弹窗渲染由 TestBackend 覆盖(approval_modal_shows_summary) |
 | 5 | x 中断任务并确认挂起审批收尾 | PASS | 自动化:acceptance.rs a3_interrupt_records_state_and_pending_approvals_rejected(挂起审批按 Reject 收尾,TaskInterrupted 落账) |
 | 6 | R 恢复任务并确认投影接续 | PASS | 自动化:真实模型任务中断后 R 恢复,brief/plan/工具摘要注入 resume prompt(resume_prompt_carries_projection_context),任务最终 Completed |
-| 7 | q 退出后终端无 raw mode / alternate screen 残留 | 待确认 | 待人工:按 q 后确认输入回显正常(场景 1 的同一终端);机制为 TerminalGuard Drop + panic hook 恢复 |
+| 7 | q 退出后终端无 raw mode / alternate screen 残留 | PASS | 人工确认:按 q 退出后回到普通命令行,输入回显正常,无残留(2026-10-17) |
 | 8 | 损坏账本显示错误且 TUI 不崩溃 | PASS | 自动化:账本第 2 行改非法 JSON 后 `task status` 输出结构化错误("ledger corrupt at line 2: json 解析失败"),非崩溃;TUI 同一错误路径由错误弹窗承接(错误弹窗测试覆盖) |
 
 ## 执行记录
 
-- 2026-10-17:场景 1 由开发者打开 TUI 截图确认;场景 2/3/5/6/8 由 Claude Code 自动化驱动真实二进制完成;场景 4 由单元测试+渲染测试+CLI E2E 三重证据闭合;场景 7 待开发者按 q 后确认。
+- 2026-10-17:场景 1 由开发者打开 TUI 截图确认;场景 2/3/5/6/8 由 Claude Code 自动化驱动真实二进制完成;场景 4 由单元测试+渲染测试+CLI E2E 三重证据闭合;场景 7 由开发者按 q 确认退出正常,8/8 全部 PASS。
