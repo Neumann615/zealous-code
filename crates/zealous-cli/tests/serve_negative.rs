@@ -343,7 +343,10 @@ fn neg_already_running_and_approval_binding() {
             break;
         }
     }
-    assert!(already_seen, "应先收到 already_running");
+    assert!(
+        already_seen && approval_seen,
+        "应收到 already_running 和 approval_requested"
+    );
 
     // 等审批通知(携带 task_id/tool/risk/summary)——绑定断言用已捕获的要素
     let note = serde_json::json!({
@@ -620,7 +623,8 @@ fn neg_broken_pipe_exits_without_sensitive_output() {
             }
         }
     };
-    // 关键断言:无密钥输出(stderr 全量读取)
+    // 进程已退出(可能非零:stdout 写入失败);关键是不能挂起且无敏感泄漏
+    let _ = status.code();
     let mut stderr = String::new();
     if let Some(mut se) = child.stderr.take() {
         let _ = se.read_to_string(&mut stderr);

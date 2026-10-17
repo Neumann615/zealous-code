@@ -1,63 +1,110 @@
-# TUI 手工验收夹具(spec 90 §5 / 110 收口)
-# 用法: powershell -File scripts\tui-acceptance-fixture.ps1 [-Zealous <exe 路径>]
-# 产出: %TEMP%\zealous-tui-acceptance\ 下两个仓库
-#   main\    —— 正常任务验收用(README + 大文件 edit 场景)
-#   corrupt\ —— 损坏账本场景用(events.jsonl 中间损坏 + torn tail 两份)
-param(
-    [string]$Zealous = "$PSScriptRoot\..\target\debug\zealous.exe"
-)
+# TUI manual acceptance fixture (spec 90 s5 / 110 closeout)
+# Usage: powershell -File scripts\tui-acceptance-fixture.ps1
+# Creates 4 repos under %TEMP%\zealous-tui-acceptance\ for the 8 scenarios.
+# ASCII-only to avoid PowerShell encoding issues.
 $ErrorActionPreference = "Stop"
 
-$exe = Resolve-Path $Zealous -ErrorAction Stop
+# --- self checks ---
+$exe = Join-Path $PSScriptRoot "..\target\debug\zealous.exe"
+if (-not (Test-Path $exe)) {
+    Write-Host "[FAIL] zealous.exe not found at $exe"
+    Write-Host "       Run: cargo build -p zealous-cli"
+    exit 1
+}
+Write-Host "[ok] zealous.exe: $exe"
+
+try {
+    $null = git --version
+    Write-Host "[ok] git available"
+} catch {
+    Write-Host "[FAIL] git not available"
+    exit 1
+}
+
 $base = Join-Path $env:TEMP "zealous-tui-acceptance"
-if (Test-Path $base) { Remove-Item -Recurse -Force $base }
+if (Test-Path $base) {
+    # safety: only clean if under TEMP
+    $tempRoot = $env:TEMP
+    if (-not $base.StartsWith($tempRoot)) {
+        Write-Host "[FAIL] $base is not under $tempRoot"
+        exit 1
+    }
+    Remove-Item -Recurse -Force $base
+}
 New-Item -ItemType Directory -Path $base | Out-Null
+Write-Host "[ok] base dir: $base"
 
 function New-Repo {
     param([string]$Dir)
     New-Item -ItemType Directory -Path $Dir | Out-Null
     git -C $Dir init -q
-    git -C $Dir -c user.name=t -c user.email=t@t add -A 2>$null
+    Set-Content -Path (Join-Path $Dir "README.md") -Value "fixture`n"
+    git -C $Dir add -A
+    git -C $Dir -c user.name=t -c user.email=t@t commit -q -m init
 }
 
-# ---- main 仓库:正常任务 + 大文件 edit 审批场景 ----
+# --- repo 1: normal task + brief file (scenarios 1-3, 5-7) ---
 $main = Join-Path $base "main"
 New-Repo $main
-Set-Content -Path (Join-Path $main "README.md") -Value "tui acceptance fixture`nsecond line`n"
-# 大文件:~200KB 文本,edit_file 审批摘要将超过一屏
-$big = ("lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor " * 80) + "`n"
-Set-Content -Path (Join-Path $main "big.txt") -Value $big
-git -C $main add -A
-git -C $main -c user.name=t -c user.email=t@t commit -q -m init
-# brief 文件(任务表单引用)
-Set-Content -Path (Join-Path $main "BRIEF.md") -Value "把 big.txt 的第一段替换为 REPLACED-BY-MODEL,保持其余内容不变。完成后汇报修改前后文件大小。"
-Write-Host "[main] $main"
+Set-Content -Path (Join-Path $main "BRIEF.md") -Value "Replace the word fixture with ACCEPTED in README.md. Then report the new content."
+Write-Host "[main] $main (scenarios 1-3, 5-7: render / brief / real model / interrupt / resume / exit)"
 
-# ---- corrupt 仓库:损坏账本 + torn tail 两份任务 ----
+# --- repo 2: large edit_file approval (scenario 4) ---
+$big = Join-Path $base "big-edit"
+New-Repo $big
+$bigContent = ("A" * 40 + "`n") * 200
+Set-Content -Path (Join-Path $big "big.txt") -Value $bigContent
+git -C $big add -A
+git -C $big -c user.name=t -c user.email=t@t commit -q -m init
+# brief: replace a large block
+$briefContent = ("B" * 40 + "`n") * 100
+Set-Content -Path (Join-Path $big "EDIT-BRIEF.md") -Value $briefContent
+Write-Host "[big-edit] $big (scenario 4: large edit_file approval + scroll)"
+
+# --- repo 3: corrupted middle ledger (scenario 8) ---
 $corrupt = Join-Path $base "corrupt"
 New-Repo $corrupt
 Set-Content -Path (Join-Path $corrupt "README.md") -Value "corrupt fixture`n"
 git -C $corrupt add -A
 git -C $corrupt -c user.name=t -c user.email=t@t commit -q -m init
-# 用 CLI 真实创建两个任务(走真实账本写入)
-& $exe task new "corrupt: middle broken" | Out-Null
-& $exe task new "corrupt: torn tail" | Out-Null
-$tasks = Get-ChildItem (Join-Path $corrupt ".zealous\tasks") -Directory
-$ledgers = Get-ChildItem (Join-Path $corrupt ".zealous\tasks") -Recurse -Filter events.jsonl
-# 任务 1:中间损坏(第 1 行改非法 JSON)
-$p1 = $ledgers[0].FullName
-$lines = [System.IO.File]::ReadAllLines($p1)
-$lines[0] = "{{{ corrupted"
-[System.IO.File]::WriteAllLines($p1, $lines)
-# 任务 2:残缺尾行
-$p2 = $ledgers[1].FullName
-[System.IO.File]::AppendAllText($p2, '{"seq":99,"ts":"2026')
-Write-Host "[corrupt] $corrupt"
-Write-Host "  tasks: $($tasks.Count) 个账本已就位(1 中间损坏 + 1 torn tail)"
+# Use CLI to create a real task with real ledger
+$env:ZEALOUS_BASE_URL = "https://rc.invalid/v1"
+$env:ZEALOUS_API_KEY = "fake"
+$env:ZEALOUS_MODEL = "fake"
+$null = & $exe task new "corrupt ledger test" 2>$null
+$taskDirs = Get-ChildItem (Join-Path $corrupt ".zealous\tasks") -Directory -ErrorAction SilentlyContinue
+if ($taskDirs) {
+    $ledger = Get-ChildItem $taskDirs[0].FullName -Recurse -Filter events.jsonl | Select-Object -First 1
+    if ($ledger) {
+        $lines = [System.IO.File]::ReadAllLines($ledger.FullName)
+        $lines[0] = "{{{ corrupted"
+        [System.IO.File]::WriteAllLines($ledger.FullName, $lines)
+        Write-Host "[corrupt] ledger middle line corrupted: $($taskDirs[0].FullName)"
+    }
+}
+Remove-Item Env:ZEALOUS_BASE_URL, Env:ZEALOUS_API_KEY, Env:ZEALOUS_MODEL -ErrorAction SilentlyContinue
+
+# --- repo 4: torn tail ledger (scenario 8 variant) ---
+$torn = Join-Path $base "torn"
+New-Repo $torn
+Set-Content -Path (Join-Path $torn "README.md") -Value "torn fixture`n"
+git -C $torn add -A
+git -C $torn -c user.name=t -c user.email=t@t commit -q -m init
+$null = & $exe task new "torn tail test" 2>$null
+$tornTasks = Get-ChildItem (Join-Path $torn ".zealous\tasks") -Directory -ErrorAction SilentlyContinue
+if ($tornTasks) {
+    $tornLedger = Get-ChildItem $tornTasks[0].FullName -Recurse -Filter events.jsonl | Select-Object -First 1
+    if ($tornLedger) {
+        [System.IO.File]::AppendAllText($tornLedger.FullName, '{"seq":99,"ts":"2026')
+        Write-Host "[torn] torn tail appended: $($tornLedger.FullName)"
+    }
+}
 
 Write-Host ""
-Write-Host "验收步骤:"
-Write-Host "  1. cd $main"
-Write-Host "  2. $exe tui"
-Write-Host "  3. 按 docs/acceptance/tui-alpha.md 逐项执行并记录"
-Write-Host "  4. 损坏账本场景:cd $corrupt 后再次运行 tui"
+Write-Host "=== Acceptance repos ready ==="
+Write-Host "Open Windows Terminal, then:"
+Write-Host "  cd $main"
+Write-Host "  $exe tui"
+Write-Host ""
+Write-Host "Follow docs/acceptance/tui-alpha.md for the 8 scenarios."
+Write-Host "Scenario 8 (corrupt ledger): cd $corrupt then run tui again."
