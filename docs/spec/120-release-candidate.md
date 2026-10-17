@@ -49,6 +49,6 @@
 
 ## 6. TUI 手工验收前置
 
-打包前 `docs/acceptance/tui-alpha.md` 的 8 个场景必须全部"通过";
-任一失败先修复;未执行视为未通过。夹具脚本:
-`scripts/tui-acceptance-fixture.ps1`。
+打包前 `docs/acceptance/tui-alpha.md` 的 8 个场景必须全部 PASS;
+NOT_RUN 与 FAIL 均阻塞打包(打包脚本 gate 3 解析记录,不通过即拒绝)。
+夹具脚本: `scripts/tui-acceptance-fixture.ps1`。
