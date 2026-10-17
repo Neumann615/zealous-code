@@ -129,7 +129,9 @@ try {
         $bytes = $ms.ToArray()
         $ms.Dispose(); $stream.Dispose()
         $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-        foreach ($needle in @($fakeKey, ".env", ".zealous")) {
+        # Scan for credential-like strings only; ".env"/".zealous" are legitimate
+        # code path references (dotenv loader / task data dir), not secrets
+        foreach ($needle in @($fakeKey, "api_key=", "Authorization:")) {
             if ($text.Contains($needle)) { Fail "zip" "binary contains sensitive string: $needle" }
         }
     } finally {
