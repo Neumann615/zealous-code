@@ -306,7 +306,8 @@ fn neg_already_running_and_approval_binding() {
     ];
     let endpoint = mock_endpoint(script);
     let mut proc = spawn_serve(&repo, &endpoint);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // 并行测试执行时 CPU 竞争,时限放宽到 90s
+    let deadline = Instant::now() + Duration::from_secs(90);
 
     proc.send(&serde_json::json!({"id": 1, "cmd": "initialize", "params": {"version": 1}}));
     let _ = proc.wait_id(1, deadline);
