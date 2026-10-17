@@ -42,16 +42,18 @@ try {
     }
     $acceptance = Get-Content $acceptanceFile -Raw
     # Must have no unexecuted/failed entries
-    # Must have exactly 8 PASS entries, zero NOT_RUN or FAIL
-    $passCount = ([regex]::Matches($acceptance, "PASS")).Count
-    $notRunCount = ([regex]::Matches($acceptance, "NOT_RUN")).Count
-    $failCount = ([regex]::Matches($acceptance, "(?<![A-Za-z])FAIL(?![A-Za-z])")).Count
-    if ($passCount -lt 8) {
-        Fail "acceptance" "expected >=8 PASS in acceptance record, got $passCount"
+    # Parse only the status column of table rows (lines starting with | digit |)
+    $rows = $acceptance -split "`n" | Where-Object { $_ -match "^\|\s*[0-9]+\s*\|" }
+    if ($rows.Count -ne 8) {
+        Fail "acceptance" "expected exactly 8 scenario rows, got $($rows.Count)"
     }
-    if ($notRunCount -gt 0 -or $failCount -gt 0) {
-        Fail "acceptance" "NOT_RUN or FAIL found: notRun=$notRunCount fail=$failCount"
+    foreach ($row in $rows) {
+        $status = ($row -split "\|")[3].Trim()
+        if ($status -ne "PASS") {
+            Fail "acceptance" "scenario row not PASS: $row"
+        }
     }
+    Write-Host "[gate 3/10] TUI acceptance: all 8 rows PASS"
     Write-Host "[gate 3/10] TUI acceptance 8/8 PASS"
 
     # --- Gate 4: fmt / test / clippy ---
