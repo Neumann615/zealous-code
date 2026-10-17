@@ -7,7 +7,9 @@
 ## 1. 版本与平台
 
 - 版本:workspace `0.1.0`(不递增)。
-- 平台:Windows x64(MSVC/GNU 均可,以实际构建工具链为准)。
+- 平台:Windows x64;**工具链 triple 以 `rustc -vV` 实测 host 为准**,
+  zip 命名动态生成 `dist/zealous-<version>-<host>.zip`,禁止硬编码
+  MSVC 或 GNU(命名误导分发对象即为溯源缺陷)。
 - 构建命令:`cargo build --release`。
 - 产物:`target/release/zealous.exe`。
 
@@ -17,14 +19,15 @@
 
 1. `git status --porcelain` 为空(工作区干净);
 2. `cargo fmt --check` / `cargo test --all` / `cargo clippy --all-targets -- -D warnings` 通过;
-3. release 二进制 `--version` 输出正确;
+3. release 二进制 `--version` 输出正确(动态实测,不得硬编码);
 4. `config check` 全 ok 且不回显密钥;
 5. mock 模型 E2E(cli_e2e)通过;
 6. real_model_smoke 显式执行通过(消耗额度,发布候选前一次)。
 
 ## 3. 包内容
 
-`dist/zealous-0.1.0-x86_64-pc-windows-msvc.zip`,**仅含**:
+`dist/zealous-0.1.0-<host-triple>.zip`(host 由 `rustc -vV` 动态解析),
+**仅含**:
 
 - `zealous.exe`
 
@@ -32,6 +35,19 @@
 任务数据、任何测试产物。
 
 打包脚本:`scripts/package-release.ps1`;每步校验失败即中止并保留现场。
+
+## 3.5 RC 溯源(记录必须为动态实测值)
+
+RC 记录(`docs/acceptance/rc-<version>.md`)必须记录:
+
+- **runtime source commit**:构建二进制时的 git HEAD(打包脚本运行时读取);
+- **RC record commit**:承载记录文件的提交(记录提交后由工作流核对);
+- **实际 rustc version 与 host triple**(`rustc -vV` 实测,禁止硬编码);
+- zip SHA256 与清单。
+
+约束:RC 记录提交后,`git diff <runtime source commit>..HEAD --name-only`
+的差异**只允许**是 RC 记录本身;若运行时代码变化,必须重新打包。
+RC 记录中的工具链字段若与实测不符,即为溯源缺陷,不得分发。
 
 ## 4. 发布前安全检查
 

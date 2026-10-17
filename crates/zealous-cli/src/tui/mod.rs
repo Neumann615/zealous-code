@@ -72,7 +72,7 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
     let progress_sink: Arc<dyn zealous_engine::progress::ProgressSink> = Arc::new(progress_sink);
 
     let mut state = TuiState::new();
-    state.refresh_tasks(list_tasks(&svc));
+    refresh_task_list(&mut state, &svc);
     // 启动校验(spec 90 收口):Provider 配置错误进错误弹窗,
     // 不阻塞浏览既有任务;运行 R 时会再次解析并失败
     if let Err(e) = zealous_engine::provider::ProviderConfig::resolve() {
@@ -144,6 +144,30 @@ fn list_tasks(svc: &TaskService) -> Vec<zealous_engine::task_service::TaskSummar
     svc.list_tasks().map(|(items, _)| items).unwrap_or_default()
 }
 
+/// 刷新任务列表;损坏账本计入错误栏(spec 90 场景 8:错误可见且不崩溃)
+fn refresh_task_list(state: &mut TuiState, svc: &TaskService) {
+    match svc.list_tasks() {
+        Ok((items, skipped)) => {
+            state.refresh_tasks(items);
+            if !skipped.is_empty() {
+                let reasons: Vec<String> = skipped
+                    .iter()
+                    .map(|(id, why)| {
+                        let short: String = why.chars().take(120).collect();
+                        format!("{}: {}", id, short)
+                    })
+                    .collect();
+                state.set_error(format!(
+                    "{} 个损坏账本已跳过(不崩溃) — {}",
+                    skipped.len(),
+                    reasons.join(" | ")
+                ));
+            }
+        }
+        Err(e) => state.set_error(format!("任务列表读取失败: {e}")),
+    }
+}
+
 /// 滚动路由:审批弹窗优先,其次已展开的事件流
 fn scroll_view(state: &mut TuiState, page: usize, down: bool) {
     if state.pending_approval.is_some() {
@@ -185,7 +209,7 @@ pub(crate) fn apply_event(
                         state.set_detail(p, evs);
                     }
                 }
-                state.refresh_tasks(list_tasks(svc));
+                refresh_task_list(state, svc);
             }
         }
         TuiEvent::Failure(msg) => {
@@ -236,7 +260,7 @@ fn handle_key(
                 };
                 match svc.create_task_with_brief(state.form.title.trim(), brief_path.as_deref()) {
                     Ok(_) => {
-                        state.refresh_tasks(list_tasks(svc));
+                        refresh_task_list(state, svc);
                         state.form_close();
                     }
                     Err(e) => state.set_error(e.to_string()),
@@ -469,7 +493,7 @@ mod integration_tests {
         }
 
         let mut state = TuiState::new();
-        state.refresh_tasks(list_tasks(&svc));
+        refresh_task_list(&mut state, &svc);
         state.select_next();
         let selected_id = state.selected_task().unwrap().task_id.clone();
         assert_eq!(selected_id, task_id);

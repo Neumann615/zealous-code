@@ -14,8 +14,8 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$msysBin;" + $env:Path
 
 $version = "0.1.0"
 $dist = Join-Path $repo "dist"
-$zipName = "zealous-0.1.0-x86_64-pc-windows-msvc.zip"
-$zipPath = Join-Path $dist $zipName
+$zipName = $null  # resolved dynamically from rustc -vV host (gate 7)
+$zipPath = $null  # resolved with zipName
 $acceptanceFile = Join-Path $repo "docs\acceptance\tui-alpha.md"
 $rcRecordFile = Join-Path $repo "docs\acceptance\rc-0.1.0.md"
 $fakeKey = "rc-fake-key-DO-NOT-USE-0123456789"
@@ -27,9 +27,9 @@ function Fail {
 }
 
 try {
-    # --- Gate 1: delete stale zip ---
-    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-    Write-Host "[gate 1/10] stale zip removed"
+    # --- Gate 1: delete stale zip artifacts (all old naming variants) ---
+    Get-ChildItem $dist -Filter "zealous-*.zip" -ErrorAction SilentlyContinue | Remove-Item -Force
+    Write-Host "[gate 1/10] stale zip artifacts removed"
 
     # --- Gate 2: clean worktree ---
     $dirty = git status --porcelain
@@ -79,14 +79,18 @@ try {
     if (-not (Test-Path $exe)) { Fail "build" "missing $exe" }
     Write-Host "[gate 6/10] release build"
 
-    # --- Gate 7: toolchain and binary checks ---
+    # --- Gate 7: toolchain and binary checks (all values measured, not hardcoded) ---
     $rustcInfo = rustc -vV 2>&1 | Out-String
-    if ($rustcInfo -notmatch "host: x86_64-pc-windows") {
-        Fail "toolchain" "unexpected host triple (expect x86_64-pc-windows): $rustcInfo"
+    $hostTriple = if ($rustcInfo -match "host:\s*(\S+)") { $Matches[1] } else { "" }
+    $rustcRelease = if ($rustcInfo -match "release:\s*([0-9.]+)") { $Matches[1] } else { "" }
+    if (-not $hostTriple.StartsWith("x86_64-pc-windows")) {
+        Fail "toolchain" "unexpected host triple: $hostTriple"
     }
     $ver = & $exe --version
     if ($ver -ne "zealous 0.1.0") { Fail "version" "unexpected: $ver" }
-    Write-Host "[gate 7/10] toolchain x86_64-pc-windows + version zealous 0.1.0"
+    Write-Host "[gate 7/10] host=$hostTriple rustc=$rustcRelease version=$ver"
+    $zipName = "zealous-$version-$hostTriple.zip"
+    $zipPath = Join-Path $dist $zipName
 
     # --- Gate 8: config check (fake key, try/finally) ---
     $env:ZEALOUS_BASE_URL = "https://rc-check.invalid/v1"
@@ -150,9 +154,13 @@ try {
     $rcContent = @"
 # RC 0.1.0 Acceptance Record (spec 120)
 
-- Git commit: $commit
+## Traceability (all values measured at build time)
+
+- Runtime source commit: $commit
+- RC record commit: (filled after commit; diff vs runtime source must be this file only)
+- Rustc release: $rustcRelease (measured via rustc -vV)
+- Host triple: $hostTriple (measured via rustc -vV)
 - Build time: $buildTime
-- Toolchain: stable-x86_64-pc-windows-gnu (rustc 1.99.0)
 - Target platform: Windows x64
 
 ## Quality gates (all PASS)
@@ -189,6 +197,8 @@ try {
     Write-Host "Path:   $zipPath"
     Write-Host "Size:   $((Get-Item $zipPath).Length) bytes"
     Write-Host "SHA256: $sha256"
+    Write-Host "Source commit: $commit"
+    Write-Host "Host:   $hostTriple (rustc $rustcRelease)"
 
 } catch {
     Write-Host "[UNEXPECTED ERROR] $_"
