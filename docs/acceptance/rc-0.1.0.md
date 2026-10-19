@@ -43,11 +43,11 @@
 | File | Size | SHA256 |
 | ---- | ---- | ------ |
 | zealous-0.1.0-x86_64-pc-windows-gnu.zip | 2077328 | 466224505C9D5061ABAAFBF27EBCD7ED90E22E40FF89397643624975750EDD46 |
-| zealous-code-main-extended-dogfooding.bundle | 274594 | 9B783C984BE958FB543A66E58609DE07BE192DDC4AEEF2B1FA8BD7193572E41D |
+| zealous-code-main-spec141.bundle | 291401 | 03C79BA810571A9971A8CC1CAC2F1887D3629209BFBE1453FAC38CAFE1C34998 |
 | zealous-code-archive-20261015.bundle | 40298742 | AADEBE3095B7F96E3CAA5D9B5D18E3CE924E3687F7C0DE5F7E93C0221A9A827C |
 
-bundle verify:均记录 complete history(extended-dogfooding bundle 含 main
-全部提交至扩展 dogfooding 阶段末;archive bundle 含归档分支,未改动)。
+bundle verify:均记录 complete history(spec141 bundle 含 main 全部提交至
+spec 141 阶段末(54573ad);archive bundle 含归档分支,未改动)。
 备份产物只存放 dist/,不进入 Git。
 
 ### Bundle rotation log
