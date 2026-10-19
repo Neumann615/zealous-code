@@ -68,3 +68,12 @@ RC 记录中的工具链字段若与实测不符,即为溯源缺陷,不得分发
 打包前 `docs/acceptance/tui-alpha.md` 的 8 个场景必须全部 PASS;
 NOT_RUN 与 FAIL 均阻塞打包(打包脚本 gate 3 解析记录,不通过即拒绝)。
 夹具脚本: `scripts/tui-acceptance-fixture.ps1`。
+
+Gate 3 必须同时解析**状态**列与**方式**列:
+
+- **对外 RC(默认)**:场景 1、4、7、8 必须为 `PASS | MANUAL`,
+  场景 2、3、5、6 可为 AUTOMATED;任一不满足即拒绝打包
+  (自动化证据不得替代手工证据)。
+- **本地试用 RC(`-LocalTrial` 开关)**:8/8 PASS 即可,不要求 MANUAL;
+  RC 记录必须标注 `Distribution: LOCAL TRIAL (NOT for external release)`,
+  控制台输出同样显著告警。

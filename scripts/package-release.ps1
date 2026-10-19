@@ -1,8 +1,15 @@
 # Local RC packaging with full quality gates (spec 120)
-# Usage: powershell -File scripts\package-release.ps1
-# Gates: clean worktree, TUI acceptance 8/8 PASS, fmt/test/clippy,
+# Usage: powershell -File scripts\package-release.ps1 [-LocalTrial]
+#   default        : external RC standard - TUI scenarios 1,4,7,8 must be
+#                    PASS|MANUAL and all 8 rows PASS
+#   -LocalTrial    : local trial RC - 8/8 PASS required, MANUAL not required;
+#                    RC record is marked LOCAL TRIAL (NOT for external release)
+# Gates: clean worktree, TUI acceptance record, fmt/test/clippy,
 #        real_model_smoke, host triple check, release build,
 #        version, config check, zip manifest, SHA256, RC record
+param(
+    [switch]$LocalTrial
+)
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $repo = Split-Path -Parent $PSScriptRoot
@@ -36,25 +43,50 @@ try {
     if ($dirty) { Fail "git-clean" "dirty worktree: $dirty" }
     Write-Host "[gate 2/10] git clean"
 
-    # --- Gate 3: TUI acceptance record must be 8/8 PASS ---
+    # --- Gate 3: TUI acceptance record (status AND evidence columns) ---
     if (-not (Test-Path $acceptanceFile)) {
         Fail "acceptance" "acceptance record not found: $acceptanceFile"
     }
     $acceptance = Get-Content $acceptanceFile -Raw
-    # Must have no unexecuted/failed entries
-    # Parse only the status column of table rows (lines starting with | digit |)
+    # Parse table rows (lines starting with | digit |):
+    #   | # | scenario | status | method | evidence |
+    #   split index: [1]=num [3]=status [4]=method
     $rows = $acceptance -split "`n" | Where-Object { $_ -match "^\|\s*[0-9]+\s*\|" }
     if ($rows.Count -ne 8) {
         Fail "acceptance" "expected exactly 8 scenario rows, got $($rows.Count)"
     }
+    # Scenarios that require MANUAL evidence for an external RC (spec 120 s6)
+    $manualRequired = @(1, 4, 7, 8)
+    $missingManual = @()
     foreach ($row in $rows) {
-        $status = ($row -split "\|")[3].Trim()
+        $cols = $row -split "\|"
+        $num = $cols[1].Trim()
+        $status = $cols[3].Trim()
+        $method = $cols[4].Trim()
         if ($status -ne "PASS") {
-            Fail "acceptance" "scenario row not PASS: $row"
+            Fail "acceptance" "scenario $num not PASS: $row"
+        }
+        if ($method -ne "MANUAL" -and $method -ne "AUTOMATED") {
+            Fail "acceptance" "scenario $num has unknown method '$method'"
+        }
+        if ($manualRequired -contains [int]$num -and $method -ne "MANUAL") {
+            $missingManual += $num
         }
     }
-    Write-Host "[gate 3/10] TUI acceptance: all 8 rows PASS"
-    Write-Host "[gate 3/10] TUI acceptance 8/8 PASS"
+    if ($missingManual.Count -gt 0) {
+        if ($LocalTrial) {
+            Write-Host "[gate 3/10] LOCAL TRIAL: MANUAL evidence missing for scenarios: $($missingManual -join ',')"
+            Write-Host "[gate 3/10] WARNING: NOT an external-release RC (automation cannot replace manual evidence)"
+        } else {
+            Fail "acceptance" "external RC requires MANUAL evidence for scenarios 1,4,7,8; missing: $($missingManual -join ',') (use -LocalTrial for a local trial RC)"
+        }
+    }
+    $rcDistribution = if ($LocalTrial) {
+        "LOCAL TRIAL (NOT for external release)"
+    } else {
+        "EXTERNAL"
+    }
+    Write-Host "[gate 3/10] TUI acceptance: 8/8 PASS, distribution=$rcDistribution"
 
     # --- Gate 4: fmt / test / clippy ---
     cmd /c "cargo fmt --check"
@@ -162,6 +194,7 @@ try {
 - Host triple: $hostTriple (measured via rustc -vV)
 - Build time: $buildTime
 - Target platform: Windows x64
+- Distribution: $rcDistribution
 
 ## Quality gates (all PASS)
 
