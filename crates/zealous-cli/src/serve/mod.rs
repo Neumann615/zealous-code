@@ -47,6 +47,9 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
 
     let mut last_poll = Instant::now();
     loop {
+        // 0) 回收已结束的 run(结束后允许再次 run_task 续跑;P1 修复)
+        session.worker_finished();
+
         // 1) 订阅轮询(spec 110 §2):周期推送 cursor 之后的新账本事件
         if last_poll.elapsed() >= Duration::from_millis(400) {
             session.poll_subscription();

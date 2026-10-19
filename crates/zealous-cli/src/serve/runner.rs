@@ -18,12 +18,23 @@ use super::protocol::Notification;
 /// 当前挂起审批的绑定槽(spec 110 §3):decide_approval 校验 call_id 用
 pub type PendingSlot = Arc<Mutex<Option<String>>>;
 
-/// worker 句柄:abort / 决策注入 / pending 绑定 / join
+/// worker 句柄:abort / 决策注入 / pending 绑定 / join / done 回收标记
 pub struct RunHandles {
     pub abort: Arc<AtomicBool>,
     pub decision_tx: mpsc::Sender<ApprovalDecision>,
     pub pending: PendingSlot,
+    /// worker 逻辑已结束(先于 run_finished 置位):会话据此回收 RunState,
+    /// 同一任务续跑不再被 already_running 误拒(P1:结束后必须可再次 run_task)
+    pub done: Arc<AtomicBool>,
     pub join: Option<JoinHandle<()>>,
+}
+
+/// 任何 worker 出口都置 done(drop 兜底;正常路径在 run_finished 前显式置位)
+struct DoneOnDrop(Arc<AtomicBool>);
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl RunHandles {
@@ -72,7 +83,10 @@ pub fn spawn_worker(
     ));
 
     let worker_abort = abort.clone();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_flag = done.clone();
     let join = std::thread::spawn(move || {
+        let _done_guard = DoneOnDrop(done_flag.clone());
         let config = match ProviderConfig::resolve() {
             Ok(c) => c,
             Err(e) => {
@@ -106,6 +120,9 @@ pub fn spawn_worker(
                 return;
             }
         };
+        // done 先于 run_finished 置位:客户端收到通知即可立即续跑,
+        // 会话回收不会与之竞争
+        done_flag.store(true, Ordering::SeqCst);
         let _ = notif_tx.send(Notification::run_finished(
             task_id.as_str(),
             &format!("{status:?}"),
@@ -116,6 +133,7 @@ pub fn spawn_worker(
         abort,
         decision_tx,
         pending,
+        done,
         join: Some(join),
     }
 }

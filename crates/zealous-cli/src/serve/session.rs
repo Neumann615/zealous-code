@@ -2,7 +2,7 @@
 //! 事实来自 TaskService(投影/账本);engine 是唯一写入者。
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use zealous_core::{ApprovalDecision, TaskId};
@@ -307,6 +307,8 @@ impl Session {
     }
 
     fn handle_run_task(&mut self, req: &Request) -> Response {
+        // 先回收已结束的 worker:结束后同任务可续跑(V1 限制的是"同时一个")
+        let _ = self.worker_finished();
         if self.run.is_some() {
             return err_resp(req.id, "already_running", "已有运行中的任务(V1 单任务)");
         }
@@ -409,15 +411,17 @@ impl Session {
         }
     }
 
-    /// worker 是否已结束;结束后回收 join
+    /// worker 是否已结束;结束后回收 join。
+    /// 主循环每轮调用:RunState 不回收会让二次 run_task 撞 already_running(P1)。
     pub fn worker_finished(&mut self) -> bool {
         let Some(run) = &self.run else { return true };
-        let finished = run
-            .handles
-            .join
-            .as_ref()
-            .map(|j| j.is_finished())
-            .unwrap_or(true);
+        let finished = run.handles.done.load(Ordering::SeqCst)
+            || run
+                .handles
+                .join
+                .as_ref()
+                .map(|j| j.is_finished())
+                .unwrap_or(true);
         if finished {
             if let Some(mut run) = self.run.take() {
                 if let Some(j) = run.handles.join.take() {

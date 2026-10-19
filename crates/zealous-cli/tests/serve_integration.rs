@@ -341,3 +341,117 @@ fn serve_protocol_full_flow_with_mock_model() {
         "通知泄漏密钥"
     );
 }
+
+/// P1 回归:run_finished 后同一会话必须可再次 run_task(续跑)。
+/// 此前 RunState 只在 shutdown/EOF 回收,二次 run_task 恒撞 already_running,
+/// 中断/恢复与 provider 失败续跑都走不通。
+#[test]
+fn run_task_again_after_finish_in_same_session() {
+    let repo = unique_dir("resume");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("note.txt"), "hello\n").unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+
+    // 每次 run 两拍:规划轮 Message(单 Agent 方案)→ 执行轮 Message(结束)
+    let msg = r#"{"action":"message","text":"run finished ok"}"#;
+    let endpoint = mock_endpoint(vec![msg.into(), msg.into(), msg.into(), msg.into()]);
+
+    let mut proc = spawn_serve(&repo, &endpoint);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut notifications: Vec<serde_json::Value> = Vec::new();
+    let mut next_id = 1u64;
+
+    let id = next_id;
+    next_id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "initialize", "params": {"version": 1}}));
+    let resp = proc.wait_response(&proc.lines_rx, id, deadline, |n| notifications.push(n));
+    assert!(resp["ok"].as_bool().unwrap(), "initialize: {resp}");
+
+    let id = next_id;
+    next_id += 1;
+    proc.send(&serde_json::json!({
+        "id": id, "cmd": "create_task",
+        "params": {"title": "resume same session", "brief": "say ok twice"}
+    }));
+    let resp = proc.wait_response(&proc.lines_rx, id, deadline, |n| notifications.push(n));
+    let task_id = resp["result"]["task_id"].as_str().unwrap().to_string();
+
+    let wait_finished = |proc: &mut ServeProc,
+                         notifications: &mut Vec<serde_json::Value>,
+                         next_id: &mut u64|
+     -> String {
+        let id = *next_id;
+        *next_id += 1;
+        proc.send(&serde_json::json!({
+            "id": id, "cmd": "run_task", "params": {"task_id": task_id}
+        }));
+        let resp = proc.wait_response(&proc.lines_rx, id, deadline, |n| notifications.push(n));
+        assert_eq!(
+            resp["result"]["started"], true,
+            "run_task 应启动(结束后必须可续跑,不能 already_running): {resp}"
+        );
+        loop {
+            assert!(Instant::now() < deadline, "run_finished 60s 未到");
+            let Ok(line) = proc.lines_rx.recv_timeout(Duration::from_millis(500)) else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&line).expect("合法 JSON 行");
+            if v.get("event").and_then(|e| e.as_str()) == Some("run_finished") {
+                return v["params"]["status"].as_str().unwrap().to_string();
+            }
+            notifications.push(v);
+        }
+    };
+
+    // 第一轮结束后,同会话再次 run_task = 续跑(P1 修复的核心断言)
+    let s1 = wait_finished(&mut proc, &mut notifications, &mut next_id);
+    assert_eq!(s1, "Completed", "run 1");
+    let s2 = wait_finished(&mut proc, &mut notifications, &mut next_id);
+    assert_eq!(s2, "Completed", "run 2(续跑)");
+
+    // 续跑语义:账本含 TaskResumed、seq 连续
+    let ledger = std::fs::read_to_string(
+        repo.join(".zealous")
+            .join("tasks")
+            .join(&task_id)
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    let events: Vec<serde_json::Value> = ledger
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for (i, e) in events.iter().enumerate() {
+        assert_eq!(e["seq"].as_u64().unwrap(), (i + 1) as u64, "seq 跳号");
+    }
+    assert!(
+        events.iter().any(|e| e["type"] == "TaskResumed"),
+        "第二次 run_task 应落 TaskResumed"
+    );
+
+    let id = next_id;
+    next_id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "shutdown", "params": {}}));
+    let resp = proc.wait_response(&proc.lines_rx, id, deadline, |n| notifications.push(n));
+    assert!(resp["ok"].as_bool().unwrap());
+    let _ = next_id;
+}
