@@ -78,7 +78,10 @@ try {
 } finally {
     Pop-Location
 }
-# Corrupt middle: change line 2 to invalid JSON (line 1 = TaskCreated stays valid)
+# Corrupt middle: make line 2 invalid JSON (line 1 = TaskCreated stays valid).
+# task new writes a single-event ledger, so a 1-line ledger gets the invalid
+# line APPENDED (must stay a complete newline-terminated line: ledger read
+# classifies missing-trailing-newline as torn tail, not corruption).
 $corruptTasks = Get-ChildItem (Join-Path $corrupt ".zealous\tasks") -Directory
 foreach ($td in $corruptTasks) {
     $ledger = Get-ChildItem $td.FullName -Recurse -Filter events.jsonl | Select-Object -First 1
@@ -86,9 +89,16 @@ foreach ($td in $corruptTasks) {
         $allLines = [System.IO.File]::ReadAllLines($ledger.FullName)
         if ($allLines.Count -ge 2) {
             $allLines[1] = "{{{ corrupted middle"
-            [System.IO.File]::WriteAllLines($ledger.FullName, $allLines)
-            Write-Host "[corrupt] middle line corrupted in $($td.Name)"
+        } else {
+            $allLines += "{{{ corrupted middle"
         }
+        [System.IO.File]::WriteAllLines($ledger.FullName, $allLines)
+        $verify = [System.IO.File]::ReadAllLines($ledger.FullName)
+        if (-not ($verify -contains "{{{ corrupted middle")) {
+            Write-Host "[FAIL] corruption not applied: $($ledger.FullName)"
+            exit 1
+        }
+        Write-Host "[corrupt] line 2 corrupted in $($td.Name) ($($verify.Count) lines)"
     }
 }
 Write-Host "[corrupt] $corrupt (scenario 8: corrupted ledger)"
