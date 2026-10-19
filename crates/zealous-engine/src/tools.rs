@@ -335,26 +335,40 @@ impl Tool for GitStatus {
         "{}"
     }
     fn description(&self) -> &'static str {
-        "返回 git status --porcelain 输出(只读)"
+        "返回工作区状态分类:用户改动 / 运行副产物 / zealous 运行数据(只读;spec 141)"
     }
     fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 120)
     }
     fn execute(&self, _raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let out = std::process::Command::new("git")
-            .arg("status")
-            .arg("--porcelain")
-            .current_dir(&ctx.repo_root)
-            .output()
-            .map_err(|e| ToolError::Failed(format!("spawn git: {e}")))?;
-        if !out.status.success() {
-            return Err(ToolError::Failed(
-                String::from_utf8_lossy(&out.stderr).into(),
-            ));
+        // spec 141:三分类分段输出;原始 porcelain 行保留在分段内,不隐藏事实
+        let state = crate::worktree::read_state(&ctx.repo_root).map_err(ToolError::Failed)?;
+        let section = |title: &str, kind: crate::worktree::EntryKind| -> String {
+            let entries = state.of(kind);
+            let body: String = if entries.is_empty() {
+                "\n(无)".into()
+            } else {
+                entries.iter().map(|e| format!("\n{}", e.raw)).collect()
+            };
+            format!("== {title} =={body}\n")
+        };
+        let mut text = String::new();
+        text.push_str(&section(
+            "user changes",
+            crate::worktree::EntryKind::UserChange,
+        ));
+        text.push_str(&section(
+            "runtime artifacts",
+            crate::worktree::EntryKind::RuntimeArtifact,
+        ));
+        text.push_str(&section(
+            "zealous runtime data",
+            crate::worktree::EntryKind::ZealousRuntimeData,
+        ));
+        if !state.has_user_changes() {
+            text.push_str("== clean ==\n没有用户改动\n");
         }
-        Ok(ToolOutput {
-            summary: String::from_utf8_lossy(&out.stdout).into(),
-        })
+        Ok(ToolOutput { summary: text })
     }
 }
 
@@ -721,40 +735,35 @@ fn commit_applied(repo_root: &Path, file: &Path, verb: &str) -> Result<String, T
     Ok(hash)
 }
 
-/// 主工作区写入保护(spec 60 §4):apply 前工作区必须干净,
-/// Git commit/status 是安全回退边界(spec 00 硬性前提)。
+/// 主工作区写入保护(spec 60 §4 + 141):apply 前不得有用户改动。
+/// `.zealous/` 运行数据与 Python 运行副产物(untracked `__pycache__/`、
+/// `*.pyc`)不阻塞写入;tracked 的副产物修改视为用户改动。
+/// 错误信息分段展示"用户改动"与"运行副产物"。
 fn assert_clean_worktree(repo_root: &Path) -> Result<(), ToolError> {
-    let out = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| ToolError::Failed(format!("spawn git: {e}")))?;
-    if !out.status.success() {
-        return Err(ToolError::Failed(format!(
-            "git status 失败: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
+    let state = crate::worktree::read_state(repo_root).map_err(ToolError::Failed)?;
+    if !state.has_user_changes() {
+        return Ok(());
     }
-    let dirty = String::from_utf8_lossy(&out.stdout);
-    // `.zealous/` 是本工具自己的运行时数据(账本/提案),不算用户的脏工作区
-    let user_dirty: Vec<&str> = dirty
-        .lines()
-        .filter(|l| {
-            let path = l.get(3..).unwrap_or("").trim_start_matches('"');
-            !path.starts_with(".zealous/")
-        })
+    let user: String = state
+        .of(crate::worktree::EntryKind::UserChange)
+        .iter()
+        .take(5)
+        .map(|e| format!("\n  {}", e.raw))
         .collect();
-    if !user_dirty.is_empty() {
-        let preview: String = user_dirty
-            .iter()
-            .take(5)
-            .map(|l| format!("\n  {l}"))
-            .collect();
-        return Err(ToolError::Failed(format!(
-            "Git 工作区有未提交改动,拒绝写入主工作区。请先 commit/stash:{preview}"
-        )));
+    let artifacts: String = state
+        .of(crate::worktree::EntryKind::RuntimeArtifact)
+        .iter()
+        .take(5)
+        .map(|e| format!("\n  {}", e.raw))
+        .collect();
+    let mut msg = format!("Git 工作区存在用户改动,拒绝写入主工作区。\n用户改动:{user}\n");
+    if !artifacts.is_empty() {
+        msg.push_str(&format!(
+            "运行副产物(不自动处理,不阻塞本次写入):{artifacts}\n"
+        ));
     }
-    Ok(())
+    msg.push_str("请先 commit/stash 用户改动。");
+    Err(ToolError::Failed(msg))
 }
 
 // ---------- T2:shell ----------
@@ -1369,5 +1378,205 @@ mod edit_file_tests {
         );
         assert!(s.contains("fixture") && s.contains("fixture v2"), "{s}");
         assert!(s.contains("唯一匹配"), "{s}");
+    }
+}
+
+/// spec 141:运行副产物治理 —— 纯副产物不阻塞写入,用户改动仍阻塞,
+/// 副产物不被删除/stage/commit,git_status 三分类分段。
+#[cfg(test)]
+mod spec141_tests {
+    use super::apply_tx_tests::real_git_fixture;
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    /// 真实 git 仓库 + src/main.rs 初始 commit
+    fn fixture_sp(tag: &str) -> (PathBuf, ToolContext) {
+        let dir = real_git_fixture(tag);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() { zealous }\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "add src",
+            ],
+        );
+        (dir.clone(), ToolContext { repo_root: dir })
+    }
+
+    fn edit_main(ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        EditFile.execute(
+            r#"{"path":"src/main.rs","old_text":"zealous","new_text":"zealous2"}"#,
+            ctx,
+        )
+    }
+
+    fn porcelain(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn pure_pycache_artifacts_do_not_block_edit() {
+        let (dir, ctx) = fixture_sp("sp141-pycache");
+        std::fs::create_dir_all(dir.join("__pycache__")).unwrap();
+        std::fs::write(dir.join("__pycache__/m.cpython-312.pyc"), "bytecode").unwrap();
+        std::fs::create_dir_all(dir.join("pkg/__pycache__")).unwrap();
+        std::fs::write(dir.join("pkg/__pycache__/n.pyc"), "bytecode").unwrap();
+        edit_main(&ctx).unwrap();
+        assert!(std::fs::read_to_string(dir.join("src/main.rs"))
+            .unwrap()
+            .contains("zealous2"));
+    }
+
+    #[test]
+    fn pure_pyc_artifact_does_not_block_edit() {
+        let (dir, ctx) = fixture_sp("sp141-pyc");
+        std::fs::write(dir.join("out.pyc"), "bytecode").unwrap();
+        edit_main(&ctx).unwrap();
+        assert!(std::fs::read_to_string(dir.join("src/main.rs"))
+            .unwrap()
+            .contains("zealous2"));
+    }
+
+    #[test]
+    fn tracked_pyc_modification_blocks_edit() {
+        let (dir, ctx) = fixture_sp("sp141-tracked-pyc");
+        std::fs::write(dir.join("tracked.pyc"), "v1").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "track pyc",
+            ],
+        );
+        std::fs::write(dir.join("tracked.pyc"), "v2").unwrap();
+        let err = edit_main(&ctx).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("用户改动"), "{msg}");
+        assert!(msg.contains("tracked.pyc"), "{msg}");
+        assert!(!msg.contains("运行副产物"), "tracked 修改不得降级: {msg}");
+    }
+
+    #[test]
+    fn user_change_plus_artifact_error_sections() {
+        let (dir, ctx) = fixture_sp("sp141-mixed");
+        std::fs::create_dir_all(dir.join("__pycache__")).unwrap();
+        std::fs::write(dir.join("__pycache__/m.pyc"), "bytecode").unwrap();
+        std::fs::write(dir.join("README.md"), "user edit\n").unwrap();
+        let err = edit_main(&ctx).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("拒绝写入"), "{msg}");
+        assert!(msg.contains("用户改动"), "{msg}");
+        assert!(msg.contains("README.md"), "{msg}");
+        assert!(msg.contains("运行副产物"), "{msg}");
+        assert!(msg.contains("__pycache__"), "{msg}");
+        assert!(msg.contains("请先 commit/stash 用户改动"), "{msg}");
+        assert!(!std::fs::read_to_string(dir.join("src/main.rs"))
+            .unwrap()
+            .contains("zealous2"));
+    }
+
+    #[test]
+    fn zealous_runtime_data_does_not_block_write() {
+        let (dir, ctx) = fixture_sp("sp141-zealous");
+        std::fs::create_dir_all(dir.join(".zealous/tasks/t1")).unwrap();
+        std::fs::write(dir.join(".zealous/tasks/t1/events.jsonl"), "{}\n").unwrap();
+        edit_main(&ctx).unwrap();
+        assert!(std::fs::read_to_string(dir.join("src/main.rs"))
+            .unwrap()
+            .contains("zealous2"));
+    }
+
+    #[test]
+    fn git_status_outputs_three_sections_and_clean_marker() {
+        let (dir, ctx) = fixture_sp("sp141-status");
+        std::fs::create_dir_all(dir.join("pkg/__pycache__")).unwrap();
+        std::fs::write(dir.join("pkg/__pycache__/m.pyc"), "b").unwrap();
+        std::fs::write(dir.join("out.pyc"), "b").unwrap();
+        std::fs::write(dir.join("README.md"), "edited\n").unwrap();
+        std::fs::create_dir_all(dir.join(".zealous")).unwrap();
+        std::fs::write(dir.join(".zealous/x"), "z").unwrap();
+
+        let out = GitStatus.execute("{}", &ctx).unwrap();
+        let s = out.summary;
+        assert!(s.contains("== user changes =="), "{s}");
+        assert!(s.contains("== runtime artifacts =="), "{s}");
+        assert!(s.contains("== zealous runtime data =="), "{s}");
+        assert!(s.contains("README.md"), "{s}");
+        assert!(s.contains("__pycache__"), "{s}");
+        assert!(s.contains("out.pyc"), "{s}");
+        assert!(s.contains(".zealous"), "{s}");
+        // 有用户改动:不得出现 clean 标记
+        assert!(!s.contains("没有用户改动"), "{s}");
+
+        // 用户改动清掉后:副产物仍在,必须明确"没有用户改动"
+        git(&dir, &["checkout", "--", "README.md"]);
+        let out = GitStatus.execute("{}", &ctx).unwrap();
+        let s = out.summary;
+        assert!(s.contains("== clean =="), "{s}");
+        assert!(s.contains("没有用户改动"), "{s}");
+        assert!(s.contains("__pycache__"), "副产物原始行仍可见: {s}");
+    }
+
+    #[test]
+    fn nested_pycache_classified_as_artifact_in_status() {
+        let (dir, ctx) = fixture_sp("sp141-nested");
+        std::fs::create_dir_all(dir.join("a/b/__pycache__")).unwrap();
+        std::fs::write(dir.join("a/b/__pycache__/deep.pyc"), "b").unwrap();
+        let out = GitStatus.execute("{}", &ctx).unwrap();
+        let s = out.summary;
+        let art_idx = s.find("== runtime artifacts ==").unwrap();
+        let clean_idx = s.find("== clean ==").unwrap();
+        assert!(s[art_idx..clean_idx].contains("__pycache__"), "{s}");
+    }
+
+    #[test]
+    fn apply_leaves_artifacts_unstaged_and_uncommitted() {
+        let (dir, ctx) = fixture_sp("sp141-apply");
+        std::fs::create_dir_all(dir.join("__pycache__")).unwrap();
+        std::fs::write(dir.join("__pycache__/test.pyc"), "bytecode").unwrap();
+        edit_main(&ctx).unwrap();
+
+        // 副产物保持 untracked,未进 commit
+        let st = porcelain(&dir);
+        assert!(st.contains("__pycache__"), "副产物应保持 untracked: {st}");
+        let log = std::process::Command::new("git")
+            .args(["log", "-1", "--name-only", "--pretty=format:%s"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        // Windows 下 rel 可能带反斜杠,主题只需前缀稳定
+        assert!(log.contains("zealous: edit src"), "{log}");
+        assert!(log.contains("src/main.rs"), "{log}");
+        assert!(!log.contains("__pycache__"), "commit 不得含副产物: {log}");
+        assert!(!log.contains("test.pyc"), "commit 不得含副产物: {log}");
     }
 }

@@ -13,6 +13,7 @@ pub mod progress;
 pub mod provider;
 pub mod task_service;
 pub mod tools;
+pub mod worktree;
 
 /// 测试专用:ProviderConfig::resolve 读取进程级环境变量,
 /// 触碰环境的测试必须持有此锁串行执行,避免并行测试互相污染。
