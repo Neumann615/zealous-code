@@ -41,3 +41,28 @@
 - Shell is a T2 approval action.
 - File access is limited to the repository (path guard).
 - Model endpoint is the only default outbound network access.
+
+## Local immutable backup (dist/, gitignored)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-0.1.0-x86_64-pc-windows-gnu.zip | 2077328 | 466224505C9D5061ABAAFBF27EBCD7ED90E22E40FF89397643624975750EDD46 |
+| zealous-code-main-offline-rc.bundle | 301434 | A0AB0BB170A133C8922DA510C79C8BBFF6E1D4549EC579FDAB60A91CAEF50717 |
+| zealous-code-archive-20261015.bundle | 40298742 | AADEBE3095B7F96E3CAA5D9B5D18E3CE924E3687F7C0DE5F7E93C0221A9A827C |
+bundle verify:offline-rc bundle 记录 complete history,含 main 至
+304e0fd(RC zip 刷新记录提交);archive bundle 未改动。
+备份产物只存放 dist/,不进入 Git;仍不推 remote。
+
+### Bundle rotation log
+
+- 2026-10-22(spec 150 离线发布治理阶段末):RC zip 以默认模式重建
+  (OFFLINE EXTERNAL CANDIDATE,见 Artifact 节);main bundle 轮换至
+  zealous-code-main-offline-rc.bundle(SHA256 A0AB0BB1…AEF50717,
+  verify complete history 通过,含 main 至 304e0fd)后,删除过期
+  zealous-code-main-spec141.bundle(旧 SHA256
+  03C79BA810571A9971A8CC1CAC2F1887D3629209BFBE1453FAC38CAFE1C34998,
+  含 main 至 54573ad,为新 bundle 的历史前缀,冗余已消除)。
+  archive bundle 未触碰。
+- 证据归档:dist/evidence/v0.1.0/(TUI 截图、Dogfooding 结果、mock
+  驱动脚本、spec 141 结果、RC 记录副本),清单 SHA256SUMS.txt,
+  归档前后已校验关键文件哈希;不含 .env / 真实密钥。
