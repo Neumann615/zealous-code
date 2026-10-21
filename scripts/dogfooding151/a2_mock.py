@@ -25,6 +25,8 @@ ACTIONS = [
     {"action": "plan", "plan": "fix note.txt", "workers": []},
     {"action": "tool", "tool": "edit_file",
      "args": {"path": "note.txt", "old_text": "ACCEPT", "new_text": "PASSED"}},
+    {"action": "tool", "tool": "edit_file",
+     "args": {"path": "note.txt", "old_text": "ACCEPT", "new_text": "PASSED"}},
     {"action": "message", "text": "a2 recovery done"},
 ]
 
@@ -62,6 +64,7 @@ class Handler(BaseHTTPRequestHandler):
                 i = OK_IDX[0]
                 OK_IDX[0] += 1
             action = ACTIONS[i] if i < len(ACTIONS) else {"action": "message", "text": "done guard"}
+            print("[mock] serving #%d -> %s" % (n, action.get("action")), flush=True)
             body = json.dumps({"choices": [{"message": {"content": json.dumps(action, ensure_ascii=False)}}]})
             respond(self, 200, body)
 

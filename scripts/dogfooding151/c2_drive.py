@@ -83,23 +83,23 @@ def main():
     result["checks"]["create_ok"] = bool(task_id)
 
     request("run_task", {"task_id": task_id})
-    appr1 = wait_notification(lambda m: m.get("type") == "approval_requested")
-    call1 = appr1.get("call_id")
+    appr1 = wait_notification(lambda m: m.get("event") == "approval_requested")
+    call1 = (appr1.get("params") or {}).get("call_id")
     result["checks"]["approval1_call"] = call1
     request("interrupt_task", {"task_id": task_id})
-    fin1 = wait_notification(lambda m: m.get("type") == "run_finished", timeout=60)
-    result["checks"]["run1_finished"] = fin1.get("status")
+    fin1 = wait_notification(lambda m: m.get("event") == "run_finished", timeout=60)
+    result["checks"]["run1_finished"] = (fin1.get("params") or {}).get("status")
 
     r = request("run_task", {"task_id": task_id})
     result["checks"]["resume_not_already_running"] = r.get("ok") is True
-    appr2 = wait_notification(lambda m: m.get("type") == "approval_requested")
-    call2 = appr2.get("call_id")
+    appr2 = wait_notification(lambda m: m.get("event") == "approval_requested")
+    call2 = (appr2.get("params") or {}).get("call_id")
     result["checks"]["approval2_call"] = call2
     result["checks"]["approval_call_rebound"] = call2 != call1
     r = request("decide_approval", {"task_id": task_id, "call_id": call2, "decision": "approve"})
     result["checks"]["decide_ok"] = r.get("ok") is True
-    fin2 = wait_notification(lambda m: m.get("type") == "run_finished", timeout=180)
-    result["checks"]["run2_finished"] = fin2.get("status")
+    fin2 = wait_notification(lambda m: m.get("event") == "run_finished", timeout=180)
+    result["checks"]["run2_finished"] = (fin2.get("params") or {}).get("status")
 
     r = request("get_task", {"task_id": task_id})
     proj = r.get("result") or {}

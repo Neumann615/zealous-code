@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 
-SAFE_SHELL = re.compile(r"^\s*(python3?|node|cargo|npm)\b")
+SAFE_SHELL = re.compile(r"(?:^|shell:\s*)(python3?|node|cargo|npm)\b")
 UNSAFE_PAT = re.compile(r"git\s+(add|commit)|stash|checkout\s+--|^\s*rm\s|\brm\s+-", re.I)
 
 

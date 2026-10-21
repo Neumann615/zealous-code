@@ -63,6 +63,7 @@ VK = {
     "enter": 0x0D,
     "esc": 0x1B,
     "space": 0x20,
+    "tab": 0x09,
 }
 
 
@@ -121,7 +122,7 @@ def send_key(handle, char=None, name=None):
     rec.KeyEvent.wRepeatCount = 1
     if name is not None:
         rec.KeyEvent.wVirtualKeyCode = VK[name]
-        rec.KeyEvent.UnicodeChar = "\r" if name == "enter" else "\x1b" if name == "esc" else " "
+        rec.KeyEvent.UnicodeChar = "\r" if name == "enter" else "\x1b" if name == "esc" else "\t" if name == "tab" else " "
         if name == "down":
             rec.KeyEvent.UnicodeChar = " "
     else:
