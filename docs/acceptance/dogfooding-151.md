@@ -131,3 +131,23 @@ mock 端点(failn_then_ok)下 17 项检查全部通过:
 - 每任务账本 seq 连续、无中间损坏行、无 API key/Authorization/Bearer 落账;
 - 锁定产物(offline-rc-final-lock)每轮前后校验一致;
 - 运行时代码零改动 → 当前 offline RC 继续有效,不重新打包。
+
+## 阶段末本地 bundle(spec 151)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-dogfooding151.bundle | 330210 | FF103F8B735C46C1C0B15CCC9103186783094E1A3B5892B3B3BFC93C69F484CB |
+
+- `git bundle verify` 通过,记录 complete history,含 main 至 b6677bf
+  (验收记录 + spec 152/153 + harness 修复提交);
+- verify 通过后删除旧 `zealous-code-main-offline-rc-final.bundle`
+  (SHA256 81877D9D…428D105E,含 main 至 682fa4c,为新 bundle 历史前缀);
+- **记录本哈希的提交(bundle rotation commit)不进入该 bundle**,
+  为 spec 150 三段溯源模型的既定限制;
+- archive bundle 与 offline-rc-final-lock/ 保留不动;仍不推 remote。
+
+## 运行时代码声明
+
+本阶段运行时代码零改动(仅文档与证据工具脚本)。
+当前 offline RC(46622450…750EDD46)继续有效,未重新打包,
+release-mode 真实模型 smoke 未重复消耗。
