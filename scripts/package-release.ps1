@@ -4,10 +4,14 @@
 #                    be PASS|MANUAL and all 8 rows PASS
 #   -LocalTrial    : local trial RC - 8/8 PASS required, MANUAL not required;
 #                    RC record is marked LOCAL TRIAL (NOT for external release)
-# Gates: clean worktree, TUI acceptance record, fmt/test/clippy,
+# Fail-safe (spec 150): the official zip is NOT touched before all gates pass.
+# The new zip is built in dist\.rc-staging\ and only published (with backup +
+# rollback of the previous zip and RC record) after every gate succeeds.
+# Gates: staging cleanup, clean worktree, TUI acceptance record, fmt/test/clippy,
 #        release build, toolchain/version, release-mode mock E2E,
 #        release-mode real_model_smoke (consumes quota, once per package),
-#        config check, zip manifest, zip extraction verify, SHA256, RC record
+#        config check, zip manifest, zip extraction verify,
+#        fail-safe publish + SHA256 + RC record
 param(
     [switch]$LocalTrial
 )
@@ -22,8 +26,10 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$msysBin;" + $env:Path
 
 $version = "0.1.0"
 $dist = Join-Path $repo "dist"
+$staging = Join-Path $dist ".rc-staging"
 $zipName = $null  # resolved dynamically from rustc -vV host (gate 6)
-$zipPath = $null  # resolved with zipName
+$stagingZip = $null
+$zipPath = $null  # official path, only touched in the gate-12 transaction
 $acceptanceFile = Join-Path $repo "docs\acceptance\tui-alpha.md"
 $rcRecordFile = Join-Path $repo "docs\acceptance\rc-0.1.0.md"
 $fakeKey = "rc-fake-key-DO-NOT-USE-0123456789"
@@ -35,9 +41,10 @@ function Fail {
 }
 
 try {
-    # --- Gate 1: delete stale zip artifacts (all old naming variants) ---
-    Get-ChildItem $dist -Filter "zealous-*.zip" -ErrorAction SilentlyContinue | Remove-Item -Force
-    Write-Host "[gate 1/12] stale zip artifacts removed"
+    # --- Gate 1: clean staging residue ONLY (official zip is preserved) ---
+    if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    Write-Host "[gate 1/12] staging dir cleaned (official zip untouched)"
 
     # --- Gate 2: clean worktree ---
     $dirty = git status --porcelain
@@ -117,6 +124,7 @@ try {
     if ($ver -ne "zealous 0.1.0") { Fail "version" "unexpected: $ver" }
     Write-Host "[gate 6/12] host=$hostTriple rustc=$rustcRelease version=$ver"
     $zipName = "zealous-$version-$hostTriple.zip"
+    $stagingZip = Join-Path $staging $zipName
     $zipPath = Join-Path $dist $zipName
 
     # --- Gate 7: release-mode mock E2E (real binary loop against release exe) ---
@@ -147,13 +155,12 @@ try {
         Remove-Item Env:ZEALOUS_BASE_URL, Env:ZEALOUS_API_KEY, Env:ZEALOUS_MODEL -ErrorAction SilentlyContinue
     }
 
-    # --- Gate 10: zip packaging and checks ---
-    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-    New-Item -ItemType Directory -Path $dist -Force | Out-Null
-    Compress-Archive -Path $exe -DestinationPath $zipPath
+    # --- Gate 10: zip packaging INTO STAGING + manifest + sensitive scan ---
+    if (Test-Path $stagingZip) { Remove-Item $stagingZip -Force }
+    Compress-Archive -Path $exe -DestinationPath $stagingZip
 
     # Verify zip manifest
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($stagingZip)
     try {
         if ($zip.Entries.Count -ne 1) {
             Fail "zip" "expected 1 entry, got $($zip.Entries.Count)"
@@ -177,12 +184,12 @@ try {
     } finally {
         $zip.Dispose()
     }
-    Write-Host "[gate 10/12] zip: 1 entry zealous.exe, no sensitive strings"
+    Write-Host "[gate 10/12] zip (staging): 1 entry zealous.exe, no sensitive strings"
 
-    # --- Gate 11: zip extraction verification (spec 150) ---
+    # --- Gate 11: zip extraction verification from staging (spec 150) ---
     $tmpExtract = Join-Path $env:TEMP ("zealous-rc-extract-" + [guid]::NewGuid().ToString("N"))
     try {
-        Expand-Archive -Path $zipPath -DestinationPath $tmpExtract -Force
+        Expand-Archive -Path $stagingZip -DestinationPath $tmpExtract -Force
         $extractedExe = Join-Path $tmpExtract "zealous.exe"
         if (-not (Test-Path $extractedExe)) { Fail "zip-extract" "missing zealous.exe after extraction" }
         $exVer = & $extractedExe --version
@@ -204,20 +211,24 @@ try {
         Remove-Item $tmpExtract -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # --- Gate 12: SHA256 and RC record ---
-    $sha256 = (Get-FileHash $zipPath -Algorithm SHA256).Hash
-    $size = (Get-Item $zipPath).Length
-
-    # --- Generate RC record ---
+    # --- Gate 12: fail-safe publish + SHA256 + RC record ---
+    # All gates passed. Publish transaction: backup old zip + RC record,
+    # move staging zip into place, write RC record; on ANY failure restore
+    # the previous artifacts, clean staging, exit 1 (spec 150).
+    $sha256 = (Get-FileHash $stagingZip -Algorithm SHA256).Hash
+    $size = (Get-Item $stagingZip).Length
     $commit = git rev-parse HEAD
     $buildTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
     $rcContent = @"
 # RC 0.1.0 Acceptance Record (spec 120 / spec 150)
 
-## Traceability (all values measured at build time)
+## Traceability (all values measured at build time; three-stage model)
 
 - Runtime source commit: $commit
-- RC record commit: (filled after commit; diff vs runtime source must be this file only)
+- RC record commit: (filled after commit; diff vs runtime source must be
+  acceptance/release docs only - spec 150 three-stage model)
+- Bundle rotation commit: (created after the RC record commit; NOT part of
+  the bundle; see bundle rotation log)
 - Rustc release: $rustcRelease (measured via rustc -vV)
 - Host triple: $hostTriple (measured via rustc -vV)
 - Build time: $buildTime
@@ -242,7 +253,7 @@ try {
 ## Artifact
 
 - Path: dist/$zipName
-- Size: $((Get-Item $zipPath).Length) bytes
+- Size: $((Get-Item $stagingZip).Length) bytes
 - SHA256: $sha256
 - Manifest: zealous.exe (single entry)
 
@@ -253,8 +264,30 @@ try {
 - File access is limited to the repository (path guard).
 - Model endpoint is the only default outbound network access.
 "@
-    Set-Content -Path $rcRecordFile -Value $rcContent -Encoding UTF8
-    Write-Host "[ok] RC record: $rcRecordFile"
+    $prevZip = "$zipPath.prev"
+    $prevRc = "$rcRecordFile.prev"
+    try {
+        if (Test-Path $zipPath) { Copy-Item $zipPath $prevZip -Force }
+        if (Test-Path $rcRecordFile) { Copy-Item $rcRecordFile $prevRc -Force }
+        Move-Item $stagingZip $zipPath -Force
+        Set-Content -Path $rcRecordFile -Value $rcContent -Encoding UTF8
+        Write-Host "[gate 12/12] published: $zipPath + RC record (previous versions backed up then removed)"
+    } catch {
+        Write-Host "[FAIL] publish :: $_ -- restoring previous artifacts"
+        if (Test-Path $prevZip) {
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+            Move-Item $prevZip $zipPath -Force
+        }
+        if (Test-Path $prevRc) {
+            if (Test-Path $rcRecordFile) { Remove-Item $rcRecordFile -Force -ErrorAction SilentlyContinue }
+            Move-Item $prevRc $rcRecordFile -Force
+        }
+        exit 1
+    }
+    if (Test-Path $prevZip) { Remove-Item $prevZip -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $prevRc) { Remove-Item $prevRc -Force -ErrorAction SilentlyContinue }
+    Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "[ok] staging cleaned"
 
     Write-Host ""
     Write-Host "=== RC Ready ==="

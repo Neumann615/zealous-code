@@ -1,4 +1,4 @@
-﻿# zealous-code
+# zealous-code
 
 本仓库是从零重建的新产品主线:`main` 分支为 orphan 分支。
 旧工程完整快照保存在归档分支 `archive/pre-agent-assets-20261015`(基于原 master 及其历史),
@@ -31,7 +31,9 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    zealous config check
    ```
 
-3. 创建任务(brief 可经 `--file <仓库内路径>` 或 stdin 提供):
+3. 创建任务(brief 输入方式按入口而定:CLI 为 `--file <仓库内相对路径>`;
+   TUI 为新建表单的 brief file 字段;app-server 为 `create_task` 请求的
+   `brief` 文本字段。CLI 当前不支持 stdin brief):
 
    ```bash
    zealous task new "修复登录空指针" --file BRIEF.md

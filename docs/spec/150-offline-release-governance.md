@@ -22,6 +22,23 @@
 - 安装器;
 - 自动更新。
 
+## 溯源模型(三段,spec 150 修订版)
+
+发布溯源固定为三段提交,避免"bundle 无法包含记录自身哈希的提交"
+被误读为治理不一致:
+
+1. **Runtime source commit**
+   产品运行时代码,以及影响证据生成的脚本(如
+   `scripts/package-release.ps1`、`scripts/tui-console-drive.py`)、
+   对外文档(README)所在提交。zip 由该提交构建。
+2. **RC record commit**
+   相对 runtime source commit,只允许修改 RC 记录、验收记录与纯文档
+   (`docs/` 下)。由打包脚本自动生成 RC 记录后提交。
+3. **Bundle rotation commit**
+   bundle 创建并 verify 通过后,最后提交 bundle 哈希与事故/轮换记录。
+   **该提交不进入 bundle**(bundle 无法包含记录自身哈希的提交),
+   必须在 RC 记录中明确说明这一限制。
+
 ## 发布门槛(默认打包模式全部硬性)
 
 1. TUI 验收 8/8 PASS,且场景 1、4、7、8 证据方式为 MANUAL
@@ -41,7 +58,16 @@
      不含假密钥;
    - 验证后删除临时目录。
 7. RC 记录完整:zip SHA256、bundle SHA256、verify 结果、runtime commit、
-   分发状态;RC 记录提交与 runtime source commit 的差异仅限文档。
+   分发状态。
+
+## 打包失败安全(硬性)
+
+- 打包脚本**不得在任何 gate 通过之前删除正式候选包**;
+- 新 zip 一律先写入 `dist/.rc-staging/`,全部 gate(含清单、解压验证)
+  通过后才替换正式 zip;
+- 替换前备份旧 zip 与旧 RC 记录;替换或 RC 记录写入失败时:
+  恢复旧 zip、恢复旧 RC 记录、清理 staging、退出码 1;
+- Gate 1 只允许清理 `.rc-staging` 残留。
 
 ## `-LocalTrial` 模式
 
@@ -50,20 +76,31 @@ RC 记录标记 `LOCAL TRIAL (NOT for external release)`,不得对外分发。
 
 ## 本地不可变备份
 
-最终 RC 记录提交后执行:
+最终 RC record commit 后执行:
 
-- `git bundle create dist/zealous-code-main-offline-rc.bundle main`;
-- `git bundle verify` 通过后删除旧 `zealous-code-main-spec141.bundle`;
+- `git bundle create dist/zealous-code-main-offline-rc-final.bundle main`;
+- `git bundle verify` 通过后再提交 bundle rotation 记录(见溯源模型第 3 段);
+- rotation 记录提交后删除旧 `zealous-code-main-offline-rc.bundle`;
 - `zealous-code-archive-20261015.bundle` 保留;
 - bundle SHA256 记入 RC 记录。仍不推 remote。
 
 ## 证据归档
 
-`dist/evidence/v0.1.0/` 归档 TUI 截图、Dogfooding 结果、mock 驱动脚本、
-spec 141 结果、RC 记录副本:
+`dist/evidence/v0.1.0/` 归档:
 
-- 归档前计算 SHA256,归档后确认关键文件存在;
-- 不删除开发者尚未确认的截图;
+- TUI 截图与驱动脚本;
+- Dogfooding 验收文档快照(`dogfooding-0.1.0.md`、`dogfooding-140.md`);
+- spec 141 验收文档快照(`spec141-temp-artifact-hygiene.md`);
+- 最终 RC 记录与 TUI 验收记录快照;
+- `EVIDENCE-MANIFEST.md`:逐文件说明证据作用;明确 Dogfooding 原始
+  JSON 结果因 dist 事故丢失不可确定性重建;声明 `docs/acceptance/`
+  为权威验收记录;说明重生成 TUI 证据与原始证据的关系。
+
+要求:
+
+- `SHA256SUMS.txt` 使用相对 `dist/evidence/v0.1.0/` 的 POSIX 路径,
+  不含 Windows 盘符;
+- 归档后确认关键文件存在;
 - 严禁把 `.env` 或任何真实 API key 放入证据归档。
 
 ## 产物验证清单
@@ -72,5 +109,6 @@ spec 141 结果、RC 记录副本:
 - 解压后 `--version` 正确、`config check` 不泄漏密钥;
 - SHA256 写入 RC 记录;
 - RC 记录中的 runtime commit 与实际构建源一致;
+- 三段溯源清晰(runtime source / RC record / bundle rotation);
 - bundle verify 通过;
 - 包内无 `.env`、`.zealous/`、Git 元数据、`agent-assets/` 或任务数据。
