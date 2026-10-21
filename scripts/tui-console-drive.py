@@ -249,6 +249,11 @@ def screenshot(out_dir, name, pid):
     w, h = rect.right - rect.left, rect.bottom - rect.top
     if w <= 0 or h <= 0:
         return "window rect invalid (%dx%d)" % (w, h)
+    # Restore if minimized and bring to foreground so CopyFromScreen
+    # captures the TUI window, not whatever happens to be on top.
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.5)
     # HWND_TOPMOST = -1 during capture so the window is unoccluded
     user32.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0001 | 0x0002)
     time.sleep(0.3)
