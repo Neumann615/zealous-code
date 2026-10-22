@@ -55,6 +55,9 @@ pub struct ChatResponse {
 pub enum ProviderError {
     /// 配置缺失/非法——创建任务即失败的原因(A6)
     Invalid(String),
+    /// 可重试的暂时性失败(网络/5xx/429),只携带底层原因文本
+    /// (spec 152:不再滥用 Exhausted,避免错误双重嵌套)
+    Transient(String),
     /// 重试耗尽仍失败,携带最后一次可解释原因
     Exhausted { attempts: u32, last: String },
     /// 不可重试的 4xx
@@ -65,6 +68,7 @@ impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProviderError::Invalid(r) => write!(f, "provider_config_invalid: {r}"),
+            ProviderError::Transient(r) => write!(f, "{r}"),
             ProviderError::Exhausted { attempts, last } => {
                 write!(f, "provider_exhausted after {attempts} attempts: {last}")
             }
@@ -344,10 +348,7 @@ fn classify_ureq(e: ureq::Error) -> ProviderError {
                 .map(|s| truncate(&s, 200))
                 .unwrap_or_else(|_| "<unreadable body>".into());
             if code == 429 || code >= 500 {
-                ProviderError::Exhausted {
-                    attempts: 0,
-                    last: format!("http {code}: {summary}"),
-                }
+                ProviderError::Transient(format!("http {code}: {summary}"))
             } else {
                 ProviderError::Rejected {
                     status: code,
@@ -355,10 +356,15 @@ fn classify_ureq(e: ureq::Error) -> ProviderError {
                 }
             }
         }
-        other => ProviderError::Exhausted {
-            attempts: 0,
-            last: format!("network: {other}"),
-        },
+        other => {
+            // ureq Transport Display 会叠加多层 "Network Error: " 前缀
+            // (spec 152:归一为单个 network: 前缀,去掉重复段)
+            // ureq Transport Display 形如
+            // "{url}: Network Error: Network Error: {os/os error 文本}",
+            // "Network Error" 段与我们的 network: 前缀语义重复,整体移除
+            let msg = other.to_string().replace("Network Error: ", "");
+            ProviderError::Transient(format!("network: {msg}"))
+        }
     }
 }
 
@@ -497,6 +503,22 @@ mod tests {
                         .to_string();
                         format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
                     }
+                } else if path.starts_with("/always500") {
+                    // spec 152:恒 500(retry exhausted 错误形态断言)
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else if path.starts_with("/hang") {
+                    // spec 152:客户端超时路径。在独立线程延迟响应,
+                    // 不阻塞共享 accept 循环(否则并行测试被排队超时)。
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(3));
+                        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    });
+                    continue;
+                } else if path.starts_with("/badjson") {
+                    // spec 152:200 + 非法 JSON(Rejected 不重试断言)
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\nConnection: close\r\n\r\nnot json {{{\r\n".to_string()
                 } else {
                     // /reject 及未知路径:恒 401(A6:4xx 不重试路径)
                     "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -724,5 +746,117 @@ mod tests {
             )
             .is_err());
         assert_eq!(mock.calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
+
+    // ---------- spec 152:错误去嵌套 ----------
+
+    fn single_line_count(s: &str, needle: &str) -> usize {
+        s.matches(needle).count()
+    }
+
+    #[test]
+    fn http_500_retry_exhausted_error_is_single_layer() {
+        let addr = shared_server();
+        wait_listening(addr);
+        let cfg = ProviderConfig {
+            base_url: format!("http://{addr}/always500"),
+            api_key: "k".into(),
+            model: "m".into(),
+            timeout_secs: 5,
+            max_retries: 1,
+        };
+        let provider = OpenAiCompatProvider::new(cfg).with_retry(zero_backoff_policy());
+        let err = provider
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    messages: vec![ChatMessage::user("hi")],
+                },
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        // 单层:exhausted after 只出现一次,且直接跟底层 http 原因
+        assert_eq!(
+            single_line_count(&text, "exhausted after"),
+            1,
+            "nested exhausted: {text}"
+        );
+        assert!(
+            text.starts_with("provider_exhausted after ") && text.contains(": http 500:"),
+            "{text}"
+        );
+        assert!(!text.contains("provider_exhausted after 0"), "{text}");
+    }
+
+    #[test]
+    fn timeout_retry_error_mentions_network_error_at_most_once() {
+        let addr = shared_server();
+        wait_listening(addr);
+        let cfg = ProviderConfig {
+            base_url: format!("http://{addr}/hang"),
+            api_key: "k".into(),
+            model: "m".into(),
+            timeout_secs: 1,
+            max_retries: 1,
+        };
+        let provider = OpenAiCompatProvider::new(cfg).with_retry(zero_backoff_policy());
+        let err = provider
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    messages: vec![ChatMessage::user("hi")],
+                },
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert_eq!(
+            single_line_count(&text, "exhausted after"),
+            1,
+            "nested exhausted: {text}"
+        );
+        assert!(
+            single_line_count(&text, "Network Error") <= 1,
+            "repeated Network Error: {text}"
+        );
+        assert!(text.contains("network:"), "{text}");
+    }
+
+    #[test]
+    fn bad_json_200_is_rejected_without_retry() {
+        let addr = shared_server();
+        wait_listening(addr);
+        let cfg = ProviderConfig {
+            base_url: format!("http://{addr}/badjson"),
+            api_key: "k".into(),
+            model: "m".into(),
+            timeout_secs: 5,
+            max_retries: 2,
+        };
+        let provider = OpenAiCompatProvider::new(cfg).with_retry(zero_backoff_policy());
+        let err = provider
+            .complete(
+                "m",
+                &ChatRequest {
+                    system: None,
+                    messages: vec![ChatMessage::user("hi")],
+                },
+            )
+            .unwrap_err();
+        match &err {
+            ProviderError::Rejected {
+                status: 200,
+                summary,
+            } => {
+                assert!(summary.starts_with("bad json"), "{summary}");
+            }
+            other => panic!("expected Rejected 200/bad json, got {other:?}"),
+        }
+        // 不可重试:单次调用即失败
+        assert_eq!(
+            provider.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }
