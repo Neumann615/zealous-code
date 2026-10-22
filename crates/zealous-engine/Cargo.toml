@@ -13,3 +13,5 @@ serde_json = "1"
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 # spec 154:search_text 正则检索
 regex = "1"
+# spec 156:全局 run lease(OS advisory lock)
+fs4 = "0.13"
