@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 
-SAFE_SHELL = re.compile(r"(?:^|shell:\s*)(python3?|node|cargo|npm)\b")
+SAFE_SHELL = re.compile(r"(?:^|shell:\s*)\s*(python3?|node|cargo|npm)\b")
 UNSAFE_PAT = re.compile(r"git\s+(add|commit)|stash|checkout\s+--|^\s*rm\s|\brm\s+-", re.I)
 
 
@@ -52,13 +52,15 @@ def main():
             decision = "approve"
             answer = "y\n"
         elif tool == "shell":
-            if SAFE_SHELL.match(summary):
+            # spec 153:审批摘要可能带警示前缀,unsafe 判定只看命令段
+            cmd_part = summary.split("shell:", 1)[-1] if "shell:" in summary else summary
+            if SAFE_SHELL.match(cmd_part):
                 decision = "approve"
                 answer = "y\n"
             else:
                 decision = "reject"
                 answer = "n\n"
-                if UNSAFE_PAT.search(summary):
+                if UNSAFE_PAT.search(cmd_part):
                     unsafe.append(summary.strip())
         else:
             decision = "reject"
