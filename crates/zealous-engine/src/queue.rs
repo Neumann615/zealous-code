@@ -12,9 +12,18 @@ use crate::task_service::TaskService;
 use crate::tools::builtin_registry;
 use crate::workspace;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use zealous_core::{AgentRef, TaskId, TaskStatus};
+use zealous_core::{TaskId, TaskStatus};
+
+/// --all 模式筛选结果
+pub type SelectResult = Result<(Vec<TaskId>, Vec<(TaskId, String)>), String>;
+
+/// 队列事件钩子类型(简化 clippy type_complexity)
+pub type OnTaskStartedFn<'a> = Box<dyn FnMut(&TaskId, usize, usize) + 'a>;
+pub type OnTaskFinishedFn<'a> = Box<dyn FnMut(&TaskId, TaskStatus) + 'a>;
+pub type OnApplyFinishedFn<'a> = Box<dyn FnMut(&TaskId, bool, String) + 'a>;
+pub type ConfirmApplyFn<'a> = Box<dyn FnMut(&TaskId) -> bool + 'a>;
 
 /// 单任务可入队判定(spec 156):Queued + 无任何 run + 无 isolated workspace
 pub fn check_runnable(proj: &zealous_core::projection::TaskProjection) -> Result<(), String> {
@@ -31,7 +40,7 @@ pub fn check_runnable(proj: &zealous_core::projection::TaskProjection) -> Result
 }
 
 /// --all 模式筛选:可运行(TaskId 升序)+ 不可运行原因
-pub fn select_runnable(svc: &TaskService) -> Result<(Vec<TaskId>, Vec<(TaskId, String)>), String> {
+pub fn select_runnable(svc: &TaskService) -> SelectResult {
     let (summaries, skipped) = svc.list_tasks().map_err(|e| e.to_string())?;
     let mut runnable = Vec::new();
     let mut not_runnable: Vec<(TaskId, String)> = skipped
@@ -71,11 +80,11 @@ pub fn validate_explicit(svc: &TaskService, ids: &[TaskId]) -> Result<(), (usize
 
 /// 队列前端钩子(进度/通知/交互确认)
 pub struct QueueHooks<'a> {
-    pub on_task_started: Box<dyn FnMut(&TaskId, usize, usize) + 'a>,
-    pub on_task_finished: Box<dyn FnMut(&TaskId, TaskStatus) + 'a>,
-    pub on_apply_finished: Box<dyn FnMut(&TaskId, bool, String) + 'a>,
+    pub on_task_started: OnTaskStartedFn<'a>,
+    pub on_task_finished: OnTaskFinishedFn<'a>,
+    pub on_apply_finished: OnApplyFinishedFn<'a>,
     /// auto_apply=false 时的交互确认;返回 false 队列停止
-    pub confirm_apply: Box<dyn FnMut(&TaskId) -> bool + 'a>,
+    pub confirm_apply: ConfirmApplyFn<'a>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -189,7 +198,7 @@ mod tests {
     use crate::lease::try_acquire;
     use std::path::PathBuf;
     use std::process::Command;
-    use zealous_core::{AgentRole, AgentRunId, EventPayload, TaskStatus};
+    use zealous_core::{AgentRef, AgentRole, AgentRunId, EventPayload};
 
     fn repo(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -238,15 +247,6 @@ mod tests {
         Arc::new(crate::provider::MockProvider::scripted(
             script.into_iter().map(Ok).collect(),
         ))
-    }
-
-    fn no_hooks() -> QueueHooks<'static> {
-        QueueHooks {
-            on_task_started: Box::new(|_, _, _| {}),
-            on_task_finished: Box::new(|_, _| {}),
-            on_apply_finished: Box::new(|_, _, _| {}),
-            confirm_apply: Box::new(|_| true),
-        }
     }
 
     #[test]

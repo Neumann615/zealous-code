@@ -10,7 +10,6 @@
 
 use fs4::fs_std::FileExt as _;
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use zealous_core::time::rfc3339_from_unix_millis;

@@ -216,6 +216,14 @@ pub(crate) fn apply_event(
             state.running = false;
             state.set_error(msg);
         }
+        TuiEvent::Progress(msg) => {
+            state.push_progress(msg);
+        }
+        TuiEvent::QueueFinished(summary) => {
+            state.running = false;
+            state.push_important(&format!("queue: {summary}"));
+            refresh_task_list(state, svc);
+        }
     }
 }
 
@@ -291,6 +299,21 @@ fn handle_key(
                         }
                     }
                 }
+                state::ConfirmKind::QueueRun => {
+                    if !state.running {
+                        let ids = state.queue_ids.clone();
+                        if !ids.is_empty() {
+                            state.running = true;
+                            runner::spawn_queue(
+                                TaskService::new(svc.repo_root().to_path_buf()),
+                                ids,
+                                event_tx.clone(),
+                                progress_sink.clone(),
+                                abort.clone(),
+                            );
+                        }
+                    }
+                }
                 state::ConfirmKind::WorkspaceRemove => {
                     if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
                         match svc.open_task(&task_id) {
@@ -354,6 +377,48 @@ fn handle_key(
             KeyCode::Up | KeyCode::Char('k') => state.select_prev(),
             KeyCode::Char('r') => state.refresh_tasks(list_tasks(svc)),
             KeyCode::Char('n') => state.open_form(),
+            KeyCode::Char('A') => {
+                // spec 156:确认后串行运行全部可运行 queued 任务(auto apply)
+                match zealous_engine::queue::select_runnable(svc) {
+                    Ok((runnable, _)) => {
+                        if runnable.is_empty() {
+                            state.set_error("(no runnable queued tasks)".into());
+                        } else {
+                            state.queue_ids = runnable;
+                            state.open_confirm(state::ConfirmKind::QueueRun);
+                        }
+                    }
+                    Err(e) => state.set_error(e.clone()),
+                }
+            }
+            KeyCode::Char('Q') => match zealous_engine::queue::select_runnable(svc) {
+                Ok((runnable, not_runnable)) => {
+                    let mut text = String::new();
+                    if zealous_engine::lease::is_held(svc.repo_root()) {
+                        if let Some(info) = zealous_engine::lease::peek_info(svc.repo_root()) {
+                            text.push_str(&format!(
+                                "active: pid {} task {} mode {}\n",
+                                info.pid, info.task_id, info.mode
+                            ));
+                        }
+                    } else {
+                        text.push_str("active: (none)\n");
+                    }
+                    text.push_str(&format!("runnable ({}):\n", runnable.len()));
+                    for id in &runnable {
+                        text.push_str(&format!("  {}\n", id.as_str()));
+                    }
+                    if !not_runnable.is_empty() {
+                        text.push_str("not runnable:\n");
+                        for (id, reason) in &not_runnable {
+                            text.push_str(&format!("  {}  {reason}\n", id.as_str()));
+                        }
+                    }
+                    state.queue_status_text = Some(text);
+                    state.screen = Screen::Queue;
+                }
+                Err(e) => state.set_error(e.clone()),
+            },
             KeyCode::Enter => {
                 let id = state.selected_task().map(|t| t.task_id.clone());
                 if let Some(id) = id {
@@ -366,6 +431,10 @@ fn handle_key(
                     }
                 }
             }
+            _ => {}
+        },
+        Screen::Queue => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => state.screen = Screen::List,
             _ => {}
         },
         Screen::Detail => match key.code {

@@ -273,6 +273,18 @@ fn render_confirm_modal(f: &mut Frame, state: &TuiState) {
                 "worktree 中的未提交改动不会被删除(需 CLI --force)。".to_string(),
             ],
         ),
+        super::state::ConfirmKind::QueueRun => {
+            let mut lines = vec![
+                "Run queued tasks in isolated worktrees?".to_string(),
+                String::new(),
+            ];
+            for id in &state.queue_ids {
+                lines.push(format!("  Task: {}", id.as_str()));
+            }
+            lines.push(String::new());
+            lines.push("Completed tasks will be fast-forward applied to main.".into());
+            ("Queue".to_string(), lines)
+        }
     };
     let area = centered_rect(60, 30, f.area());
     f.render_widget(Clear, area);

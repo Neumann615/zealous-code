@@ -52,6 +52,7 @@ pub fn spawn_worker(
     notif_tx: mpsc::Sender<Notification>,
     abort: Arc<AtomicBool>,
     isolate: bool,
+    run_lease: zealous_engine::lease::RunLease,
 ) -> RunHandles {
     let (approval_sink, request_rx, decision_tx) =
         crate::tui::approval::channel(task_id.as_str().to_string(), abort.clone());
@@ -123,6 +124,8 @@ pub fn spawn_worker(
     ));
 
     let worker_abort = abort.clone();
+    // spec 156:lease 由 worker 线程持有,结束(Drop)即释放
+    let _run_lease = run_lease;
     let done = Arc::new(AtomicBool::new(false));
     let done_flag = done.clone();
     let join = std::thread::spawn(move || {

@@ -1,7 +1,7 @@
 //! TUI 纯 UI 状态与 reducer(spec 90):只保存 UI 选择、输入草稿、滚动
 //! 与渲染所需数据;任务/审批/工具状态全部来自投影或 engine 事件。
 
-use zealous_core::{TaskEvent, TaskProjection, TaskStatus};
+use zealous_core::{TaskEvent, TaskId, TaskProjection, TaskStatus};
 use zealous_engine::task_service::TaskSummary;
 
 /// 审批请求的 UI 形态(来自 channel sink)
@@ -26,6 +26,8 @@ pub enum Screen {
     Detail,
     /// 新建任务表单
     Form,
+    /// 队列状态视图(spec 156)
+    Queue,
 }
 
 /// 新建任务表单草稿
@@ -44,6 +46,8 @@ pub enum ConfirmKind {
     IsolatedRun,
     Apply,
     WorkspaceRemove,
+    /// spec 156:串行运行全部可运行 queued 任务(auto apply)
+    QueueRun,
 }
 
 /// TUI 全部 UI 状态;任务事实以投影/账本为准,这里只有派生显示数据
@@ -54,6 +58,10 @@ pub struct TuiState {
     pub confirm: Option<ConfirmKind>,
     /// spec 155:详情页是否显示 workspace 区块(W 切换)
     pub workspace_visible: bool,
+    /// spec 156:待运行的队列任务(确认弹窗展示 + Enter 执行)
+    pub queue_ids: Vec<TaskId>,
+    /// spec 156:queue status 文本(Q 视图)
+    pub queue_status_text: Option<String>,
     pub tasks: Vec<TaskSummary>,
     pub selected: usize,
     pub detail: Option<TaskProjection>,
@@ -89,6 +97,8 @@ impl TuiState {
             screen: Screen::List,
             confirm: None,
             workspace_visible: false,
+            queue_ids: Vec::new(),
+            queue_status_text: None,
             tasks: Vec::new(),
             selected: 0,
             detail: None,

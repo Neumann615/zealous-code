@@ -17,7 +17,7 @@ use zealous_core::{ApprovalDecision, TaskStatus};
 use zealous_engine::approval::ApprovalSink;
 use zealous_engine::executor::ToolExecutor;
 use zealous_engine::orchestrator::Orchestrator;
-use zealous_engine::provider::{OpenAiCompatProvider, ProviderConfig};
+use zealous_engine::provider::{OpenAiCompatProvider, Provider, ProviderConfig};
 use zealous_engine::task_service::{CreateOutcome, TaskService};
 use zealous_engine::tools::builtin_registry;
 
@@ -44,6 +44,37 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// 串行任务队列(spec 156;全部 isolated,单并发)
+    Queue {
+        #[command(subcommand)]
+        cmd: QueueCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum QueueCmd {
+    /// 串行执行任务(显式 IDs 按顺序;--all 按 TaskId 升序取全部可运行)
+    Run {
+        /// 按顺序执行的 task ids(与 --all 互斥)
+        task_ids: Vec<String>,
+        /// 取全部可运行 Queued 任务
+        #[arg(long)]
+        all: bool,
+        /// 任务 Completed 后自动 fast-forward 应用回主分支
+        #[arg(long)]
+        auto_apply: bool,
+        /// 全部工具审批自动通过
+        #[arg(long)]
+        yes: bool,
+        /// 全部工具审批自动拒绝
+        #[arg(long)]
+        no: bool,
+        /// 只保留审批请求、错误与最终结果
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// 查看队列状态(active / runnable / not runnable)
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -271,6 +302,17 @@ fn main() {
                 yes,
             } => cmd_workspace_remove(&task_id, force, yes),
         },
+        Cmd::Queue { cmd } => match cmd {
+            QueueCmd::Run {
+                task_ids,
+                all,
+                auto_apply,
+                yes,
+                no,
+                quiet,
+            } => cmd_queue_run(task_ids, all, auto_apply, yes, no, quiet),
+            QueueCmd::Status => cmd_queue_status(),
+        },
         Cmd::Config {
             cmd: ConfigCmd::Check,
         } => cmd_config_check(),
@@ -434,6 +476,13 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool, isolate: bool) -> i3
     if proj.pending_approvals.is_empty() && matches!(proj.status, TaskStatus::Running) {
         println!("任务已在运行中(可能有挂起审批未处理;如异常请查看 events)");
     }
+    // spec 156:全局 run lease(单并发防线;Drop 时释放)
+    let mode = if isolate { "isolated" } else { "direct" };
+    let _run_lease =
+        match zealous_engine::lease::try_acquire(&repo_root().unwrap_or_default(), task_id, mode) {
+            Ok(l) => l,
+            Err(e) => return err(e.to_string()),
+        };
     // spec 155:运行根解析(模式规则落账;isolated 校验/重建在此完成)
     let run_root = match zealous_engine::workspace::ensure_run_root(
         repo_root().unwrap_or_default().as_path(),
@@ -541,6 +590,200 @@ fn cmd_events(task_id: &str) -> i32 {
         }
         Err(e) => err(e.to_string()),
     }
+}
+
+fn cmd_queue_run(
+    task_ids: Vec<String>,
+    all: bool,
+    auto_apply: bool,
+    yes: bool,
+    no: bool,
+    quiet: bool,
+) -> i32 {
+    use zealous_engine::queue;
+    if !all && task_ids.is_empty() {
+        return err("需要显式 task ids 或 --all");
+    }
+    if all && !task_ids.is_empty() {
+        return err("显式 task ids 与 --all 互斥");
+    }
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    // 任务解析与筛选
+    let ids: Vec<zealous_core::TaskId> = if all {
+        let (runnable, not_runnable) = match queue::select_runnable(&svc) {
+            Ok(x) => x,
+            Err(e) => return err(e),
+        };
+        if runnable.is_empty() {
+            println!("(no runnable queued tasks)");
+            return 0;
+        }
+        if !not_runnable.is_empty() {
+            println!("not runnable:");
+            for (id, reason) in &not_runnable {
+                println!("  {id}  {reason}");
+            }
+        }
+        runnable
+    } else {
+        let mut parsed = Vec::new();
+        for raw in &task_ids {
+            match zealous_core::TaskId::parse(raw) {
+                Ok(id) => parsed.push(id),
+                Err(e) => return err(format!("无效 task id {raw}: {e}")),
+            }
+        }
+        parsed
+    };
+    // 显式模式:启动前全量校验
+    if !all {
+        if let Err((i, id, reason)) = queue::validate_explicit(&svc, &ids) {
+            return err(format!(
+                "queue 启动失败(未执行任何任务): 第 {} 个任务 {id}: {reason}",
+                i + 1
+            ));
+        }
+    }
+    // Provider 配置
+    let config = match ProviderConfig::resolve() {
+        Ok(c) => c,
+        Err(e) => return err(format!("provider 配置无效: {e}")),
+    };
+    println!(
+        "queue: {} 个任务, isolated, auto_apply={auto_apply}",
+        ids.len()
+    );
+    // 全局 run lease(队列全程持有)
+    let lease = match zealous_engine::lease::try_acquire(&repo, "queue", "queue") {
+        Ok(l) => l,
+        Err(e) => return err(e.to_string()),
+    };
+    let model = config.model.clone();
+    let provider: Arc<dyn Provider> = Arc::new(OpenAiCompatProvider::new(config));
+    let auto = if yes {
+        Some(ApprovalDecision::Approve)
+    } else if no {
+        Some(ApprovalDecision::Reject)
+    } else {
+        None
+    };
+    let abort = Arc::new(AtomicBool::new(false));
+    if let Err(e) = ctrlc::set_handler({
+        let abort = abort.clone();
+        move || abort.store(true, Ordering::Relaxed)
+    }) {
+        return err(format!("install ctrl-c handler: {e}"));
+    }
+    let sink: Arc<dyn ApprovalSink> = Arc::new(StdinApproval::new(auto, abort.clone()));
+    let progress: Option<zealous_engine::progress::SharedSink> =
+        Some(Arc::new(CliProgress { quiet }));
+    // 交互 apply 确认(auto_apply 时跳过)
+    let confirm = move |tid: &zealous_core::TaskId| -> bool {
+        print!(
+            "任务 {} 已完成,将其 fast-forward 应用回主分支? [y/N] ",
+            tid.as_str()
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        let t = line.trim().to_ascii_lowercase();
+        t == "y" || t == "yes"
+    };
+    let mut hooks = queue::QueueHooks {
+        on_task_started: Box::new(|tid, i, total| {
+            println!("=== [{i}/{total}] task {} 开始(isolated) ===", tid.as_str());
+        }),
+        on_task_finished: Box::new(|tid, status| {
+            println!("=== task {} 结束: {status:?} ===", tid.as_str());
+        }),
+        on_apply_finished: Box::new(|tid, ok, detail| {
+            if ok {
+                println!("=== task {} apply 成功: {detail} ===", tid.as_str());
+            } else {
+                println!("=== task {} apply 失败: {detail} ===", tid.as_str());
+            }
+        }),
+        confirm_apply: Box::new(confirm),
+    };
+    let summary = queue::run_serial(
+        &repo, &svc, provider, model, 24, &ids, auto_apply, sink, progress, abort, &lease,
+        &mut hooks,
+    );
+    println!(
+        "queue 完成: applied {} / completed {}",
+        summary.applied.len(),
+        summary.completed.len()
+    );
+    if !summary.stopped_reason.is_empty() {
+        println!("queue 停止: {}", summary.stopped_reason);
+        return 1;
+    }
+    0
+}
+
+fn cmd_queue_status() -> i32 {
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    // active:lease 持有中?
+    if zealous_engine::lease::is_held(&repo) {
+        let info = zealous_engine::lease::peek_info(&repo);
+        println!("active:");
+        match info {
+            Some(info) => {
+                println!(
+                    "  pid {} task {} mode {}",
+                    info.pid, info.task_id, info.mode
+                );
+                if let Ok(tid) = zealous_core::TaskId::parse(&info.task_id) {
+                    if let Ok((_l, proj, _)) = svc.open_task(&tid) {
+                        println!("  status {:?}", proj.status);
+                        if let Some(ws) = &proj.execution_workspace {
+                            println!("  workspace branch {}", ws.branch);
+                        }
+                    }
+                }
+            }
+            None => println!("  (metadata 不可读)"),
+        }
+    } else {
+        println!("active: (none)");
+    }
+    match zealous_engine::queue::select_runnable(&svc) {
+        Ok((runnable, not_runnable)) => {
+            println!("runnable queue (--all order):");
+            if runnable.is_empty() {
+                println!("  (none)");
+            }
+            for (i, id) in runnable.iter().enumerate() {
+                println!("  {}. {}", i + 1, id.as_str());
+            }
+            println!("not runnable:");
+            if not_runnable.is_empty() {
+                println!("  (none)");
+            }
+            for (id, reason) in &not_runnable {
+                println!("  {}  {reason}", id.as_str());
+            }
+        }
+        Err(e) => return err(e),
+    }
+    0
 }
 
 fn git_out(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {

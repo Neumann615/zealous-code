@@ -2,11 +2,13 @@
 //! 事实来自 TaskService(投影/账本);engine 是唯一写入者。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
-use zealous_core::{ApprovalDecision, TaskId};
-use zealous_engine::provider::ProviderConfig;
+use zealous_core::{ApprovalDecision, TaskId, TaskStatus};
+use zealous_engine::approval::ApprovalSink;
+use zealous_engine::provider::{OpenAiCompatProvider, ProviderConfig};
+use zealous_engine::queue as queue_mod;
 use zealous_engine::task_service::TaskService;
 
 use super::protocol::{ErrorResponse, Notification, ProtocolError, Request, Response};
@@ -45,12 +47,25 @@ pub struct RunState {
     handles: runner::RunHandles,
 }
 
+/// spec 156:队列运行时共享状态(线程 ↔ 会话)
+pub struct QueueShared {
+    pub abort: Arc<AtomicBool>,
+    pub task_ids: Vec<TaskId>,
+    pub index: AtomicUsize,
+    pub auto_apply: bool,
+    pub completed: Mutex<Vec<String>>,
+    pub last_failed: Mutex<Option<String>>,
+    pub finished: AtomicBool,
+}
+
 pub struct Session {
     pub svc: TaskService,
     pub repo_root: PathBuf,
     pub initialized: bool,
     pub subscription: Option<Subscription>,
     pub run: Option<RunState>,
+    pub queue: Option<Arc<QueueShared>>,
+    pub queue_join: Option<std::thread::JoinHandle<()>>,
     pub notif_tx: mpsc::Sender<Notification>,
 }
 
@@ -62,6 +77,8 @@ impl Session {
             initialized: false,
             subscription: None,
             run: None,
+            queue: None,
+            queue_join: None,
             notif_tx,
         }
     }
@@ -81,11 +98,15 @@ impl Session {
             "run_task" => Handled::Response(self.handle_run_task(&req)),
             "interrupt_task" => Handled::Response(self.handle_interrupt(&req)),
             "decide_approval" => Handled::Response(self.handle_decide(&req)),
+            "run_queue" => Handled::Response(self.handle_run_queue(&req)),
+            "stop_queue" => Handled::Response(self.handle_stop_queue(&req)),
+            "get_queue_status" => Handled::Response(self.handle_get_queue_status(&req)),
             "apply_task" => Handled::Response(self.handle_apply_task(&req)),
             "get_workspace" => Handled::Response(self.handle_get_workspace(&req)),
             "remove_workspace" => Handled::Response(self.handle_remove_workspace(&req)),
             "shutdown" => {
                 self.wait_worker();
+                self.wait_queue();
                 Handled::Shutdown(Response::ok(req.id, serde_json::json!({ "bye": true })))
             }
             other => Handled::Response(err_resp(
@@ -332,6 +353,13 @@ impl Session {
             .get("isolate")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // spec 156:全局 run lease(单并发防线)
+        let mode = if isolate { "isolated" } else { "direct" };
+        let run_lease =
+            match zealous_engine::lease::try_acquire(&self.repo_root, task_id.as_str(), mode) {
+                Ok(l) => l,
+                Err(e) => return err_resp(req.id, "already_running", e.to_string()),
+            };
         let handles = runner::spawn_worker(
             self.svc.clone(),
             self.repo_root.clone(),
@@ -339,6 +367,7 @@ impl Session {
             self.notif_tx.clone(),
             Arc::new(AtomicBool::new(false)),
             isolate,
+            run_lease,
         );
         self.run = Some(RunState { task_id, handles });
         Response::ok(req.id, serde_json::json!({ "started": true }))
@@ -449,9 +478,228 @@ impl Session {
             }
         }
     }
-}
 
-impl Session {
+    /// spec 156:等待 queue worker 结束(shutdown)
+    fn wait_queue(&mut self) {
+        if let Some(join) = self.queue_join.take() {
+            let _ = join.join();
+        }
+    }
+
+    /// 回收已结束的 queue 运行时
+    fn reap_queue(&mut self) {
+        if let Some(q) = &self.queue {
+            if q.finished.load(Ordering::SeqCst) {
+                self.wait_queue();
+                self.queue = None;
+            }
+        }
+    }
+
+    /// run_queue(spec 156):后台串行执行;单 session 一个 queue worker
+    fn handle_run_queue(&mut self, req: &Request) -> Response {
+        self.reap_queue();
+        if let Some(q) = &self.queue {
+            if !q.finished.load(Ordering::SeqCst) {
+                return err_resp(req.id, "already_running", "已有队列在运行");
+            }
+        }
+        let all = req
+            .params
+            .get("all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let auto_apply = req
+            .params
+            .get("auto_apply")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut task_ids: Vec<TaskId> = Vec::new();
+        if all {
+            match queue_mod::select_runnable(&self.svc) {
+                Ok((runnable, _)) => task_ids = runnable,
+                Err(e) => return err_resp(req.id, "internal", e),
+            }
+            if task_ids.is_empty() {
+                return err_resp(req.id, "no_runnable_tasks", "(no runnable queued tasks)");
+            }
+        } else if let Some(arr) = req.params.get("task_ids").and_then(|v| v.as_array()) {
+            for v in arr {
+                match v.as_str().map(TaskId::parse) {
+                    Some(Ok(id)) => task_ids.push(id),
+                    _ => {
+                        return err_resp(req.id, "invalid_params", "task_ids 含非法任务 ID");
+                    }
+                }
+            }
+        } else {
+            return err_resp(req.id, "invalid_params", "task_ids 或 all 必填");
+        }
+        if !all {
+            if let Err((i, id, reason)) = queue_mod::validate_explicit(&self.svc, &task_ids) {
+                return err_resp(
+                    req.id,
+                    "queue_start_failed",
+                    format!("第 {} 个任务 {id}: {reason}", i + 1),
+                );
+            }
+        }
+        if ProviderConfig::resolve().is_err() {
+            return err_resp(req.id, "internal", "provider 配置无效");
+        }
+        // 全局 run lease(队列全程持有,线程结束 Drop 释放)
+        let lease = match zealous_engine::lease::try_acquire(&self.repo_root, "queue", "queue") {
+            Ok(l) => l,
+            Err(e) => return err_resp(req.id, "already_running", e.to_string()),
+        };
+        let total = task_ids.len();
+        let shared = Arc::new(QueueShared {
+            abort: Arc::new(AtomicBool::new(false)),
+            task_ids: task_ids.clone(),
+            index: AtomicUsize::new(0),
+            auto_apply,
+            completed: Mutex::new(Vec::new()),
+            last_failed: Mutex::new(None),
+            finished: AtomicBool::new(false),
+        });
+        let notif = self.notif_tx.clone();
+        let svc = self.svc.clone();
+        let repo = self.repo_root.clone();
+        let shared_t = shared.clone();
+        let join = std::thread::spawn(move || {
+            let _lease = lease;
+            let config = match ProviderConfig::resolve() {
+                Ok(c) => c,
+                Err(e) => {
+                    shared_t.finished.store(true, Ordering::SeqCst);
+                    let _ = notif.send(Notification::error_occurred(&format!(
+                        "provider 配置无效: {e}"
+                    )));
+                    return;
+                }
+            };
+            let model = config.model.clone();
+            let provider: Arc<dyn zealous_engine::provider::Provider> =
+                Arc::new(OpenAiCompatProvider::new(config));
+            let (approval_sink, request_rx, _decision) =
+                crate::tui::approval::channel("queue".into(), Arc::new(AtomicBool::new(false)));
+            // 队列内无交互审批对象:请求一律转 error 通知(V1 队列建议 auto_apply/yes 语义由模型侧脚本控制;
+            // 真实交互审批场景请使用 CLI queue run)
+            {
+                let notif2 = notif.clone();
+                std::thread::spawn(move || {
+                    for r in request_rx {
+                        let _ = notif2.send(Notification::error_occurred(&format!(
+                            "队列内收到审批请求(无交互对象,已拒绝): {} {}",
+                            r.tool, r.summary
+                        )));
+                    }
+                });
+            }
+            let progress: Option<zealous_engine::progress::SharedSink> = None;
+            let mut hooks = queue_mod::QueueHooks {
+                on_task_started: Box::new(|tid, i, total| {
+                    shared_t.index.store(i - 1, Ordering::SeqCst);
+                    let _ = notif.send(Notification::progress(
+                        "queue_task_started",
+                        &format!("{} ({i}/{total})", tid.as_str()),
+                    ));
+                }),
+                on_task_finished: Box::new(|tid, status| {
+                    if status != TaskStatus::Completed {
+                        *shared_t.last_failed.lock().unwrap() =
+                            Some(format!("{:?}: {}", status, tid.as_str()));
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "queue_task_finished",
+                        &format!("{} {:?}", tid.as_str(), status),
+                    ));
+                }),
+                on_apply_finished: Box::new(|tid, ok, detail| {
+                    if ok {
+                        shared_t.completed.lock().unwrap().push(tid.as_str().into());
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "queue_apply_finished",
+                        &format!("{} {} {}", tid.as_str(), ok, detail),
+                    ));
+                }),
+                confirm_apply: Box::new(|_| auto_apply),
+            };
+            let summary = queue_mod::run_serial(
+                &repo,
+                &svc,
+                provider,
+                model.clone(),
+                24,
+                &task_ids,
+                auto_apply,
+                Arc::new(approval_sink) as Arc<dyn ApprovalSink>,
+                progress,
+                shared_t.abort.clone(),
+                &_lease,
+                &mut hooks,
+            );
+            shared_t.finished.store(true, Ordering::SeqCst);
+            let _ = notif.send(Notification::progress(
+                "queue_finished",
+                &format!(
+                    "completed={} applied={} stopped={}",
+                    summary.completed.len(),
+                    summary.applied.len(),
+                    summary.stopped_reason
+                ),
+            ));
+        });
+        self.queue = Some(shared);
+        self.queue_join = Some(join);
+        Response::ok(
+            req.id,
+            serde_json::json!({ "queue_started": true, "total": total }),
+        )
+    }
+
+    fn handle_stop_queue(&mut self, req: &Request) -> Response {
+        match &self.queue {
+            Some(q) if !q.finished.load(Ordering::SeqCst) => {
+                q.abort.store(true, Ordering::SeqCst);
+                Response::ok(req.id, serde_json::json!({ "stopping": true }))
+            }
+            _ => err_resp(req.id, "invalid_params", "当前没有运行中的队列"),
+        }
+    }
+
+    fn handle_get_queue_status(&mut self, req: &Request) -> Response {
+        match &self.queue {
+            Some(q) => {
+                let index = q.index.load(Ordering::SeqCst);
+                let pending: Vec<String> = q
+                    .task_ids
+                    .iter()
+                    .skip(index + 1)
+                    .map(|t| t.as_str().into())
+                    .collect();
+                Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "active": q.task_ids.get(index).map(|t| t.as_str()),
+                        "index": index,
+                        "total": q.task_ids.len(),
+                        "pending": pending,
+                        "completed": q.completed.lock().unwrap().clone(),
+                        "last_failed": q.last_failed.lock().unwrap().clone(),
+                        "apply_policy": if q.auto_apply { "auto" } else { "confirm" },
+                        "finished": q.finished.load(Ordering::SeqCst),
+                    }),
+                )
+            }
+            None => Response::ok(
+                req.id,
+                serde_json::json!({ "active": null, "total": 0, "finished": true }),
+            ),
+        }
+    }
+
     fn parse_task(&self, req: &Request) -> Result<TaskId, Response> {
         self.parse_task_id(req)
     }
