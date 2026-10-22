@@ -276,6 +276,7 @@ fn cli_isolated_run_and_apply() {
 // ---------- app-server 流 ----------
 
 struct ServeProc {
+    #[allow(dead_code)]
     child: Child,
     stdin: BufWriter,
     lines_rx: std::sync::mpsc::Receiver<String>,
