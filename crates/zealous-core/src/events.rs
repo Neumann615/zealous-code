@@ -209,6 +209,24 @@ pub enum EventPayload {
         scope: String,
         message: String,
     },
+    /// spec 155:isolated 运行的工作区准备(opt-in;kind = "git-worktree")
+    ExecutionWorkspacePrepared {
+        kind: String,
+        branch: String,
+        path: String,
+        base_branch: String,
+        base_commit: String,
+    },
+    /// spec 155:任务分支已 ff-only 应用回主工作区
+    ExecutionWorkspaceApplied {
+        branch: String,
+        applied_commit: String,
+    },
+    /// spec 155:任务 worktree 与分支已清理
+    ExecutionWorkspaceRemoved {
+        branch: String,
+        path: String,
+    },
 }
 
 /// 统一事件信封(spec 20):`seq` 由写入器分配并保证 task 内连续;`agent` 记事件主体。

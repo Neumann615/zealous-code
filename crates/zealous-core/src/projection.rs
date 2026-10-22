@@ -48,6 +48,19 @@ pub struct PendingApproval {
     pub summary: String,
 }
 
+/// spec 155:isolated 运行的工作区视图(只来自事件投影)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExecutionWorkspaceView {
+    pub kind: String,
+    pub branch: String,
+    pub path: String,
+    pub base_branch: String,
+    pub base_commit: String,
+    pub current_commit: String,
+    /// ready / applied / removed
+    pub status: String,
+}
+
 /// Task 的完整投影:所有 UI/恢复判定只读这里,不读原始事件。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TaskProjection {
@@ -65,6 +78,12 @@ pub struct TaskProjection {
     pub last_error: Option<(String, String)>,
     pub interrupted_count: u64,
     pub last_event_seq: u64,
+    /// spec 155:isolated 运行的工作区状态
+    pub execution_workspace: Option<ExecutionWorkspaceView>,
+    /// spec 155:已应用回主工作区的 commit
+    pub applied_commit: Option<String>,
+    /// spec 155:workspace 是否已清理
+    pub workspace_removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +129,9 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
         last_error: None,
         interrupted_count: 0,
         last_event_seq: 0,
+        execution_workspace: None,
+        applied_commit: None,
+        workspace_removed: false,
     };
 
     let mut seen_runs: HashSet<String> = HashSet::new();
@@ -332,6 +354,61 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
             EventPayload::ErrorOccurred { scope, message } => {
                 proj.last_error = Some((scope.clone(), message.clone()));
             }
+            EventPayload::ExecutionWorkspacePrepared {
+                kind,
+                branch,
+                path,
+                base_branch,
+                base_commit,
+            } => {
+                if proj.execution_workspace.is_some() {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "workspace 重复准备".into(),
+                    });
+                }
+                proj.execution_workspace = Some(ExecutionWorkspaceView {
+                    kind: kind.clone(),
+                    branch: branch.clone(),
+                    path: path.clone(),
+                    base_branch: base_branch.clone(),
+                    base_commit: base_commit.clone(),
+                    current_commit: base_commit.clone(),
+                    status: "ready".into(),
+                });
+            }
+            EventPayload::ExecutionWorkspaceApplied {
+                branch,
+                applied_commit,
+            } => {
+                match &mut proj.execution_workspace {
+                    Some(ws) if ws.branch == *branch => {
+                        ws.current_commit = applied_commit.clone();
+                        ws.status = "applied".into();
+                        proj.applied_commit = Some(applied_commit.clone());
+                    }
+                    _ => {
+                        return Err(FoldError::OrphanReference {
+                            seq: event.seq,
+                            detail: "apply 引用未准备的 workspace 或分支不匹配".into(),
+                        })
+                    }
+                }
+            }
+            EventPayload::ExecutionWorkspaceRemoved { branch, .. } => {
+                match &mut proj.execution_workspace {
+                    Some(ws) if ws.branch == *branch => {
+                        ws.status = "removed".into();
+                        proj.workspace_removed = true;
+                    }
+                    _ => {
+                        return Err(FoldError::OrphanReference {
+                            seq: event.seq,
+                            detail: "remove 引用未准备的 workspace 或分支不匹配".into(),
+                        })
+                    }
+                }
+            }
         }
     }
 
@@ -355,6 +432,115 @@ fn active_run(proj: &TaskProjection, run_id: &AgentRunId, seq: u64) -> Result<us
         });
     }
     Ok(idx)
+}
+
+#[cfg(test)]
+mod spec155_tests {
+    use super::*;
+    use crate::events::EventPayload;
+    use crate::ids::TaskId;
+
+    fn ev(tid: &TaskId, seq: u64, payload: EventPayload) -> TaskEvent {
+        TaskEvent::new(
+            seq,
+            "2026-10-22T00:00:00.000Z".into(),
+            tid.clone(),
+            AgentRef::Coordinator,
+            payload,
+        )
+    }
+
+    #[test]
+    fn workspace_lifecycle_fold() {
+        let tid = TaskId::generate();
+        let mut events = vec![ev(
+            &tid,
+            1,
+            EventPayload::TaskCreated {
+                title: "t".into(),
+                repo_root: "r".into(),
+            },
+        )];
+        events.push(ev(
+            &tid,
+            2,
+            EventPayload::ExecutionWorkspacePrepared {
+                kind: "git-worktree".into(),
+                branch: "zealous/t1".into(),
+                path: "r/.zealous/worktrees/t1".into(),
+                base_branch: "main".into(),
+                base_commit: "abc".into(),
+            },
+        ));
+        let proj = fold(&tid, &events).unwrap();
+        let ws = proj.execution_workspace.as_ref().unwrap();
+        assert_eq!(ws.status, "ready");
+        assert_eq!(ws.current_commit, "abc");
+        assert_eq!(proj.applied_commit, None);
+        assert!(!proj.workspace_removed);
+
+        events.push(ev(
+            &tid,
+            3,
+            EventPayload::ExecutionWorkspaceApplied {
+                branch: "zealous/t1".into(),
+                applied_commit: "def".into(),
+            },
+        ));
+        let proj = fold(&tid, &events).unwrap();
+        assert_eq!(proj.applied_commit.as_deref(), Some("def"));
+        assert_eq!(proj.execution_workspace.as_ref().unwrap().status, "applied");
+
+        events.push(ev(
+            &tid,
+            4,
+            EventPayload::ExecutionWorkspaceRemoved {
+                branch: "zealous/t1".into(),
+                path: "r/.zealous/worktrees/t1".into(),
+            },
+        ));
+        let proj = fold(&tid, &events).unwrap();
+        assert!(proj.workspace_removed);
+        assert_eq!(proj.execution_workspace.as_ref().unwrap().status, "removed");
+    }
+
+    #[test]
+    fn workspace_apply_branch_mismatch_is_orphan() {
+        let tid = TaskId::generate();
+        let events = vec![
+            ev(
+                &tid,
+                1,
+                EventPayload::TaskCreated {
+                    title: "t".into(),
+                    repo_root: "r".into(),
+                },
+            ),
+            ev(
+                &tid,
+                2,
+                EventPayload::ExecutionWorkspacePrepared {
+                    kind: "git-worktree".into(),
+                    branch: "zealous/t1".into(),
+                    path: "p".into(),
+                    base_branch: "main".into(),
+                    base_commit: "abc".into(),
+                },
+            ),
+            ev(
+                &tid,
+                3,
+                EventPayload::ExecutionWorkspaceApplied {
+                    branch: "zealous/other".into(),
+                    applied_commit: "def".into(),
+                },
+            ),
+        ];
+        assert!(matches!(
+            fold(&tid, &events),
+            Err(FoldError::OrphanReference { .. })
+        ));
+    }
 }
 
 /// 便捷:直接从 AgentRef 构造事件(写入器用)。
