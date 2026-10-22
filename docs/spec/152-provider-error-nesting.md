@@ -50,3 +50,11 @@ Provider 错误经多层包装后重复携带同类信息,可读性差:
 
 独立实施 + 完整质量门 + 重新打包(运行时代码变化会使当前 offline RC
 失效,按 spec 150 三段溯源重新生成)。
+
+## 实施记录(2026-10-22)
+
+已按本方案实施(commit 3141499):新增 `Transient` 变体、
+classify_ureq 归一化(移除 `Network Error` 重复段)、错误单点格式化。
+回归:provider 单测 3 项新增全绿;Dogfooding A2 四子场景复跑通过,
+账本错误文本单层(exhausted ×1 / Network Error ×0),详见
+docs/acceptance/dogfooding-152-153.md。

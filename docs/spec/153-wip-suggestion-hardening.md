@@ -42,3 +42,11 @@
 
 独立实施 + 完整质量门 + Dogfooding 受影响场景重跑;运行时代码变化
 会使当前 offline RC 失效,按 spec 150 重新生成候选包。
+
+## 实施记录(2026-10-22)
+
+已按本方案实施(commit 4495459):守卫文案中性化(含
+WRITE_GUARD_REJECT_MARKER 常量)、executor shell 审批账本警示。
+回归:守卫文案断言更新全绿;Dogfooding A1 ×3 + B3 复跑,警示 3/3
+出现、unsafe 建议 0、B3 绕过尝试归零,详见
+docs/acceptance/dogfooding-152-153.md。
