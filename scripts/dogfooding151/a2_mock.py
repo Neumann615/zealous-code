@@ -53,6 +53,21 @@ class Handler(BaseHTTPRequestHandler):
             respond(self, 500, json.dumps({"error": {"message": "internal boom"}}))
         elif MODE == "badjson":
             respond(self, 200, "this is definitely not json {{{")
+        elif MODE == "ok3_then_500":
+            # spec 156 DF2:前 3 个请求成功(任务 1),之后 500(任务 2 Failed)
+            if n <= 3:
+                actions = [
+                    {"action": "plan", "plan": "edit note", "workers": []},
+                    {"action": "tool", "tool": "edit_file",
+                     "args": {"path": "note.txt", "old_text": "OLD-VALUE", "new_text": "NEW-VALUE"}},
+                    {"action": "message", "text": "done"},
+                ]
+                i = n - 1
+                action = actions[i] if i < len(actions) else {"action": "message", "text": "done"}
+                body = json.dumps({"choices": [{"message": {"content": json.dumps(action, ensure_ascii=False)}}]})
+                respond(self, 200, body)
+            else:
+                respond(self, 500, json.dumps({"error": {"message": "boom after task1"}}))
         elif MODE == "hang":
             import time
             time.sleep(600)
