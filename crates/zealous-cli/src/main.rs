@@ -78,9 +78,31 @@ enum TaskCmd {
         /// 只保留审批请求、错误与最终结果(spec 80 §5)
         #[arg(long)]
         quiet: bool,
+        /// 在任务专属 worktree 中执行(spec 155,opt-in)
+        #[arg(long)]
+        isolate: bool,
     },
     /// 查看任务事件账本(可审计)
     Events { task_id: String },
+    /// 将已完成 isolated 任务 fast-forward 应用回主工作区(spec 155)
+    Apply {
+        task_id: String,
+        /// 跳过确认(仅限你已确认变更内容)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 查看 isolated 任务 workspace 状态(spec 155)
+    Workspace { task_id: String },
+    /// 清理 isolated 任务 worktree 与分支(spec 155)
+    WorkspaceRemove {
+        task_id: String,
+        /// worktree 有用户未提交改动时强制删除
+        #[arg(long)]
+        force: bool,
+        /// 跳过确认
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// stdin 交互审批:完整展示将执行的动作,y/回车=批准,其余=拒绝
@@ -238,8 +260,16 @@ fn main() {
                 yes,
                 no,
                 quiet,
-            } => cmd_run(&task_id, yes, no, quiet),
+                isolate,
+            } => cmd_run(&task_id, yes, no, quiet, isolate),
             TaskCmd::Events { task_id } => cmd_events(&task_id),
+            TaskCmd::Apply { task_id, yes } => cmd_apply(&task_id, yes),
+            TaskCmd::Workspace { task_id } => cmd_workspace(&task_id),
+            TaskCmd::WorkspaceRemove {
+                task_id,
+                force,
+                yes,
+            } => cmd_workspace_remove(&task_id, force, yes),
         },
         Cmd::Config {
             cmd: ConfigCmd::Check,
@@ -387,7 +417,7 @@ impl zealous_engine::progress::ProgressSink for CliProgress {
     }
 }
 
-fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool) -> i32 {
+fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool, isolate: bool) -> i32 {
     let svc = match svc() {
         Ok(s) => s,
         Err(e) => return err(e),
@@ -403,6 +433,25 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool) -> i32 {
     let ledger = Arc::new(ledger);
     if proj.pending_approvals.is_empty() && matches!(proj.status, TaskStatus::Running) {
         println!("任务已在运行中(可能有挂起审批未处理;如异常请查看 events)");
+    }
+    // spec 155:运行根解析(模式规则落账;isolated 校验/重建在此完成)
+    let run_root = match zealous_engine::workspace::ensure_run_root(
+        repo_root().unwrap_or_default().as_path(),
+        &ledger,
+        &tid,
+        isolate,
+    ) {
+        Ok(r) => r,
+        Err(e) => return err(format!("workspace: {e}")),
+    };
+    if run_root != repo_root().unwrap_or_default() {
+        let ws = proj.execution_workspace.as_ref();
+        if let Some(ws) = ws {
+            println!(
+                "[isolated] worktree: {}\n[isolated] branch: {} (base {} @ {})",
+                ws.path, ws.branch, ws.base_branch, ws.base_commit
+            );
+        }
     }
 
     let config = match ProviderConfig::resolve() {
@@ -436,7 +485,7 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool) -> i32 {
     }
     let sink: Arc<dyn ApprovalSink> = Arc::new(StdinApproval::new(auto, abort.clone()));
     let executor = Arc::new(ToolExecutor::new(
-        repo_root().unwrap(),
+        run_root.clone(),
         builtin_registry(),
         sink,
     ));
@@ -448,7 +497,13 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool) -> i32 {
         model,
         progress: Some(Arc::new(CliProgress { quiet })),
     };
-    let title = proj.title.clone();
+    let mut title = proj.title.clone();
+    if run_root != repo_root().unwrap_or_default() {
+        // spec 155:isolated 运行必须向模型声明执行环境边界
+        title = format!(
+            "[isolated workspace] 本次运行在任务专属 git worktree 中执行;\n主工作区的未提交改动在此不可见,不得尝试访问或修改主工作区。\n\n{title}"
+        );
+    }
     match orch.run_task(&ledger, &title) {
         Ok(status) => {
             println!("task finished: {status:?}");
@@ -485,6 +540,194 @@ fn cmd_events(task_id: &str) -> i32 {
             0
         }
         Err(e) => err(e.to_string()),
+    }
+}
+
+fn git_out(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into())
+}
+
+fn cmd_apply(task_id: &str, yes: bool) -> i32 {
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let (ledger, proj, _) = match svc.open_task(&tid) {
+        Ok(x) => x,
+        Err(e) => return err(e.to_string()),
+    };
+    let ledger = std::sync::Arc::new(ledger);
+    let ws = match &proj.execution_workspace {
+        Some(w) => w.clone(),
+        None => return err("任务不是 isolated 模式"),
+    };
+    if let Some(applied) = &proj.applied_commit {
+        println!("已应用过(幂等): {applied}");
+        return 0;
+    }
+    if proj.status != TaskStatus::Completed {
+        return err("任务尚未 Completed,不能 apply");
+    }
+    // 预览(spec 155:base / tip / commits / 变更文件)
+    let tip = match git_out(&repo, &["rev-parse", &format!("refs/heads/{}", ws.branch)]) {
+        Ok(t) => t.trim().to_string(),
+        Err(e) => return err(e),
+    };
+    println!("base:   {} @ {}", ws.base_branch, ws.base_commit);
+    println!("branch: {} @ {}", ws.branch, tip);
+    println!("将进入主分支的 commits:");
+    match git_out(
+        &repo,
+        &[
+            "log",
+            "--oneline",
+            &format!("{}..{}", ws.base_commit, ws.branch),
+        ],
+    ) {
+        Ok(l) => print!("{}", l),
+        Err(e) => return err(e),
+    }
+    println!("变更文件:");
+    match git_out(
+        &repo,
+        &[
+            "diff",
+            "--name-status",
+            &format!("{}..{}", ws.base_commit, ws.branch),
+        ],
+    ) {
+        Ok(l) => print!("{}", l),
+        Err(e) => return err(e),
+    }
+    if !yes {
+        print!("确认应用? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return err("读取确认失败");
+        }
+        let t = line.trim().to_ascii_lowercase();
+        if t != "y" && t != "yes" {
+            println!("已取消");
+            return 0;
+        }
+    }
+    match zealous_engine::workspace::apply(&repo, &ledger) {
+        Ok(out) => {
+            println!(
+                "applied: {} @ {}{}",
+                out.branch,
+                out.applied_commit,
+                if out.already { " (already)" } else { "" }
+            );
+            0
+        }
+        Err(e) => err(format!("apply: {e}")),
+    }
+}
+
+fn cmd_workspace(task_id: &str) -> i32 {
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let (_ledger, proj, _) = match svc.open_task(&tid) {
+        Ok(x) => x,
+        Err(e) => return err(e.to_string()),
+    };
+    let ws = match &proj.execution_workspace {
+        Some(w) => w,
+        None => return err("任务不是 isolated 模式"),
+    };
+    println!("mode:           isolated ({})", ws.kind);
+    println!("path:           {}", ws.path);
+    println!("branch:         {}", ws.branch);
+    println!("base_branch:    {}", ws.base_branch);
+    println!("base_commit:    {}", ws.base_commit);
+    println!("current_commit: {}", ws.current_commit);
+    println!("status:         {}", ws.status);
+    if let Some(applied) = &proj.applied_commit {
+        println!("applied_commit: {applied}");
+    }
+    println!("workspace_removed: {}", proj.workspace_removed);
+    // 活分支 tip(来自 git 事实,仅展示)
+    if let Ok(tip) = git_out(&repo, &["rev-parse", &format!("refs/heads/{}", ws.branch)]) {
+        println!("branch_tip:     {}", tip.trim());
+    }
+    0
+}
+
+fn cmd_workspace_remove(task_id: &str, force: bool, yes: bool) -> i32 {
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let (ledger, proj, _) = match svc.open_task(&tid) {
+        Ok(x) => x,
+        Err(e) => return err(e.to_string()),
+    };
+    let ledger = std::sync::Arc::new(ledger);
+    let ws = match &proj.execution_workspace {
+        Some(w) => w.clone(),
+        None => return err("任务不是 isolated 模式"),
+    };
+    if !yes {
+        println!("将删除 worktree {} 与分支 {}。", ws.path, ws.branch);
+        if force {
+            println!("警告:--force 将丢弃 worktree 中的未提交改动!");
+        }
+        print!("确认删除? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return err("读取确认失败");
+        }
+        let t = line.trim().to_ascii_lowercase();
+        if t != "y" && t != "yes" {
+            println!("已取消");
+            return 0;
+        }
+    }
+    match zealous_engine::workspace::remove(&repo, &ledger, force) {
+        Ok(info) => {
+            println!("removed: {} ({})", info.branch, info.path.display());
+            0
+        }
+        Err(e) => err(format!("workspace-remove: {e}")),
     }
 }
 
