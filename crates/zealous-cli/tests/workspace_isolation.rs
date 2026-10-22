@@ -1,0 +1,459 @@
+//! Worktree 隔离集成测试(spec 155):
+//! CLI:task new → run --isolate(mock)→ workspace → apply(ff-only)。
+//! serve:run_task isolate:true → decide → get_workspace → apply_task。
+//!
+//! 断言:主工作区文件在运行期间不变、rollback commit 落在任务分支、
+//! 账本在主仓库 .zealous/tasks、apply 后主工作区 fast-forward、
+//! 事件 seq 连续、apply 事件落账、无密钥泄漏。
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+fn unique_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "zealous-ws155-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn chat_body(content: &str) -> String {
+    serde_json::json!({
+        "choices": [{ "message": { "content": content } }]
+    })
+    .to_string()
+}
+
+fn mock_endpoint(script: Vec<String>) -> String {
+    let counter = AtomicU32::new(0);
+    let script = Mutex::new(script);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let len = text
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let idx = counter.fetch_add(1, Ordering::Relaxed) as usize;
+        let content = {
+            let script = script.lock().unwrap();
+            if idx < script.len() {
+                script[idx].clone()
+            } else {
+                "guard".into()
+            }
+        };
+        let body = chat_body(&content);
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    format!("http://{addr}/v1")
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into()
+}
+
+fn base_repo(tag: &str) -> std::path::PathBuf {
+    let dir = unique_dir(tag);
+    std::fs::write(dir.join(".gitignore"), ".zealous/\n").unwrap();
+    std::fs::write(dir.join("note.txt"), "OLD-VALUE\n").unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+    dir
+}
+
+fn find_ledger(repo: &std::path::Path) -> Option<std::path::PathBuf> {
+    let tasks = repo.join(".zealous").join("tasks");
+    if let Ok(entries) = std::fs::read_dir(&tasks) {
+        for e in entries.flatten() {
+            let p = e.path().join("events.jsonl");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn ledger_text(repo: &std::path::Path) -> String {
+    let p = find_ledger(repo).expect("ledger");
+    std::fs::read_to_string(&p).unwrap()
+}
+
+fn run_task(repo: &std::path::Path, task_id: &str, endpoint: &str, isolate: bool) -> String {
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let mut args = vec!["task", "run", task_id];
+    if isolate {
+        args.push("--isolate");
+    }
+    args.push("--yes");
+    let out = Command::new(zealous)
+        .args(&args)
+        .current_dir(repo)
+        .env("ZEALOUS_BASE_URL", endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .expect("spawn task run");
+    assert!(
+        out.status.success(),
+        "task run failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    String::from_utf8_lossy(&out.stdout).into()
+}
+
+#[test]
+fn cli_isolated_run_and_apply() {
+    let repo = base_repo("cli");
+    let script = vec![
+        r#"{"action":"plan","plan":"edit note.txt in worktree","workers":[]}"#.into(),
+        r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}}"#.into(),
+        r#"{"action":"message","text":"done"}"#.into(),
+    ];
+    let endpoint = mock_endpoint(script);
+
+    // task new
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let out = Command::new(zealous)
+        .args(["task", "new", "ws cli task"])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let task_id = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("task created: "))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // run --isolate --yes(mock)
+    let run_out = run_task(&repo, &task_id, &endpoint, true);
+    assert!(run_out.contains("Completed"), "{run_out}");
+
+    // 主工作区 note.txt 不变(修改在 worktree 中)
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "OLD-VALUE"
+    );
+    // 任务分支有 rollback commit;主分支没有
+    let branch_log = git(&repo, &["log", "--oneline", &format!("zealous/{task_id}")]);
+    assert!(
+        branch_log.contains("zealous: edit note.txt"),
+        "{branch_log}"
+    );
+    let main_log = git(&repo, &["log", "--oneline", "main"]);
+    assert!(!main_log.contains("zealous: edit note.txt"));
+    // 账本在主仓库 .zealous/tasks
+    assert!(find_ledger(&repo).is_some());
+    let text = ledger_text(&repo);
+    for needle in ["e2e-secret-key", "Authorization", "Bearer "] {
+        assert!(!text.contains(needle), "账本泄漏: {needle}");
+    }
+
+    // task workspace:字段来自投影
+    let out = Command::new(zealous)
+        .args(["task", "workspace", &task_id])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let ws_text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(ws_text.contains("mode:           isolated"), "{ws_text}");
+    assert!(ws_text.contains(&format!("zealous/{task_id}")), "{ws_text}");
+
+    // apply --yes:主工作区 fast-forward
+    let out = Command::new(zealous)
+        .args(["task", "apply", &task_id, "--yes"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "NEW-VALUE"
+    );
+    let main_log = git(&repo, &["log", "--oneline", "main"]);
+    assert!(main_log.contains("zealous: edit note.txt"));
+
+    // 事件 seq 连续 + apply 事件落账
+    let text = ledger_text(&repo);
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(ev["seq"].as_u64().unwrap(), (i + 1) as u64, "seq 跳号");
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "ExecutionWorkspacePrepared"),
+        "缺少 Prepared 事件"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "ExecutionWorkspaceApplied"),
+        "缺少 Applied 事件"
+    );
+
+    // 重复 apply 幂等
+    let out = Command::new(zealous)
+        .args(["task", "apply", &task_id, "--yes"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "重复 apply 应幂等成功");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("已应用过"));
+}
+
+// ---------- app-server 流 ----------
+
+struct ServeProc {
+    child: Child,
+    stdin: BufWriter,
+    lines_rx: std::sync::mpsc::Receiver<String>,
+}
+
+type BufWriter = std::io::BufWriter<std::process::ChildStdin>;
+
+fn spawn_serve(repo: &std::path::Path, endpoint: &str) -> ServeProc {
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let mut child = Command::new(zealous)
+        .args(["serve"])
+        .current_dir(repo)
+        .env("ZEALOUS_BASE_URL", endpoint)
+        .env("ZEALOUS_API_KEY", "serve-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    let stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    ServeProc {
+        child,
+        stdin: std::io::BufWriter::new(stdin),
+        lines_rx: rx,
+    }
+}
+
+impl ServeProc {
+    fn send(&mut self, v: &serde_json::Value) {
+        serde_json::to_writer(&mut self.stdin, v).unwrap();
+        self.stdin.write_all(b"\n").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn wait_response(
+        &mut self,
+        id: u64,
+        deadline: Instant,
+        collect: &mut Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        loop {
+            assert!(Instant::now() < deadline, "等待响应 id={id} 超时");
+            let line = self
+                .lines_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("响应超时");
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
+                return v;
+            }
+            collect.push(v);
+        }
+    }
+}
+
+#[test]
+fn serve_isolated_run_get_workspace_apply() {
+    let repo = base_repo("serve");
+    let script = vec![
+        r#"{"action":"plan","plan":"edit note.txt","workers":[]}"#.into(),
+        r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}}"#.into(),
+        r#"{"action":"message","text":"done"}"#.into(),
+    ];
+    let endpoint = mock_endpoint(script);
+    let mut proc = spawn_serve(&repo, &endpoint);
+    let mut notes: Vec<serde_json::Value> = Vec::new();
+    let mut id = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(60);
+
+    id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "initialize", "params": {"version": 1}}));
+    let r = proc.wait_response(id, deadline, &mut notes);
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["result"]["capabilities"]["isolated_worktree"], true);
+
+    id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "create_task", "params": {"title": "ws serve", "brief": "edit note.txt"}}));
+    let r = proc.wait_response(id, deadline, &mut notes);
+    let task_id = r["result"]["task_id"].as_str().unwrap().to_string();
+
+    id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "run_task", "params": {"task_id": task_id, "isolate": true}}));
+    let r = proc.wait_response(id, deadline, &mut notes);
+    assert_eq!(r["ok"], true);
+
+    // 等审批 → 批准 → Completed
+    let mut saw_approval = false;
+    loop {
+        assert!(Instant::now() < deadline, "等待 run_finished 超时");
+        let line = proc
+            .lines_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("通知流超时");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if v["event"] == "approval_requested" {
+            saw_approval = true;
+            let call = v["params"]["call_id"].as_str().unwrap().to_string();
+            id += 1;
+            proc.send(&serde_json::json!({"id": id, "cmd": "decide_approval", "params": {"task_id": task_id, "call_id": call, "decision": "approve"}}));
+        }
+        if v["event"] == "run_finished" {
+            assert_eq!(v["params"]["status"], "Completed");
+            break;
+        }
+    }
+    assert!(saw_approval, "缺少审批请求");
+
+    // get_workspace
+    id += 1;
+    proc.send(
+        &serde_json::json!({"id": id, "cmd": "get_workspace", "params": {"task_id": task_id}}),
+    );
+    let r = proc.wait_response(id, deadline, &mut notes);
+    assert_eq!(r["result"]["mode"], "isolated");
+    assert_eq!(r["result"]["status"], "ready");
+
+    // apply_task
+    id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "apply_task", "params": {"task_id": task_id}}));
+    let r = proc.wait_response(id, deadline, &mut notes);
+    assert_eq!(r["ok"], true, "{}", r);
+
+    // get_task Completed + 主工作区 fast-forward
+    id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "get_task", "params": {"task_id": task_id}}));
+    let r = proc.wait_response(id, deadline, &mut notes);
+    assert_eq!(r["result"]["status"], "Completed");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "NEW-VALUE"
+    );
+
+    // 事件连续 + 无泄漏
+    let mut ledger = None;
+    let tasks = repo.join(".zealous").join("tasks");
+    for e in std::fs::read_dir(&tasks).unwrap().flatten() {
+        let p = e.path().join("events.jsonl");
+        if p.exists() {
+            ledger = Some(std::fs::read_to_string(p).unwrap());
+        }
+    }
+    let text = ledger.unwrap();
+    for needle in ["serve-secret-key", "Authorization", "Bearer "] {
+        assert!(!text.contains(needle), "账本泄漏: {needle}");
+    }
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(ev["seq"].as_u64().unwrap(), (i + 1) as u64, "seq 跳号");
+    }
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "ExecutionWorkspaceApplied"));
+
+    // shutdown
+    id += 1;
+    proc.send(&serde_json::json!({"id": id, "cmd": "shutdown", "params": {}}));
+    let r = proc.wait_response(id, deadline, &mut notes);
+    assert_eq!(r["ok"], true);
+}
