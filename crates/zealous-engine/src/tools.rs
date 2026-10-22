@@ -172,27 +172,79 @@ impl Tool for ReadFile {
         RiskTier::T0
     }
     fn args_template(&self) -> &'static str {
-        "{\"path\": \"relative/path\"}"
+        "{\"path\": \"relative/path\", \"offset\": 101, \"limit\": 120}"
     }
     fn description(&self) -> &'static str {
-        "读取仓库内文本文件(<=512KB),返回文件全文"
+        "读取仓库内文本文件:默认全文(<=512KB);给 offset/limit 则分片返回带行号(1-based,limit<=500,单次<=4MB)"
     }
     fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 200)
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let path = resolve_in_repo(&ctx.repo_root, &arg_str(raw_args, "path")?)?;
-        const MAX: u64 = 512 * 1024;
-        let meta = std::fs::metadata(&path).map_err(|e| ToolError::Failed(format!("stat: {e}")))?;
-        if meta.len() > MAX {
-            return Err(ToolError::Failed(format!(
-                "file too large: {} bytes (max {MAX})",
-                meta.len()
-            )));
+        let rel = rel_to_repo(&ctx.repo_root, &path);
+        let offset = opt_u64(raw_args, "offset")?;
+        let limit = opt_u64(raw_args, "limit")?;
+        if offset.is_none() && limit.is_none() {
+            // 默认:全文,行为与 spec 154 之前完全一致
+            const MAX: u64 = 512 * 1024;
+            let meta =
+                std::fs::metadata(&path).map_err(|e| ToolError::Failed(format!("stat: {e}")))?;
+            if meta.len() > MAX {
+                return Err(ToolError::Failed(format!(
+                    "file too large: {} bytes (max {MAX})",
+                    meta.len()
+                )));
+            }
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| ToolError::Failed(format!("read: {e}")))?;
+            return Ok(ToolOutput { summary: text });
         }
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| ToolError::Failed(format!("read: {e}")))?;
-        Ok(ToolOutput { summary: text })
+        // 分片模式(spec 154)
+        let offset = match offset {
+            Some(0) => return Err(ToolError::BadArgs("offset must be >= 1 (1-based)".into())),
+            Some(v) => v,
+            None => 1,
+        };
+        let limit = match limit {
+            Some(0) => return Err(ToolError::BadArgs("limit must be >= 1".into())),
+            Some(v) if v > 500 => return Err(ToolError::BadArgs("limit must be <= 500".into())),
+            Some(v) => v,
+            None => 500,
+        };
+        const SLICE_CAP: u64 = 4 * 1024 * 1024;
+        let file =
+            std::fs::File::open(&path).map_err(|e| ToolError::Failed(format!("open: {e}")))?;
+        let mut buf = Vec::new();
+        use std::io::Read as _;
+        file.take(SLICE_CAP + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| ToolError::Failed(format!("read: {e}")))?;
+        if buf.len() as u64 > SLICE_CAP {
+            return Err(ToolError::Failed("sliced read exceeds 4 MiB cap".into()));
+        }
+        let text = String::from_utf8(buf)
+            .map_err(|_| ToolError::Failed("file is not valid UTF-8".into()))?;
+        let total = text.lines().count();
+        if offset as usize > total {
+            return Ok(ToolOutput {
+                summary: format!(
+                    "path: {rel}\n(empty range: offset {offset} beyond end of file, total {total} lines)"
+                ),
+            });
+        }
+        let start = offset as usize;
+        let end = (start + limit as usize - 1).min(total);
+        let mut out = format!("path: {rel}\nlines: {start}-{end} / {total}\n");
+        for (i, line) in text
+            .lines()
+            .enumerate()
+            .skip(start - 1)
+            .take(end - start + 1)
+        {
+            out.push_str(&format!("  {} {}\n", i + 1, line));
+        }
+        Ok(ToolOutput { summary: out })
     }
 }
 
@@ -243,7 +295,9 @@ struct SearchText;
 
 const SEARCH_SKIP_DIRS: &[&str] = &[".git", ".zealous", "target", "node_modules", "dist"];
 const SEARCH_MAX_FILE: u64 = 1024 * 1024;
-const SEARCH_MAX_HITS: usize = 100;
+const SEARCH_DEFAULT_MAX: u64 = 100;
+const SEARCH_MAX_RESULTS_CAP: u64 = 200;
+const SEARCH_PER_FILE_HITS: usize = 20;
 
 impl Tool for SearchText {
     fn name(&self) -> &'static str {
@@ -253,20 +307,42 @@ impl Tool for SearchText {
         RiskTier::T0
     }
     fn args_template(&self) -> &'static str {
-        "{\"query\": \"substring\"}"
+        "{\"query\": \"substring\", \"regex\": false, \"path\": \"optional/dir\", \"max_results\": 100}"
     }
     fn description(&self) -> &'static str {
-        "在仓库文本文件中做子串搜索(跳过 .git/target 等),返回 file:line: 片段"
+        "搜索仓库文本文件(默认字面量;regex=true 用正则;path 限定文件/目录;跳过 .git/target 等),返回 file:line: 片段"
     }
     fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
         truncate_for_display(raw_args, 200)
     }
     fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let needle = arg_str(raw_args, "query")?;
-        let root = resolve_in_repo(&ctx.repo_root, ".")?;
+        if needle.is_empty() {
+            return Err(ToolError::BadArgs("query must not be empty".into()));
+        }
+        let use_regex = opt_bool(raw_args, "regex")?.unwrap_or(false);
+        let max_results = opt_u64(raw_args, "max_results")?
+            .unwrap_or(SEARCH_DEFAULT_MAX)
+            .clamp(1, SEARCH_MAX_RESULTS_CAP) as usize;
+        // 作用域(spec 154):仓库内相对路径,文件或目录;越界直接拒绝
+        let scope: PathBuf = match opt_str(raw_args, "path")? {
+            Some(p) => resolve_in_repo(&ctx.repo_root, &p)?,
+            None => ctx.repo_root.clone(),
+        };
+        let re = if use_regex {
+            if needle.chars().count() > 1024 {
+                return Err(ToolError::BadArgs("regex too long (max 1024 chars)".into()));
+            }
+            Some(
+                regex::Regex::new(&needle)
+                    .map_err(|e| ToolError::BadArgs(format!("invalid regex: {e}")))?,
+            )
+        } else {
+            None
+        };
         let mut hits: Vec<String> = Vec::new();
-        walk(&root, &mut |file: &Path| {
-            if hits.len() >= SEARCH_MAX_HITS {
+        let scan = |file: &Path, hits: &mut Vec<String>| {
+            if hits.len() >= max_results {
                 return;
             }
             let Ok(meta) = std::fs::metadata(file) else {
@@ -278,20 +354,36 @@ impl Tool for SearchText {
             let Ok(text) = std::fs::read_to_string(file) else {
                 return;
             };
+            let mut per_file = 0usize;
             for (i, line) in text.lines().enumerate() {
-                if line.contains(&needle) {
+                let matched = match &re {
+                    Some(re) => re.is_match(line),
+                    None => line.contains(&needle),
+                };
+                if matched {
+                    let rel = file
+                        .strip_prefix(&ctx.repo_root)
+                        .unwrap_or(file)
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     hits.push(format!(
                         "{}:{}: {}",
-                        file.strip_prefix(&root).unwrap_or(file).display(),
+                        rel,
                         i + 1,
                         truncate_for_display(line.trim(), 120)
                     ));
-                    if hits.len() >= SEARCH_MAX_HITS {
+                    per_file += 1;
+                    if per_file >= SEARCH_PER_FILE_HITS || hits.len() >= max_results {
                         return;
                     }
                 }
             }
-        });
+        };
+        if scope.is_file() {
+            scan(&scope, &mut hits);
+        } else {
+            walk(&scope, &mut |file: &Path| scan(file, &mut hits));
+        }
         Ok(ToolOutput {
             summary: if hits.is_empty() {
                 "(no matches)".into()
@@ -769,6 +861,101 @@ fn assert_clean_worktree(repo_root: &Path) -> Result<(), ToolError> {
     Err(ToolError::Failed(msg))
 }
 
+// ---------- T0:git_show(spec 154) ----------
+
+struct GitShow;
+
+impl Tool for GitShow {
+    fn name(&self) -> &'static str {
+        "git_show"
+    }
+    fn risk(&self) -> RiskTier {
+        RiskTier::T0
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"object\": \"HEAD:README.md\"}"
+    }
+    fn description(&self) -> &'static str {
+        "查看 git 对象(commit diff / 历史文件内容 / HEAD:path),只读,输出上限 64KB"
+    }
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
+        truncate_for_display(raw_args, 200)
+    }
+    fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let object = arg_str(raw_args, "object")?;
+        let object = object.trim();
+        // 防选项注入:git show --output=… 可写文件,一律拒绝以 "-" 开头的 object
+        if object.is_empty() || object.starts_with('-') {
+            return Err(ToolError::BadArgs(
+                "invalid git object (must not start with '-')".into(),
+            ));
+        }
+        let out = std::process::Command::new("git")
+            .args(["show", object])
+            .current_dir(&ctx.repo_root)
+            .output()
+            .map_err(|e| ToolError::Failed(format!("spawn git: {e}")))?;
+        if !out.status.success() {
+            return Err(ToolError::Failed(
+                String::from_utf8_lossy(&out.stderr).into(),
+            ));
+        }
+        Ok(ToolOutput {
+            summary: cap_output(String::from_utf8_lossy(&out.stdout).into()),
+        })
+    }
+}
+
+// ---------- T0:git_branch(spec 154) ----------
+
+struct GitBranch;
+
+impl Tool for GitBranch {
+    fn name(&self) -> &'static str {
+        "git_branch"
+    }
+    fn risk(&self) -> RiskTier {
+        RiskTier::T0
+    }
+    fn args_template(&self) -> &'static str {
+        "{\"all\": true, \"limit\": 100}"
+    }
+    fn description(&self) -> &'static str {
+        "列出分支与最后提交说明(默认本地;all=true 含 remote;只读,不创建/删除/切换分支)"
+    }
+    fn summarize(&self, raw_args: &str, _ctx: &ToolContext) -> String {
+        truncate_for_display(raw_args, 200)
+    }
+    fn execute(&self, raw_args: &str, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let all = opt_bool(raw_args, "all")?.unwrap_or(false);
+        let limit = opt_u64(raw_args, "limit")?.unwrap_or(100).clamp(1, 500) as usize;
+        let mut args = vec![
+            "branch".to_string(),
+            "--no-color".to_string(),
+            "--format=%(HEAD) %(refname:short) %(subject)".to_string(),
+        ];
+        if all {
+            args.push("-a".to_string());
+        }
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&ctx.repo_root)
+            .output()
+            .map_err(|e| ToolError::Failed(format!("spawn git: {e}")))?;
+        if !out.status.success() {
+            return Err(ToolError::Failed(
+                String::from_utf8_lossy(&out.stderr).into(),
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines: Vec<&str> = stdout.lines().collect();
+        lines.truncate(limit);
+        Ok(ToolOutput {
+            summary: cap_output(lines.join("\n")),
+        })
+    }
+}
+
 // ---------- T2:shell ----------
 
 struct Shell;
@@ -826,6 +1013,8 @@ pub fn builtin_registry() -> Vec<Box<dyn Tool>> {
         Box::new(GitStatus),
         Box::new(GitLog),
         Box::new(GitDiff),
+        Box::new(GitShow),
+        Box::new(GitBranch),
         Box::new(WriteFile),
         Box::new(EditFile),
         Box::new(Shell),
@@ -1588,5 +1777,306 @@ mod spec141_tests {
         assert!(log.contains("src/main.rs"), "{log}");
         assert!(!log.contains("__pycache__"), "commit 不得含副产物: {log}");
         assert!(!log.contains("test.pyc"), "commit 不得含副产物: {log}");
+    }
+}
+
+#[cfg(test)]
+mod spec154_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zealous-s154-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn ctx_for(dir: &Path) -> ToolContext {
+        ToolContext {
+            repo_root: dir.to_path_buf(),
+        }
+    }
+
+    fn git(dir: &PathBuf, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn git_repo(tag: &str) -> PathBuf {
+        let dir = unique_dir(tag);
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "init commit"]);
+        dir
+    }
+
+    fn run(tool: &dyn Tool, args: &str, dir: &Path) -> Result<ToolOutput, ToolError> {
+        tool.execute(args, &ctx_for(dir))
+    }
+
+    // ---------- read_file ----------
+
+    #[test]
+    fn read_file_default_full_read_unchanged() {
+        let dir = unique_dir("rf-default");
+        std::fs::write(dir.join("a.txt"), "l1\nl2\nl3\n").unwrap();
+        let out = run(&ReadFile, r#"{"path":"a.txt"}"#, &dir).unwrap();
+        assert_eq!(out.summary, "l1\nl2\nl3\n");
+        // 不带行号头
+        assert!(!out.summary.contains("lines:"));
+    }
+
+    #[test]
+    fn read_file_sliced_returns_numbered_range() {
+        let dir = unique_dir("rf-slice");
+        let content: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("big.txt"), content).unwrap();
+        let out = run(
+            &ReadFile,
+            r#"{"path":"big.txt","offset":101,"limit":120}"#,
+            &dir,
+        )
+        .unwrap();
+        assert!(out
+            .summary
+            .starts_with("path: big.txt\nlines: 101-220 / 300\n"));
+        assert!(out.summary.contains("\n  101 line 101\n"));
+        assert!(out.summary.contains("\n  220 line 220\n"));
+        assert!(!out.summary.contains("line 221"));
+    }
+
+    #[test]
+    fn read_file_offset_beyond_eof_reports_empty_range() {
+        let dir = unique_dir("rf-eof");
+        std::fs::write(dir.join("a.txt"), "l1\n").unwrap();
+        let out = run(
+            &ReadFile,
+            r#"{"path":"a.txt","offset":99,"limit":10}"#,
+            &dir,
+        )
+        .unwrap();
+        assert!(out
+            .summary
+            .contains("(empty range: offset 99 beyond end of file, total 1 lines)"));
+    }
+
+    #[test]
+    fn read_file_invalid_args_rejected() {
+        let dir = unique_dir("rf-bad");
+        std::fs::write(dir.join("a.txt"), "x\n").unwrap();
+        for args in [
+            r#"{"path":"a.txt","offset":0,"limit":10}"#,
+            r#"{"path":"a.txt","offset":1,"limit":0}"#,
+            r#"{"path":"a.txt","offset":1,"limit":501}"#,
+        ] {
+            let err = run(&ReadFile, args, &dir).unwrap_err();
+            assert!(matches!(err, ToolError::BadArgs(_)), "{args} -> {err:?}");
+        }
+    }
+
+    #[test]
+    fn read_file_non_utf8_fails() {
+        let dir = unique_dir("rf-bin");
+        std::fs::write(dir.join("bin.txt"), [0xFF, 0xFE, 0x00]).unwrap();
+        for args in [
+            r#"{"path":"bin.txt"}"#,
+            r#"{"path":"bin.txt","offset":1,"limit":10}"#,
+        ] {
+            let err = run(&ReadFile, args, &dir).unwrap_err();
+            assert!(matches!(err, ToolError::Failed(_)), "{args} -> {err:?}");
+        }
+    }
+
+    #[test]
+    fn read_file_large_file_sliced_avoids_full_read_cap() {
+        let dir = unique_dir("rf-big");
+        // ~700KB:全文模式(512KB 上限)必须失败,分片模式成功
+        let line = "x".repeat(100) + "\n";
+        std::fs::write(dir.join("big.txt"), line.repeat(7000)).unwrap();
+        let err = run(&ReadFile, r#"{"path":"big.txt"}"#, &dir).unwrap_err();
+        assert!(matches!(err, ToolError::Failed(ref m) if m.contains("file too large")));
+        let out = run(
+            &ReadFile,
+            r#"{"path":"big.txt","offset":1,"limit":5}"#,
+            &dir,
+        )
+        .unwrap();
+        assert!(out.summary.contains("lines: 1-5 /"));
+    }
+
+    // ---------- search_text ----------
+
+    #[test]
+    fn search_literal_still_works() {
+        let dir = unique_dir("st-lit");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn WidgetFactoryZQ() {}\n").unwrap();
+        let out = run(&SearchText, r#"{"query":"WidgetFactoryZQ"}"#, &dir).unwrap();
+        assert!(out.summary.contains("src/a.rs:1:"), "{}", out.summary);
+    }
+
+    #[test]
+    fn search_regex_matches() {
+        let dir = unique_dir("st-re");
+        std::fs::write(
+            dir.join("code.rs"),
+            "fn alpha() {}\nstruct beta;\nfn gamma() {}\n",
+        )
+        .unwrap();
+        let out = run(&SearchText, r#"{"query":"fn\\s+\\w+","regex":true}"#, &dir).unwrap();
+        assert!(out.summary.contains("code.rs:1:"), "{}", out.summary);
+        assert!(out.summary.contains("code.rs:3:"), "{}", out.summary);
+        assert!(!out.summary.contains("code.rs:2:"), "{}", out.summary);
+    }
+
+    #[test]
+    fn search_invalid_regex_is_explainable() {
+        let dir = unique_dir("st-badre");
+        std::fs::write(dir.join("a.rs"), "x\n").unwrap();
+        let err = run(&SearchText, r#"{"query":"(unclosed","regex":true}"#, &dir).unwrap_err();
+        assert!(
+            matches!(err, ToolError::BadArgs(ref m) if m.contains("invalid regex")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn search_path_scope_file_and_dir_and_traversal() {
+        let dir = unique_dir("st-scope");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "needle here\n").unwrap();
+        std::fs::write(dir.join("docs/b.md"), "needle here\n").unwrap();
+        // path=文件:只搜该文件
+        let out = run(&SearchText, r#"{"query":"needle","path":"src/a.rs"}"#, &dir).unwrap();
+        assert!(out.summary.contains("src/a.rs:1:"));
+        assert!(!out.summary.contains("docs/b.md"));
+        // path=目录:只搜该目录
+        let out = run(&SearchText, r#"{"query":"needle","path":"docs"}"#, &dir).unwrap();
+        assert!(out.summary.contains("docs/b.md:1:"));
+        assert!(!out.summary.contains("src/a.rs"));
+        // 越界
+        let err = run(
+            &SearchText,
+            r#"{"query":"needle","path":"../outside"}"#,
+            &dir,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ToolError::BadArgs(_) | ToolError::Failed(_)));
+    }
+
+    #[test]
+    fn search_max_results_and_per_file_cap() {
+        let dir = unique_dir("st-cap");
+        std::fs::write(dir.join("many.txt"), "needle\n".repeat(30)).unwrap();
+        let out = run(&SearchText, r#"{"query":"needle"}"#, &dir).unwrap();
+        assert_eq!(out.summary.lines().next(), Some("20 hits"));
+        let out = run(&SearchText, r#"{"query":"needle","max_results":1}"#, &dir).unwrap();
+        assert_eq!(out.summary.lines().next(), Some("1 hits"));
+    }
+
+    // ---------- git_show ----------
+
+    #[test]
+    fn git_show_head_and_head_path() {
+        let dir = git_repo("show-head");
+        let out = run(&GitShow, r#"{"object":"HEAD"}"#, &dir).unwrap();
+        assert!(out.summary.contains("init commit"), "{}", out.summary);
+        let out = run(&GitShow, r#"{"object":"HEAD:README.md"}"#, &dir).unwrap();
+        assert!(out.summary.contains("hello"), "{}", out.summary);
+        // 工作区不变
+        let st = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(st.stdout.is_empty());
+    }
+
+    #[test]
+    fn git_show_truncates_large_output() {
+        let dir = git_repo("show-big");
+        std::fs::write(dir.join("big.txt"), "y".repeat(100 * 1024)).unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", "big"]);
+        let out = run(&GitShow, r#"{"object":"HEAD:big.txt"}"#, &dir).unwrap();
+        assert!(out.summary.len() <= 64 * 1024 + 80);
+        assert!(out.summary.contains("[truncated"), "{}", &out.summary[..80]);
+    }
+
+    #[test]
+    fn git_show_invalid_object_reports_git_error() {
+        let dir = git_repo("show-bad");
+        let err = run(&GitShow, r#"{"object":"does-not-exist"}"#, &dir).unwrap_err();
+        assert!(matches!(err, ToolError::Failed(_)), "{err:?}");
+        // 选项注入拒绝
+        let err = run(&GitShow, r#"{"object":"--output=evil.txt"}"#, &dir).unwrap_err();
+        assert!(matches!(err, ToolError::BadArgs(_)), "{err:?}");
+    }
+
+    // ---------- git_branch ----------
+
+    #[test]
+    fn git_branch_local_all_limit_and_current_marker() {
+        let dir = git_repo("br");
+        git(&dir, &["checkout", "-q", "-b", "other"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        // local only
+        let out = run(&GitBranch, "{}", &dir).unwrap();
+        assert!(out.summary.contains("* main"), "{}", out.summary);
+        assert!(out.summary.contains("other"));
+        assert!(!out.summary.contains("remotes/"));
+        // all=true
+        let out = run(&GitBranch, r#"{"all":true}"#, &dir).unwrap();
+        assert!(out.summary.contains("origin/main"), "{}", out.summary);
+        // limit
+        let out = run(&GitBranch, r#"{"limit":1}"#, &dir).unwrap();
+        assert_eq!(out.summary.lines().count(), 1, "{}", out.summary);
+        // 分支未被改变
+        let cur = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&cur.stdout).trim(), "main");
+    }
+
+    // ---------- manifest ----------
+
+    #[test]
+    fn manifest_includes_new_tools_and_args() {
+        let all = tool_manifest(None);
+        assert!(all.contains("`git_show`"), "{}", all);
+        assert!(all.contains("`git_branch`"), "{}", all);
+        assert!(all.contains("\"offset\": 101"), "{}", all);
+        assert!(all.contains("\"regex\": false"), "{}", all);
+        let t0 = tool_manifest(Some(RiskTier::T0));
+        assert!(t0.contains("`git_show`"));
+        assert!(t0.contains("`git_branch`"));
+        // 新工具全部 T0:Worker manifest 同样可见,写工具仍不可见
+        assert!(!t0.contains("`write_file`"));
+        assert!(!t0.contains("`shell`"));
     }
 }

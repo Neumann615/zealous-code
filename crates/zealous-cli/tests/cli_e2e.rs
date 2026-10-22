@@ -501,3 +501,165 @@ fn real_model_smoke() {
         "缺少 zealous 回退 commit"
     );
 }
+
+#[test]
+fn e2e_spec154_tools_sequence() {
+    // ---- 夹具:仓库 + 历史 commit(spec 154:git_show 需要历史)----
+    let repo = unique_dir("s154");
+    let run_git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run_git(&["init", "-q"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    // 60 行大文件:目标 TOKEN 只在第 51 行(read_file 分片读取的目标)
+    let big: String = (1..=60)
+        .map(|i| {
+            if i == 51 {
+                "TOKEN_AT_51\n".to_string()
+            } else {
+                format!("filler line {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(repo.join("big.txt"), big).unwrap();
+    std::fs::write(
+        repo.join("src/helper.rs"),
+        "fn alpha_helper() {}\nfn beta_helper() {}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("note.txt"), "OLD-VALUE\n").unwrap();
+    run_git(&["add", "-A"]);
+    run_git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+
+    // ---- mock:plan → 分片读 → 正则搜索 → git_show → edit → message ----
+    let endpoint = mock_endpoint(vec![
+        r#"{"action":"plan","plan":"slice read big.txt, regex search src, show history note, then edit","workers":[]}"#.into(),
+        r#"{"action":"tool","tool":"read_file","args":{"path":"big.txt","offset":51,"limit":10}}"#.into(),
+        r#"{"action":"tool","tool":"search_text","args":{"query":"fn \\w+_helper","regex":true,"path":"src"}}"#.into(),
+        r#"{"action":"tool","tool":"git_show","args":{"object":"HEAD:note.txt"}}"#.into(),
+        r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}}"#.into(),
+        r#"{"action":"message","text":"spec154 done"}"#.into(),
+    ]);
+
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let out = Command::new(zealous)
+        .args(["task", "new", "s154 tools sequence"])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .expect("spawn task new");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let task_id = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("task created: "))
+        .expect("task id")
+        .trim()
+        .to_string();
+
+    let mut child = Command::new(zealous)
+        .args(["task", "run", &task_id])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn task run");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        stdin.write_all(b"y\n").expect("write approval");
+        stdin.flush().unwrap();
+    }
+    let status = wait_exit(child, 60);
+    assert!(status.success(), "task run exit: {status}");
+
+    // ---- 断言:文件修改 + rollback commit ----
+    let note = std::fs::read_to_string(repo.join("note.txt")).unwrap();
+    assert_eq!(note, "NEW-VALUE\n");
+    let log = Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert!(log.contains("zealous: edit note.txt"), "git log: {log}");
+
+    // ---- 断言:账本含 spec 154 工具调用且 seq 连续、无泄漏 ----
+    let ledger_path = repo
+        .join(".zealous")
+        .join("tasks")
+        .join(&task_id)
+        .join("events.jsonl");
+    let text = std::fs::read_to_string(&ledger_path).unwrap();
+    for needle in ["e2e-secret-key", "Authorization", "Bearer "] {
+        assert!(!text.contains(needle), "账本泄漏敏感串: {needle}");
+    }
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(ev["seq"].as_u64().unwrap(), (i + 1) as u64, "seq 跳号");
+    }
+    let mut saw_read_slice = false;
+    let mut saw_search_regex = false;
+    let mut saw_git_show = false;
+    for e in &events {
+        if e["type"] == "ToolCallRequested" {
+            let tool = e["tool"].as_str().unwrap_or("");
+            let args_json = e["args_json"].as_str().unwrap_or("");
+            if tool == "read_file" && args_json.contains("\"offset\":51") {
+                saw_read_slice = true;
+            }
+            if tool == "search_text" && args_json.contains("\"regex\":true") {
+                saw_search_regex = true;
+            }
+            if tool == "git_show" && args_json.contains("HEAD:note.txt") {
+                saw_git_show = true;
+            }
+        }
+    }
+    assert!(saw_read_slice, "缺少 read_file 分片调用");
+    assert!(saw_search_regex, "缺少 search_text 正则调用");
+    assert!(saw_git_show, "缺少 git_show 调用");
+    // 工具结果成功且搜索结果包含正则匹配
+    assert!(
+        events.iter().any(|e| {
+            e["type"] == "ToolCallCompleted"
+                && e["ok"] == true
+                && e["output_summary"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("helper.rs:1:")
+        }),
+        "search_text 结果应含 helper.rs 正则匹配"
+    );
+}
