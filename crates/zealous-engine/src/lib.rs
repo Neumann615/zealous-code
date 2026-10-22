@@ -13,6 +13,7 @@ pub mod progress;
 pub mod provider;
 pub mod task_service;
 pub mod tools;
+pub mod workspace;
 pub mod worktree;
 
 /// 测试专用:ProviderConfig::resolve 读取进程级环境变量,
