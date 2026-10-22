@@ -79,3 +79,14 @@
 | (待旋转后填入) | | |
 
 - 新 OFFLINE EXTERNAL CANDIDATE 见 RC 记录。
+## 阶段末本地 bundle(spec 156)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-spec156.bundle | 404338 | 6D31AA149DEEDCE4311866B4DCE8C9A42FD75BA62B87862C1D8108090BFCD623 |
+
+- verify complete history 通过,含 main 至 7505693(RC record commit);
+- verify 通过后删除旧 zealous-code-main-worktree155.bundle
+  (094D3878…11607A,为新 bundle 历史前缀);
+- 本提交为 bundle rotation commit,不进入 bundle(spec 150 既定限制);
+- offline RC lock 已刷新;archive bundle 保留;仍不推 remote。
