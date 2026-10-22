@@ -380,21 +380,19 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
             EventPayload::ExecutionWorkspaceApplied {
                 branch,
                 applied_commit,
-            } => {
-                match &mut proj.execution_workspace {
-                    Some(ws) if ws.branch == *branch => {
-                        ws.current_commit = applied_commit.clone();
-                        ws.status = "applied".into();
-                        proj.applied_commit = Some(applied_commit.clone());
-                    }
-                    _ => {
-                        return Err(FoldError::OrphanReference {
-                            seq: event.seq,
-                            detail: "apply 引用未准备的 workspace 或分支不匹配".into(),
-                        })
-                    }
+            } => match &mut proj.execution_workspace {
+                Some(ws) if ws.branch == *branch => {
+                    ws.current_commit = applied_commit.clone();
+                    ws.status = "applied".into();
+                    proj.applied_commit = Some(applied_commit.clone());
                 }
-            }
+                _ => {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "apply 引用未准备的 workspace 或分支不匹配".into(),
+                    })
+                }
+            },
             EventPayload::ExecutionWorkspaceRemoved { branch, .. } => {
                 match &mut proj.execution_workspace {
                     Some(ws) if ws.branch == *branch => {

@@ -31,8 +31,12 @@ def main():
         if a == "--env" and i + 1 < len(args):
             k, _, v = args[i + 1].partition("=")
             env[k] = v
+    cmd_args = [exe, "task", "run", task_id]
+    if "--isolate" in args:
+        args.remove("--isolate")
+        cmd_args.append("--isolate")
     proc = subprocess.Popen(
-        [exe, "task", "run", task_id], cwd=repo, env=env,
+        cmd_args, cwd=repo, env=env,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
         bufsize=1)
