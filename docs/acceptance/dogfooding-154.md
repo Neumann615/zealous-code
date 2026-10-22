@@ -55,3 +55,15 @@
 
 - Cargo.lock 副产物:本轮未再现(计数仍 1)。
 - 无新增 P0 / P1 / P2。
+
+## 阶段末本地 bundle(spec 154)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-spec154.bundle | 352672 | 2FE45EA761E2DEF3916CDC38EEEE97157D4681602D51DC19D03F50AAF23E403C |
+
+- verify complete history 通过,含 main 至 a7b9286(RC record commit);
+- verify 通过后删除旧 zealous-code-main-dogfooding151.bundle
+  (FF103F8B…F484CB,为新 bundle 历史前缀);
+- 本提交为 bundle rotation commit,不进入 bundle(spec 150 既定限制);
+- offline RC lock 已刷新至新候选包;archive bundle 保留;仍不推 remote。
