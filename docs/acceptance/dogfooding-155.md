@@ -46,3 +46,15 @@
 - fmt / test --all / clippy 全绿(每次实现提交后);
 - 集成测试 workspace_isolation.rs 2/2
   (CLI 全流 + serve 全流,均含 apply 与 seq/泄漏断言)。
+
+## 阶段末本地 bundle(spec 155)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-worktree155.bundle | 381724 | 094D3878BDBB7025EA4F3AFD4E3CC6EB986F03BFA27F144F693392893F11607A |
+
+- verify complete history 通过,含 main 至 66d9e61(RC record commit);
+- verify 通过后删除旧 zealous-code-main-spec154.bundle
+  (2FE45EA7…23E403C,为新 bundle 历史前缀);
+- 本提交为 bundle rotation commit,不进入 bundle(spec 150 既定限制);
+- offline RC lock 已刷新至新候选包;archive bundle 保留;仍不推 remote。
