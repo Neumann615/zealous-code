@@ -51,6 +51,7 @@ pub fn spawn_worker(
     task_id: TaskId,
     notif_tx: mpsc::Sender<Notification>,
     abort: Arc<AtomicBool>,
+    isolate: bool,
 ) -> RunHandles {
     let (approval_sink, request_rx, decision_tx) =
         crate::tui::approval::channel(task_id.as_str().to_string(), abort.clone());
@@ -76,8 +77,47 @@ pub fn spawn_worker(
     let progress: Arc<dyn ProgressSink> = Arc::new(NotifProgressSink {
         tx: notif_tx.clone(),
     });
+    // ledger 需先于运行根解析打开(spec 155:模式规则来自事件投影)
+    let (ledger, proj, _) = match svc.open_task(&task_id) {
+        Ok(x) => x,
+        Err(e) => {
+            let _ = notif_tx.send(Notification::error_occurred(&format!("打开任务失败: {e}")));
+            let (tx, _rx) = mpsc::channel();
+            return RunHandles {
+                abort: Arc::new(AtomicBool::new(false)),
+                decision_tx: tx,
+                pending: Arc::new(Mutex::new(None)),
+                done: Arc::new(AtomicBool::new(true)),
+                join: None,
+            };
+        }
+    };
+    let ledger = Arc::new(ledger);
+    let run_root =
+        match zealous_engine::workspace::ensure_run_root(&repo_root, &ledger, &task_id, isolate) {
+            Ok(r) => r,
+            Err(e) => {
+                // 预线程失败:返回已结束句柄,会话立即回收(run_finished 语义
+                // 由 error_occurred 通知承载)
+                let _ = notif_tx.send(Notification::error_occurred(&format!("workspace: {e}")));
+                let (tx, _rx) = mpsc::channel();
+                return RunHandles {
+                    abort: Arc::new(AtomicBool::new(false)),
+                    decision_tx: tx,
+                    pending: Arc::new(Mutex::new(None)),
+                    done: Arc::new(AtomicBool::new(true)),
+                    join: None,
+                };
+            }
+        };
+    let mut prompt = proj.title.clone();
+    if run_root != repo_root {
+        prompt = format!(
+            "[isolated workspace] 本次运行在任务专属 git worktree 中执行;\n主工作区的未提交改动在此不可见,不得尝试访问或修改主工作区。\n\n{prompt}"
+        );
+    }
     let executor = Arc::new(zealous_engine::executor::ToolExecutor::new(
-        repo_root,
+        run_root,
         builtin_registry(),
         Arc::new(approval_sink),
     ));
@@ -97,14 +137,6 @@ pub fn spawn_worker(
             }
         };
         let model = config.model.clone();
-        let (ledger, proj, _) = match svc.open_task(&task_id) {
-            Ok(x) => x,
-            Err(e) => {
-                let _ = notif_tx.send(Notification::error_occurred(&format!("打开任务失败: {e}")));
-                return;
-            }
-        };
-        let ledger = Arc::new(ledger);
         let orchestrator = Orchestrator {
             provider: Arc::new(OpenAiCompatProvider::new(config)),
             executor,
@@ -113,7 +145,7 @@ pub fn spawn_worker(
             model,
             progress: Some(progress),
         };
-        let status = match orchestrator.run_task(&ledger, &proj.title) {
+        let status = match orchestrator.run_task(&ledger, &prompt) {
             Ok(s) => s,
             Err(e) => {
                 let _ = notif_tx.send(Notification::error_occurred(&format!("编排失败: {e}")));

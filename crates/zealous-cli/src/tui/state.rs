@@ -38,10 +38,22 @@ pub struct NewTaskForm {
 
 pub const PROGRESS_RING_CAP: usize = 200;
 
+/// spec 155:确认弹窗类别
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmKind {
+    IsolatedRun,
+    Apply,
+    WorkspaceRemove,
+}
+
 /// TUI 全部 UI 状态;任务事实以投影/账本为准,这里只有派生显示数据
 #[derive(Debug)]
 pub struct TuiState {
     pub screen: Screen,
+    /// spec 155:待确认操作(I/P/W 触发,Enter 确认 / Esc 取消)
+    pub confirm: Option<ConfirmKind>,
+    /// spec 155:详情页是否显示 workspace 区块(W 切换)
+    pub workspace_visible: bool,
     pub tasks: Vec<TaskSummary>,
     pub selected: usize,
     pub detail: Option<TaskProjection>,
@@ -75,6 +87,8 @@ impl TuiState {
     pub fn new() -> Self {
         Self {
             screen: Screen::List,
+            confirm: None,
+            workspace_visible: false,
             tasks: Vec::new(),
             selected: 0,
             detail: None,
@@ -198,6 +212,19 @@ impl TuiState {
     }
 
     // ---- 表单 ----
+
+    /// spec 155:确认弹窗与 workspace 区块
+    pub fn open_confirm(&mut self, kind: ConfirmKind) {
+        self.confirm = Some(kind);
+    }
+
+    pub fn take_confirm(&mut self) -> Option<ConfirmKind> {
+        self.confirm.take()
+    }
+
+    pub fn toggle_workspace(&mut self) {
+        self.workspace_visible = !self.workspace_visible;
+    }
 
     pub fn open_form(&mut self) {
         self.screen = Screen::Form;

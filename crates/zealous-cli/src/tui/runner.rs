@@ -34,6 +34,7 @@ pub fn spawn_run(
     approval_sink: Arc<dyn ApprovalSink>,
     progress_sink: Arc<dyn ProgressSink>,
     abort: Arc<AtomicBool>,
+    isolate: bool,
 ) {
     std::thread::spawn(move || {
         let config = match ProviderConfig::resolve() {
@@ -54,8 +55,28 @@ pub fn spawn_run(
         };
         let ledger = Arc::new(ledger);
 
+        // spec 155:运行根解析(模式规则落账;isolated 校验/重建在此完成)
+        let run_root = match zealous_engine::workspace::ensure_run_root(
+            svc.repo_root(),
+            &ledger,
+            &task_id,
+            isolate,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = event_tx.send(TuiEvent::Failure(format!("workspace: {e}")));
+                return;
+            }
+        };
+        let mut prompt = proj.title.clone();
+        if run_root != svc.repo_root().to_path_buf() {
+            prompt = format!(
+                "[isolated workspace] 本次运行在任务专属 git worktree 中执行;\n主工作区的未提交改动在此不可见,不得尝试访问或修改主工作区。\n\n{prompt}"
+            );
+        }
+
         let executor = Arc::new(zealous_engine::executor::ToolExecutor::new(
-            svc.repo_root().to_path_buf(),
+            run_root,
             builtin_registry(),
             approval_sink,
         ));
@@ -69,7 +90,7 @@ pub fn spawn_run(
             progress: Some(progress_sink),
         };
 
-        let status = match orchestrator.run_task(&ledger, &proj.title) {
+        let status = match orchestrator.run_task(&ledger, &prompt) {
             Ok(s) => s,
             Err(e) => {
                 let _ = event_tx.send(TuiEvent::Failure(format!("编排失败: {e}")));

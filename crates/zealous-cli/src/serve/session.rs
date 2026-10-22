@@ -81,6 +81,9 @@ impl Session {
             "run_task" => Handled::Response(self.handle_run_task(&req)),
             "interrupt_task" => Handled::Response(self.handle_interrupt(&req)),
             "decide_approval" => Handled::Response(self.handle_decide(&req)),
+            "apply_task" => Handled::Response(self.handle_apply_task(&req)),
+            "get_workspace" => Handled::Response(self.handle_get_workspace(&req)),
+            "remove_workspace" => Handled::Response(self.handle_remove_workspace(&req)),
             "shutdown" => {
                 self.wait_worker();
                 Handled::Shutdown(Response::ok(req.id, serde_json::json!({ "bye": true })))
@@ -112,6 +115,7 @@ impl Session {
                             "decide_approval": true,
                             "max_workers": 3,
                             "concurrent_runs": 1,
+                            "isolated_worktree": true,
                         }
                     }),
                 )
@@ -323,12 +327,18 @@ impl Session {
                 "provider 配置无效(修 .env 或 ~/.zealous/config.json)",
             );
         }
+        let isolate = req
+            .params
+            .get("isolate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let handles = runner::spawn_worker(
             self.svc.clone(),
             self.repo_root.clone(),
             task_id.clone(),
             self.notif_tx.clone(),
             Arc::new(AtomicBool::new(false)),
+            isolate,
         );
         self.run = Some(RunState { task_id, handles });
         Response::ok(req.id, serde_json::json!({ "started": true }))
@@ -437,6 +447,93 @@ impl Session {
             if let Some(j) = run.handles.join.take() {
                 let _ = j.join();
             }
+        }
+    }
+}
+
+impl Session {
+    fn parse_task(&self, req: &Request) -> Result<TaskId, Response> {
+        self.parse_task_id(req)
+    }
+
+    /// apply_task(spec 155):fast-forward 应用;拒绝场景原样透传错误码
+    fn handle_apply_task(&mut self, req: &Request) -> Response {
+        let task_id = match self.parse_task(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        match self.svc.open_task(&task_id) {
+            Ok((ledger, _proj, _)) => {
+                match zealous_engine::workspace::apply(&self.repo_root, &ledger) {
+                    Ok(out) => Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "branch": out.branch,
+                            "applied_commit": out.applied_commit,
+                            "already": out.already,
+                        }),
+                    ),
+                    Err(e) => err_resp(req.id, "workspace", e.to_string()),
+                }
+            }
+            Err(e) => err_resp(req.id, "internal", e.to_string()),
+        }
+    }
+
+    /// get_workspace(spec 155):workspace 状态必须来自事件投影
+    fn handle_get_workspace(&mut self, req: &Request) -> Response {
+        let task_id = match self.parse_task(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        match self.svc.open_task(&task_id) {
+            Ok((_ledger, proj, _)) => match &proj.execution_workspace {
+                Some(ws) => Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "mode": "isolated",
+                        "kind": ws.kind,
+                        "path": ws.path,
+                        "branch": ws.branch,
+                        "base_branch": ws.base_branch,
+                        "base_commit": ws.base_commit,
+                        "current_commit": ws.current_commit,
+                        "status": ws.status,
+                        "applied_commit": proj.applied_commit,
+                        "workspace_removed": proj.workspace_removed,
+                    }),
+                ),
+                None => Response::ok(req.id, serde_json::json!({ "mode": "direct" })),
+            },
+            Err(e) => err_resp(req.id, "internal", e.to_string()),
+        }
+    }
+
+    /// remove_workspace(spec 155):force 透传;拒绝场景原样透传
+    fn handle_remove_workspace(&mut self, req: &Request) -> Response {
+        let task_id = match self.parse_task(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let force = req
+            .params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        match self.svc.open_task(&task_id) {
+            Ok((ledger, _proj, _)) => {
+                match zealous_engine::workspace::remove(&self.repo_root, &ledger, force) {
+                    Ok(info) => Response::ok(
+                        req.id,
+                        serde_json::json!({
+                            "branch": info.branch,
+                            "path": info.path.display().to_string(),
+                        }),
+                    ),
+                    Err(e) => err_resp(req.id, "workspace", e.to_string()),
+                }
+            }
+            Err(e) => err_resp(req.id, "internal", e.to_string()),
         }
     }
 }

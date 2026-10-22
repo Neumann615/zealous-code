@@ -239,6 +239,85 @@ fn handle_key(
         state.request_quit();
         return;
     }
+    // spec 155:确认弹窗优先于普通键位(Enter 确认 / Esc 取消)
+    if let Some(kind) = state.take_confirm() {
+        match key.code {
+            KeyCode::Esc => state.confirm = None,
+            KeyCode::Enter => match kind {
+                state::ConfirmKind::IsolatedRun => {
+                    if !state.running {
+                        if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                            state.running = true;
+                            state.abort_requested = false;
+                            abort.store(false, Ordering::Relaxed);
+                            let (approval_sink, request_rx, decision_tx_ch) =
+                                approval::channel(task_id.as_str().to_string(), abort.clone());
+                            let fwd_tx = event_tx.clone();
+                            std::thread::spawn(move || {
+                                for req in request_rx {
+                                    if fwd_tx.send(TuiEvent::Approval(req)).is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                            *decision_tx = Some(decision_tx_ch);
+                            runner::spawn_run(
+                                TaskService::new(svc.repo_root().to_path_buf()),
+                                task_id,
+                                event_tx.clone(),
+                                Arc::new(approval_sink),
+                                progress_sink.clone(),
+                                abort.clone(),
+                                true,
+                            );
+                        }
+                    }
+                }
+                state::ConfirmKind::Apply => {
+                    if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, _proj, _)) => {
+                                match zealous_engine::workspace::apply(svc.repo_root(), &ledger) {
+                                    Ok(out) => state.push_important(&format!(
+                                        "applied: {} @ {}{}",
+                                        out.branch,
+                                        out.applied_commit,
+                                        if out.already { " (already)" } else { "" }
+                                    )),
+                                    Err(e) => state.push_important(&format!("apply 失败: {e}")),
+                                }
+                            }
+                            Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
+                state::ConfirmKind::WorkspaceRemove => {
+                    if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, _proj, _)) => {
+                                match zealous_engine::workspace::remove(
+                                    svc.repo_root(),
+                                    &ledger,
+                                    false,
+                                ) {
+                                    Ok(info) => state.push_important(&format!(
+                                        "workspace removed: {}",
+                                        info.branch
+                                    )),
+                                    Err(e) => {
+                                        state.push_important(&format!("workspace remove 失败: {e}"))
+                                    }
+                                }
+                            }
+                            Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+        return;
+    }
     if key.kind != crossterm::event::KeyEventKind::Press {
         return;
     }
@@ -304,6 +383,20 @@ fn handle_key(
                 state.request_abort();
                 abort.store(true, Ordering::Relaxed);
             }
+            KeyCode::Char('I') => {
+                if !state.running {
+                    state.open_confirm(state::ConfirmKind::IsolatedRun);
+                }
+            }
+            KeyCode::Char('P') => {
+                state.open_confirm(state::ConfirmKind::Apply);
+            }
+            KeyCode::Char('D') if state.workspace_visible => {
+                state.open_confirm(state::ConfirmKind::WorkspaceRemove);
+            }
+            KeyCode::Char('W') => {
+                state.toggle_workspace();
+            }
             KeyCode::Char('R') => {
                 if !state.running {
                     let id = state.selected_task().map(|t| t.task_id.clone());
@@ -330,6 +423,7 @@ fn handle_key(
                             Arc::new(approval_sink),
                             progress_sink.clone(),
                             abort.clone(),
+                            false,
                         );
                     }
                 }
@@ -507,6 +601,7 @@ mod integration_tests {
             Arc::new(approval_sink),
             Arc::new(progress_sink),
             abort.clone(),
+            false,
         );
 
         // ---- 消费事件循环(同 apply_event),审批到达时模拟按键 a ----

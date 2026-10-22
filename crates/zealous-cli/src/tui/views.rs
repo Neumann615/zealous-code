@@ -51,6 +51,10 @@ pub fn render(f: &mut Frame, state: &mut TuiState) {
     if state.screen == Screen::Form {
         render_form_modal(f, state);
     }
+    // spec 155:确认弹窗(优先级最低,不遮蔽审批)
+    if state.confirm.is_some() {
+        render_confirm_modal(f, state);
+    }
 }
 
 fn render_task_list(f: &mut Frame, area: Rect, state: &TuiState) {
@@ -115,6 +119,28 @@ fn projection_lines(state: &TuiState, full: bool) -> Vec<Line<'static>> {
             "last error [{scope}]: {}",
             truncate(msg, 160)
         )));
+    }
+    // spec 155:workspace 区块(W 切换显示)
+    if state.workspace_visible {
+        match &proj.execution_workspace {
+            Some(ws) => {
+                lines.push(Line::from(format!(
+                    "workspace: {} ({})",
+                    ws.status, ws.kind
+                )));
+                lines.push(Line::from(format!(
+                    "  branch: {}\n  path: {}\n  base: {} @ {}\n  current: {}",
+                    ws.branch, ws.path, ws.base_branch, ws.base_commit, ws.current_commit
+                )));
+                if let Some(applied) = &proj.applied_commit {
+                    lines.push(Line::from(format!("  applied: {applied}")));
+                }
+                if proj.workspace_removed {
+                    lines.push(Line::from("  (workspace 已清理)"));
+                }
+            }
+            None => lines.push(Line::from("workspace: (非 isolated 任务)")),
+        }
     }
     if full && state.events_expanded {
         lines.push(Line::from("--- 事件流(↑/↓ 滚动) ---"));
@@ -200,7 +226,7 @@ fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
             ))
         } else {
             Line::from(format!(
-                "[{run_state}] q 退出 · n 新建 · r 刷新 · ↑/↓ 选择 · Enter 详情 · 详情内: R 运行 · x 中断 · a/d 审批 · e 事件流 · 最终状态: {status}"
+                "[{run_state}] q 退出 · n 新建 · r 刷新 · ↑/↓ 选择 · Enter 详情 · 详情内: R 运行 · I 隔离运行 · P 应用 · W 工作区 · x 中断 · a/d 审批 · e 事件流 · 最终状态: {status}"
             ))
         }
     };
@@ -220,6 +246,48 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(v[1])[1]
+}
+
+/// spec 155:确认弹窗(I/P/W 触发;Enter 确认 / Esc 取消)
+fn render_confirm_modal(f: &mut Frame, state: &TuiState) {
+    let Some(kind) = &state.confirm else { return };
+    let (title, lines) = match kind {
+        super::state::ConfirmKind::IsolatedRun => (
+            "Isolated Run".to_string(),
+            vec![
+                "将在任务专属 worktree 中运行/恢复该任务:".to_string(),
+                "(模式落账;主工作区 WIP 不受影响)".to_string(),
+            ],
+        ),
+        super::state::ConfirmKind::Apply => (
+            "Apply".to_string(),
+            vec![
+                "将把任务分支 fast-forward 应用回主工作区。".to_string(),
+                "要求:主分支未前进、主工作区干净。".to_string(),
+            ],
+        ),
+        super::state::ConfirmKind::WorkspaceRemove => (
+            "Workspace Remove".to_string(),
+            vec![
+                "将删除任务 worktree 与分支(仅已 applied/已包含时允许)。".to_string(),
+                "worktree 中的未提交改动不会被删除(需 CLI --force)。".to_string(),
+            ],
+        ),
+    };
+    let area = centered_rect(60, 30, f.area());
+    f.render_widget(Clear, area);
+    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+    let mut text = vec![Line::from(Span::styled(
+        title,
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    text.push(Line::from(""));
+    for l in lines {
+        text.push(Line::from(l));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from("Enter 确认 · Esc 取消"));
+    f.render_widget(Paragraph::new(text), inner);
 }
 
 fn render_approval_modal(f: &mut Frame, state: &mut TuiState) {
@@ -430,6 +498,9 @@ pub(crate) mod tests {
             }],
             pending_approvals: Vec::new(),
             last_error: Some(("orchestrator".into(), "验证失败".into())),
+            execution_workspace: None,
+            applied_commit: None,
+            workspace_removed: false,
             interrupted_count: 1,
             last_event_seq: 9,
         };
