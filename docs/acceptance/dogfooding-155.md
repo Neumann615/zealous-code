@@ -58,3 +58,24 @@
   (2FE45EA7…23E403C,为新 bundle 历史前缀);
 - 本提交为 bundle rotation commit,不进入 bundle(spec 150 既定限制);
 - offline RC lock 已刷新至新候选包;archive bundle 保留;仍不推 remote。
+## DF2 失败停止(spec 156 队列)—— PASS
+
+- mock ok3_then_500:任务 1 三次请求 OK(Completed+apply);
+  任务 2 的请求 4-6 全部 500 → provider_exhausted → **Failed**;
+- 队列停止(exit 1);任务 3 保持 Queued;任务 2 worktree 保留;
+- 主分支仅包含任务 1 的 rollback commit;
+- 已在集成测试 workspace_isolation.rs 完整断言(确定性 mock)。
+
+## DF3 主分支前进冲突 —— PASS
+
+- 集成测试与 engine 单测覆盖:base HEAD 变更后 apply 被拒
+  (BaseBranchMoved / DirtyWorktree / NotOnBaseBranch);
+- Dogfooding 155 DF3 已验证(同机制)。
+
+## 阶段末本地 bundle(spec 156)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| (待旋转后填入) | | |
+
+- 新 OFFLINE EXTERNAL CANDIDATE 见 RC 记录。
