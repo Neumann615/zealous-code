@@ -466,6 +466,10 @@ impl Tool for GitDiff {
 
 // ---------- T1:write_file ----------
 
+/// spec 153:写守卫拒绝文案的稳定标记(执行器据此在账本中识别
+/// "紧随被拒写入的 shell 请求")。
+pub(crate) const WRITE_GUARD_REJECT_MARKER: &str = "写入已拒绝";
+
 struct WriteFile;
 
 impl Tool for WriteFile {
@@ -756,13 +760,12 @@ fn assert_clean_worktree(repo_root: &Path) -> Result<(), ToolError> {
         .take(5)
         .map(|e| format!("\n  {}", e.raw))
         .collect();
-    let mut msg = format!("Git 工作区存在用户改动,拒绝写入主工作区。\n用户改动:{user}\n");
+    let mut msg = format!("Git 工作区存在用户未提交改动:{user}\n\n{WRITE_GUARD_REJECT_MARKER}\n用户可自行保存、提交或调整这些改动后再重试。\nZealous 不会替用户提交、stash、删除或覆盖这些改动。");
     if !artifacts.is_empty() {
         msg.push_str(&format!(
-            "运行副产物(不自动处理,不阻塞本次写入):{artifacts}\n"
+            "\n运行副产物(不自动处理,不阻塞本次写入):{artifacts}"
         ));
     }
-    msg.push_str("请先 commit/stash 用户改动。");
     Err(ToolError::Failed(msg))
 }
 
@@ -970,7 +973,12 @@ mod tests {
             .execute(r#"{"path":"new.txt","content":"x"}"#, &ctx)
             .unwrap_err();
         assert!(
-            matches!(err, ToolError::Failed(ref m) if m.contains("拒绝写入")),
+            matches!(err, ToolError::Failed(ref m) if m.contains("写入已拒绝")),
+            "{err:?}"
+        );
+        // spec 153:守卫文案不得建议 commit/stash 命令
+        assert!(
+            matches!(err, ToolError::Failed(ref m) if !m.contains("commit/stash") && !m.contains("请先")),
             "{err:?}"
         );
         assert!(!dir.join("new.txt").exists());
@@ -1479,7 +1487,7 @@ mod spec141_tests {
         std::fs::write(dir.join("tracked.pyc"), "v2").unwrap();
         let err = edit_main(&ctx).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("用户改动"), "{msg}");
+        assert!(msg.contains("未提交改动"), "{msg}");
         assert!(msg.contains("tracked.pyc"), "{msg}");
         assert!(!msg.contains("运行副产物"), "tracked 修改不得降级: {msg}");
     }
@@ -1492,12 +1500,14 @@ mod spec141_tests {
         std::fs::write(dir.join("README.md"), "user edit\n").unwrap();
         let err = edit_main(&ctx).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("拒绝写入"), "{msg}");
-        assert!(msg.contains("用户改动"), "{msg}");
+        assert!(msg.contains("写入已拒绝"), "{msg}");
+        assert!(msg.contains("用户未提交改动"), "{msg}");
         assert!(msg.contains("README.md"), "{msg}");
         assert!(msg.contains("运行副产物"), "{msg}");
         assert!(msg.contains("__pycache__"), "{msg}");
-        assert!(msg.contains("请先 commit/stash 用户改动"), "{msg}");
+        // spec 153:不得出现建议性 commit/stash 指令
+        assert!(!msg.contains("请先"), "{msg}");
+        assert!(!msg.contains("commit/stash"), "{msg}");
         assert!(!std::fs::read_to_string(dir.join("src/main.rs"))
             .unwrap()
             .contains("zealous2"));

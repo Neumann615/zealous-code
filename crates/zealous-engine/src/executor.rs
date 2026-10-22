@@ -135,7 +135,15 @@ impl ToolExecutor {
             let ctx = ToolContext {
                 repo_root: self.repo_root.clone(),
             };
-            let summary = tool.summarize(raw_args, &ctx);
+            let mut summary = tool.summarize(raw_args, &ctx);
+            // spec 153:账本中存在被写守卫拒绝的写入时,shell 审批附加
+            // 绕过警示。判定依据是账本事实(不新增第二份业务状态);
+            // 只增强可读性,不自动拒绝,T2 权限模型不变。
+            if tool_name == "shell" && ledger_has_write_guard_rejection(ledger) {
+                summary = format!(
+                    "注意:此命令紧随一次被写守卫拒绝的写入请求,\n可能试图绕过用户 WIP 保护。请确认它不会提交、stash、\n删除或覆盖用户未提交改动。\n\n{summary}"
+                );
+            }
             let info = ApprovalRequestInfo {
                 call_id: call_id.to_string(),
                 tool: tool_name.to_string(),
@@ -181,6 +189,25 @@ impl ToolExecutor {
             Err(ToolError::Failed(m)) => fail(false, risk, format!("tool failed: {m}")),
         }
     }
+}
+
+/// spec 153:账本中是否存在被写守卫拒绝的写入。
+/// 判定依据是账本事实(ToolCallCompleted ok=false + 守卫标记),
+/// 不新增第二份业务状态。
+fn ledger_has_write_guard_rejection(ledger: &Ledger) -> bool {
+    let Ok((events, _)) = crate::ledger::read_events(ledger.path()) else {
+        return false;
+    };
+    events.iter().any(|e| {
+        matches!(
+            &e.payload,
+            zealous_core::EventPayload::ToolCallCompleted {
+                call_id: _,
+                ok: false,
+                output_summary,
+            } if output_summary.contains(crate::tools::WRITE_GUARD_REJECT_MARKER)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -413,5 +440,93 @@ mod tests {
             .unwrap();
         assert!(!out.ok);
         assert!(out.text.contains("unknown tool"));
+    }
+
+    #[test]
+    fn shell_approval_warns_after_write_guard_rejection() {
+        use crate::approval::ApprovalRequestInfo;
+        use std::sync::Mutex;
+
+        struct Capture(std::sync::Mutex<Option<ApprovalRequestInfo>>);
+        impl crate::approval::ApprovalSink for Capture {
+            fn decide(&self, info: &ApprovalRequestInfo) -> zealous_core::ApprovalDecision {
+                *self.0.lock().unwrap() = Some(info.clone());
+                zealous_core::ApprovalDecision::Reject
+            }
+        }
+
+        let repo = fixture_repo();
+        // 用户 WIP:未跟踪文件 = UserChange,真实触发守卫
+        std::fs::write(repo.join("wip.txt"), "user wip").unwrap();
+        let exec = executor(Arc::new(AutoApprove), &repo);
+        let (_tid, ledger) = started_task(&repo);
+        let run = AgentRunId::generate();
+        start_run(
+            &ledger,
+            &run,
+            AgentRef::Coordinator,
+            zealous_core::AgentRole::Coordinator,
+        );
+
+        // 1) write_file 获批但被守卫 fail-closed 拒绝
+        let out = exec
+            .run_tool(
+                &ledger,
+                &run,
+                AgentRef::Coordinator,
+                r#"{"path":"new.txt","content":"x"}"#,
+                "write_file",
+            )
+            .unwrap();
+        assert!(!out.ok);
+        assert!(out.text.contains(crate::tools::WRITE_GUARD_REJECT_MARKER));
+
+        // 2) 紧随的 shell 审批必须出现警示
+        let cap = Arc::new(Capture(Mutex::new(None)));
+        let exec2 = executor(cap.clone(), &repo);
+        let _ = exec2
+            .run_tool(
+                &ledger,
+                &run,
+                AgentRef::Coordinator,
+                r#"{"command":"echo hi"}"#,
+                "shell",
+            )
+            .unwrap();
+        let info = cap.0.lock().unwrap().clone().unwrap();
+        assert!(
+            info.summary
+                .contains("注意:此命令紧随一次被写守卫拒绝的写入请求"),
+            "{}",
+            info.summary
+        );
+
+        // 3) 无前置守卫失败:另一个任务的 shell 审批不得出现警示
+        let repo_b = fixture_repo();
+        let cap_b = Arc::new(Capture(Mutex::new(None)));
+        let exec_b = executor(cap_b.clone(), &repo_b);
+        let (_tid_b, ledger_b) = started_task(&repo_b);
+        let run_b = AgentRunId::generate();
+        start_run(
+            &ledger_b,
+            &run_b,
+            AgentRef::Coordinator,
+            zealous_core::AgentRole::Coordinator,
+        );
+        let _ = exec_b
+            .run_tool(
+                &ledger_b,
+                &run_b,
+                AgentRef::Coordinator,
+                r#"{"command":"echo hi"}"#,
+                "shell",
+            )
+            .unwrap();
+        let info_b = cap_b.0.lock().unwrap().clone().unwrap();
+        assert!(
+            !info_b.summary.contains("注意:此命令紧随一次被写守卫拒绝"),
+            "{}",
+            info_b.summary
+        );
     }
 }
