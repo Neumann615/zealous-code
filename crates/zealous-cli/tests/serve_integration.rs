@@ -674,3 +674,242 @@ fn parallel_stage_endpoint() -> String {
     });
     format!("http://{addr}/v1")
 }
+
+#[test]
+fn serve_merge_workspace_conflict_continue_flow() {
+    let repo = unique_dir("merge-ws");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), ".zealous/\n").unwrap();
+    std::fs::write(repo.join("note.txt"), "OLD\n").unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+    let endpoint = serve_conflict_endpoint();
+    let mut proc = spawn_serve(&repo, &endpoint);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut next_id = 1u64;
+    let mut notes: Vec<serde_json::Value> = Vec::new();
+    macro_rules! request {
+        ($cmd:expr, $params:expr) => {{
+            let id = next_id;
+            next_id += 1;
+            proc.send(&serde_json::json!({"id": id, "cmd": $cmd, "params": $params}));
+            let resp = proc.wait_response(&proc.lines_rx, id, deadline, |n| notes.push(n));
+            resp
+        }};
+    }
+    request!("initialize", serde_json::json!({"version": 1}));
+    let mut tasks = Vec::new();
+    for title in ["serve conflict left", "serve conflict right"] {
+        let resp = request!("create_task", serde_json::json!({"title": title}));
+        tasks.push(resp["result"]["task_id"].as_str().unwrap().to_string());
+    }
+    let run = request!(
+        "run_parallel",
+        serde_json::json!({"task_ids": tasks, "auto_apply": true})
+    );
+    assert!(
+        run["result"]["parallel_started"].as_bool().unwrap(),
+        "{run}"
+    );
+    for _ in 0..2 {
+        let value = notes
+            .iter()
+            .position(|n| n["event"].as_str() == Some("approval_requested"))
+            .map(|i| notes.remove(i));
+        let value = if let Some(value) = value {
+            value
+        } else {
+            loop {
+                assert!(Instant::now() < deadline, "approval timeout");
+                let Ok(line) = proc.lines_rx.recv_timeout(Duration::from_millis(200)) else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if value["event"].as_str() == Some("approval_requested") {
+                    break value;
+                }
+            }
+        };
+        let id = next_id;
+        next_id += 1;
+        proc.send(&serde_json::json!({
+            "id": id,
+            "cmd": "decide_approval",
+            "params": {
+                "task_id": value["params"]["task_id"],
+                "call_id": value["params"]["call_id"],
+                "decision": "approve"
+            }
+        }));
+        let resp = proc.wait_response(&proc.lines_rx, id, deadline, |n| notes.push(n));
+        assert!(resp["ok"].as_bool().unwrap(), "{resp}");
+    }
+
+    loop {
+        let finished = notes.iter().position(|n| {
+            n["event"].as_str() == Some("progress")
+                && n["params"]["level"].as_str() == Some("parallel_finished")
+        });
+        if finished.is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "parallel finish timeout");
+        let Ok(line) = proc.lines_rx.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if value["event"].as_str() == Some("progress")
+            && value["params"]["level"].as_str() == Some("parallel_finished")
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "LEFT"
+    );
+
+    let started = request!(
+        "start_merge_workspace",
+        serde_json::json!({"task_id": tasks[1]})
+    );
+    assert!(
+        started["result"]["conflicted"].as_bool().unwrap(),
+        "{started}"
+    );
+    assert_eq!(
+        started["result"]["files"],
+        serde_json::json!(["note.txt"]),
+        "{started}"
+    );
+    let status = request!("get_merge_status", serde_json::json!({"task_id": tasks[1]}));
+    assert_eq!(status["result"]["status"], "conflicted", "{status}");
+    assert_eq!(
+        status["result"]["unresolved_files"],
+        serde_json::json!(["note.txt"]),
+        "{status}"
+    );
+    let unresolved = request!(
+        "continue_merge_workspace",
+        serde_json::json!({"task_id": tasks[1]})
+    );
+    assert_eq!(
+        unresolved["error"]["code"], "unresolved_conflicts",
+        "{unresolved}"
+    );
+
+    let workspace = repo.join(".zealous/merges").join(&tasks[1]);
+    std::fs::write(workspace.join("note.txt"), "SERVE-RESOLVED\n").unwrap();
+    let staged = Command::new("git")
+        .args(["add", "note.txt"])
+        .current_dir(&workspace)
+        .output()
+        .unwrap();
+    assert!(staged.status.success(), "{:?}", staged.stderr);
+    let continued = request!(
+        "continue_merge_workspace",
+        serde_json::json!({"task_id": tasks[1]})
+    );
+    assert!(
+        continued["result"]["merged"].as_bool().unwrap(),
+        "{continued}"
+    );
+    assert!(!workspace.exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "SERVE-RESOLVED"
+    );
+    let task = request!("get_task", serde_json::json!({"task_id": tasks[1]}));
+    assert_eq!(
+        task["result"]["applied_strategy"], "ThreeWayMerge",
+        "{task}"
+    );
+    assert_eq!(
+        task["result"]["merge_workspace"]["status"], "integrated",
+        "{task}"
+    );
+    let shutdown_id = next_id;
+    proc.send(&serde_json::json!({"id": shutdown_id, "cmd": "shutdown", "params": {}}));
+    let resp = proc.wait_response(&proc.lines_rx, shutdown_id, deadline, |_| {});
+    assert!(resp["ok"].as_bool().unwrap(), "{resp}");
+}
+
+fn serve_conflict_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let len = text
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&raw).to_string();
+        let left = request.contains("serve conflict left");
+        let content = if request.contains("tool `edit_file` result") {
+            r#"{"action":"message","text":"done"}"#
+        } else if request.contains("edit conflict") {
+            if left {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD","new_text":"LEFT"}}"#
+            } else {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD","new_text":"RIGHT"}}"#
+            }
+        } else if left {
+            r#"{"action":"plan","plan":"edit conflict left","workers":[]}"#
+        } else {
+            r#"{"action":"plan","plan":"edit conflict right","workers":[]}"#
+        };
+        let body = chat_body(content);
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    format!("http://{addr}/v1")
+}

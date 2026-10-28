@@ -100,6 +100,9 @@ enum ParallelCmd {
         /// 集成策略:ff-only(默认)或 merge(spec 158)
         #[arg(long, default_value = "ff-only")]
         integrate: String,
+        /// merge 冲突策略:abort(默认)或 workspace(spec 159)
+        #[arg(long, default_value = "abort")]
+        on_conflict: String,
         /// 全部工具审批自动通过
         #[arg(long)]
         yes: bool,
@@ -163,6 +166,27 @@ enum TaskCmd {
     Merge {
         task_id: String,
         /// 跳过确认(仅限你已确认变更内容)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 创建冲突解决工作区;无冲突时自动完成合并并集成(spec 159)
+    MergeWorkspace { task_id: String },
+    /// 查看冲突解决工作区状态(spec 159)
+    MergeStatus { task_id: String },
+    /// 用户解决并 stage 冲突后继续合并(spec 159)
+    MergeContinue {
+        task_id: String,
+        /// 跳过确认(仅限已确认 staged 解决结果)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 中止冲突解决工作区(spec 159)
+    MergeAbort {
+        task_id: String,
+        /// merge workspace 有额外修改时强制清理
+        #[arg(long)]
+        force: bool,
+        /// 跳过确认
         #[arg(long)]
         yes: bool,
     },
@@ -340,6 +364,14 @@ fn main() {
             TaskCmd::Events { task_id } => cmd_events(&task_id),
             TaskCmd::Apply { task_id, yes } => cmd_apply(&task_id, yes),
             TaskCmd::Merge { task_id, yes } => cmd_merge(&task_id, yes),
+            TaskCmd::MergeWorkspace { task_id } => cmd_merge_workspace(&task_id),
+            TaskCmd::MergeStatus { task_id } => cmd_merge_status(&task_id),
+            TaskCmd::MergeContinue { task_id, yes } => cmd_merge_continue(&task_id, yes),
+            TaskCmd::MergeAbort {
+                task_id,
+                force,
+                yes,
+            } => cmd_merge_abort(&task_id, force, yes),
             TaskCmd::Workspace { task_id } => cmd_workspace(&task_id),
             TaskCmd::WorkspaceRemove {
                 task_id,
@@ -365,10 +397,21 @@ fn main() {
                 max,
                 auto_apply,
                 integrate,
+                on_conflict,
                 yes,
                 no,
                 quiet,
-            } => cmd_parallel_run(task_ids, all, max, auto_apply, integrate, yes, no, quiet),
+            } => cmd_parallel_run(
+                task_ids,
+                all,
+                max,
+                auto_apply,
+                integrate,
+                on_conflict,
+                yes,
+                no,
+                quiet,
+            ),
             ParallelCmd::Status => cmd_parallel_status(),
         },
         Cmd::Config {
@@ -819,6 +862,7 @@ fn cmd_parallel_run(
     max: usize,
     auto_apply: bool,
     integrate: String,
+    on_conflict: String,
     yes: bool,
     no: bool,
     quiet: bool,
@@ -836,6 +880,11 @@ fn cmd_parallel_run(
         Ok(strategy) => strategy,
         Err(e) => return err(format!("parallel 启动失败: {e}")),
     };
+    let on_conflict_strategy =
+        match zealous_engine::parallel::OnConflictStrategy::parse(&on_conflict) {
+            Ok(strategy) => strategy,
+            Err(e) => return err(format!("parallel 启动失败: {e}")),
+        };
     let repo = match repo_root() {
         Ok(r) => r,
         Err(e) => return err(e),
@@ -884,7 +933,7 @@ fn cmd_parallel_run(
         Err(e) => return err(format!("provider 配置无效: {e}")),
     };
     println!(
-        "parallel: {} 个任务, isolated, max=1 batch/{}, auto_apply={auto_apply}, integrate={integrate}",
+        "parallel: {} 个任务, isolated, max=1 batch/{}, auto_apply={auto_apply}, integrate={integrate}, on_conflict={on_conflict}",
         ids.len(),
         ids.len()
     );
@@ -957,6 +1006,16 @@ fn cmd_parallel_run(
                 if ok { "成功" } else { "失败" }
             );
         }),
+        on_merge_conflict: Box::new(|tid, files| {
+            println!(
+                "=== parallel task {} merge 冲突已保留 workspace ===",
+                tid.as_str()
+            );
+            println!("conflicted files:");
+            for file in files {
+                println!("  {file}");
+            }
+        }),
         confirm_apply: Box::new(confirm),
     };
     let summary = zealous_engine::parallel::run_parallel(
@@ -968,6 +1027,7 @@ fn cmd_parallel_run(
         &ids,
         auto_apply,
         integration,
+        on_conflict_strategy,
         sink,
         progress,
         abort,
@@ -975,11 +1035,12 @@ fn cmd_parallel_run(
         &mut hooks,
     );
     println!(
-        "parallel 完成: integrated {} (ff {}) / completed {}, merged {}, failed {}, interrupted {}, base {}",
+        "parallel 完成: integrated {} (ff {}) / completed {}, merged {}, conflict workspaces {}, failed {}, interrupted {}, base {}",
         summary.applied.len(),
         summary.applied.len().saturating_sub(summary.merged.len()),
         summary.completed.len(),
         summary.merged.len(),
+        summary.merge_workspaces.len(),
         summary.failed.len(),
         summary.interrupted.len(),
         summary.base_commit
@@ -1290,6 +1351,169 @@ fn cmd_merge(task_id: &str, yes: bool) -> i32 {
     }
 }
 
+fn open_task_for_merge(
+    task_id: &str,
+) -> Result<(PathBuf, std::sync::Arc<zealous_engine::ledger::Ledger>), String> {
+    let repo = repo_root().map_err(|e| e.to_string())?;
+    let tid = zealous_core::TaskId::parse(task_id).map_err(|e| e.to_string())?;
+    let service = svc().map_err(|e| e.to_string())?;
+    let (ledger, _, _) = service.open_task(&tid).map_err(|e| e.to_string())?;
+    Ok((repo, std::sync::Arc::new(ledger)))
+}
+
+fn cmd_merge_workspace(task_id: &str) -> i32 {
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
+    let (repo, ledger) = match open_task_for_merge(task_id) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    match zealous_engine::merge_workspace::start(&repo, &tid, &ledger) {
+        Ok(zealous_engine::merge_workspace::StartOutcome::Integrated {
+            branch,
+            merge_commit,
+            task_tip,
+            ..
+        }) => {
+            println!("merged: {branch} @ {merge_commit} (task tip {task_tip})");
+            0
+        }
+        Ok(zealous_engine::merge_workspace::StartOutcome::Conflicted {
+            branch,
+            path,
+            main_head,
+            task_branch,
+            task_tip,
+            files,
+        }) => {
+            println!("status:        conflicted");
+            println!("workspace:    {}", path.display());
+            println!("merge branch: {branch}");
+            println!("main head:    {main_head}");
+            println!("task branch:  {task_branch}");
+            println!("task tip:     {task_tip}");
+            println!("conflicted files:");
+            if files.is_empty() {
+                println!("  (none reported)");
+            }
+            for file in files {
+                println!("  {file}");
+            }
+            println!("请在上述 workspace 中手动解决冲突并 git add;然后执行:");
+            println!("  zealous task merge-continue {task_id}");
+            println!("或中止:");
+            println!("  zealous task merge-abort {task_id}");
+            0
+        }
+        Err(e) => err(format!("merge workspace: {e}")),
+    }
+}
+
+fn cmd_merge_status(task_id: &str) -> i32 {
+    let (repo, ledger) = match open_task_for_merge(task_id) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    match zealous_engine::merge_workspace::status(&repo, &ledger) {
+        Ok(status) => {
+            println!("status:        {}", status.status);
+            println!("workspace:    {}", status.path);
+            println!("merge branch: {}", status.branch);
+            println!("main head:    {}", status.main_head);
+            println!("task branch:  {}", status.task_branch);
+            println!("task tip:     {}", status.task_tip);
+            if let Some(commit) = status.merge_commit {
+                println!("merge commit: {commit}");
+            }
+            println!("unresolved files:");
+            if status.unresolved_files.is_empty() {
+                println!("  (none)");
+            }
+            for file in status.unresolved_files {
+                println!("  {file}");
+            }
+            0
+        }
+        Err(e) => err(format!("merge status: {e}")),
+    }
+}
+
+fn cmd_merge_continue(task_id: &str, yes: bool) -> i32 {
+    let (repo, ledger) = match open_task_for_merge(task_id) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    if !yes {
+        match zealous_engine::merge_workspace::status(&repo, &ledger) {
+            Ok(status) => {
+                println!("merge branch: {}", status.branch);
+                println!("main head:    {}", status.main_head);
+                println!("task tip:     {}", status.task_tip);
+                println!("unresolved files:");
+                for file in &status.unresolved_files {
+                    println!("  {file}");
+                }
+            }
+            Err(e) => return err(format!("merge status: {e}")),
+        }
+        print!("确认提交已 stage 的手动解决结果? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return err("读取确认失败");
+        }
+        let answer = line.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("已取消");
+            return 0;
+        }
+    }
+    match zealous_engine::merge_workspace::continue_merge(&repo, &ledger) {
+        Ok(commit) => {
+            println!("merged: {commit}");
+            0
+        }
+        Err(e) => err(format!("merge continue: {e}")),
+    }
+}
+
+fn cmd_merge_abort(task_id: &str, force: bool, yes: bool) -> i32 {
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
+    let (repo, ledger) = match open_task_for_merge(task_id) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    if force && !yes {
+        println!("警告:--force 会丢弃 merge workspace 中尚未提交的用户修改。");
+        print!("确认强制中止? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return err("读取确认失败");
+        }
+        let answer = line.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("已取消");
+            return 0;
+        }
+    }
+    let _ = tid;
+    match zealous_engine::merge_workspace::abort(&repo, &ledger, force) {
+        Ok(()) => {
+            println!("merge workspace aborted");
+            0
+        }
+        Err(e) => err(format!("merge abort: {e}")),
+    }
+}
+
 fn cmd_workspace(task_id: &str) -> i32 {
     let repo = match repo_root() {
         Ok(r) => r,
@@ -1330,6 +1554,17 @@ fn cmd_workspace(task_id: &str) -> i32 {
     }
     if let Some(commit) = &proj.merge_commit {
         println!("merge_commit:    {commit}");
+    }
+    if let Some(merge_ws) = &proj.merge_workspace {
+        println!("merge_workspace: {}", merge_ws.path);
+        println!("merge_ws_branch: {}", merge_ws.branch);
+        println!("merge_ws_status: {}", merge_ws.status);
+    }
+    if !proj.merge_conflicts.is_empty() {
+        println!("merge_conflicts:");
+        for file in &proj.merge_conflicts {
+            println!("  {file}");
+        }
     }
     println!("workspace_removed: {}", proj.workspace_removed);
     // 活分支 tip(来自 git 事实,仅展示)

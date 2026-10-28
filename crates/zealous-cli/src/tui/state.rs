@@ -31,6 +31,8 @@ pub enum Screen {
     Queue,
     /// 并行状态视图(spec 157)
     Parallel,
+    /// merge workspace 状态视图(spec 159)
+    MergeStatus,
 }
 
 /// 新建任务表单草稿
@@ -49,6 +51,9 @@ pub enum ConfirmKind {
     IsolatedRun,
     Apply,
     Merge,
+    MergeWorkspace,
+    MergeContinue,
+    MergeAbort,
     WorkspaceRemove,
     /// spec 156:串行运行全部可运行 queued 任务(auto apply)
     QueueRun,
@@ -72,6 +77,8 @@ pub struct TuiState {
     pub parallel_ids: Vec<TaskId>,
     /// spec 157:parallel status 文本(Shift+Q 视图)
     pub parallel_status_text: Option<String>,
+    /// spec 159:merge workspace 状态文本
+    pub merge_status_text: Option<String>,
     pub tasks: Vec<TaskSummary>,
     pub selected: usize,
     pub detail: Option<TaskProjection>,
@@ -111,6 +118,7 @@ impl TuiState {
             queue_status_text: None,
             parallel_ids: Vec::new(),
             parallel_status_text: None,
+            merge_status_text: None,
             tasks: Vec::new(),
             selected: 0,
             detail: None,
@@ -373,6 +381,17 @@ mod tests {
         s.open_confirm(ConfirmKind::Merge);
         assert_eq!(s.confirm, Some(ConfirmKind::Merge));
         assert_eq!(s.take_confirm(), Some(ConfirmKind::Merge));
+    }
+
+    #[test]
+    fn merge_workspace_confirmation_and_status_screen() {
+        let mut s = TuiState::new();
+        s.open_confirm(ConfirmKind::MergeWorkspace);
+        assert_eq!(s.confirm, Some(ConfirmKind::MergeWorkspace));
+        assert_eq!(s.take_confirm(), Some(ConfirmKind::MergeWorkspace));
+        s.merge_status_text = Some("status: conflicted".into());
+        s.screen = Screen::MergeStatus;
+        assert_eq!(s.screen, Screen::MergeStatus);
     }
 
     #[test]

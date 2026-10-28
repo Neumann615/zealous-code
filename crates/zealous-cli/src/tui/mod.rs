@@ -290,6 +290,82 @@ fn handle_key(
                         }
                     }
                 }
+                state::ConfirmKind::MergeWorkspace => {
+                    if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, _proj, _)) => {
+                                match zealous_engine::merge_workspace::start(
+                                    svc.repo_root(),
+                                    &task_id,
+                                    &ledger,
+                                ) {
+                                    Ok(zealous_engine::merge_workspace::StartOutcome::Integrated {
+                                        branch,
+                                        merge_commit,
+                                        task_tip,
+                                        ..
+                                    }) => state.push_important(&format!(
+                                        "merged workspace: {branch} @ {merge_commit} (tip {task_tip})"
+                                    )),
+                                    Ok(zealous_engine::merge_workspace::StartOutcome::Conflicted {
+                                        path,
+                                        files,
+                                        ..
+                                    }) => {
+                                        state.push_important(&format!(
+                                            "merge conflicts retained: {} ({})",
+                                            path.display(),
+                                            files.join(", ")
+                                        ));
+                                    }
+                                    Err(e) => state.push_important(&format!(
+                                        "merge workspace 失败: {e}"
+                                    )),
+                                }
+                            }
+                            Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
+                state::ConfirmKind::MergeContinue => {
+                    if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, _proj, _)) => {
+                                match zealous_engine::merge_workspace::continue_merge(
+                                    svc.repo_root(),
+                                    &ledger,
+                                ) {
+                                    Ok(commit) => {
+                                        state.push_important(&format!("merge continued: {commit}"))
+                                    }
+                                    Err(e) => {
+                                        state.push_important(&format!("merge continue 失败: {e}"))
+                                    }
+                                }
+                            }
+                            Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
+                state::ConfirmKind::MergeAbort => {
+                    if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, _proj, _)) => {
+                                match zealous_engine::merge_workspace::abort(
+                                    svc.repo_root(),
+                                    &ledger,
+                                    false,
+                                ) {
+                                    Ok(()) => state.push_important("merge workspace aborted"),
+                                    Err(e) => {
+                                        state.push_important(&format!("merge abort 失败: {e}"))
+                                    }
+                                }
+                            }
+                            Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
                 state::ConfirmKind::Merge => {
                     if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
                         match svc.open_task(&task_id) {
@@ -531,7 +607,7 @@ fn handle_key(
             }
             _ => {}
         },
-        Screen::Queue | Screen::Parallel => match key.code {
+        Screen::Queue | Screen::Parallel | Screen::MergeStatus => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => state.screen = Screen::List,
             _ => {}
         },
@@ -558,8 +634,49 @@ fn handle_key(
             KeyCode::Char('P') => {
                 state.open_confirm(state::ConfirmKind::Apply);
             }
-            KeyCode::Char('M') => {
+            KeyCode::Char('m') => {
                 state.open_confirm(state::ConfirmKind::Merge);
+            }
+            KeyCode::Char('M') => {
+                state.open_confirm(state::ConfirmKind::MergeWorkspace);
+            }
+            KeyCode::Char('S') => {
+                if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                    match svc.open_task(&task_id) {
+                        Ok((ledger, _proj, _)) => {
+                            match zealous_engine::merge_workspace::status(svc.repo_root(), &ledger)
+                            {
+                                Ok(status) => {
+                                    let mut text = format!(
+                                        "status: {}\nworkspace: {}\nmerge branch: {}\nmain head: {}\ntask tip: {}\n",
+                                        status.status,
+                                        status.path,
+                                        status.branch,
+                                        status.main_head,
+                                        status.task_tip
+                                    );
+                                    text.push_str("unresolved files:\n");
+                                    if status.unresolved_files.is_empty() {
+                                        text.push_str("  (none)\n");
+                                    }
+                                    for file in status.unresolved_files {
+                                        text.push_str(&format!("  {file}\n"));
+                                    }
+                                    state.merge_status_text = Some(text);
+                                    state.screen = Screen::MergeStatus;
+                                }
+                                Err(e) => state.set_error(e.to_string()),
+                            }
+                        }
+                        Err(e) => state.set_error(e.to_string()),
+                    }
+                }
+            }
+            KeyCode::Char('C') => {
+                state.open_confirm(state::ConfirmKind::MergeContinue);
+            }
+            KeyCode::Char('A') => {
+                state.open_confirm(state::ConfirmKind::MergeAbort);
             }
             KeyCode::Char('D') if state.workspace_visible => {
                 state.open_confirm(state::ConfirmKind::WorkspaceRemove);

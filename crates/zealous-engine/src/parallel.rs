@@ -25,6 +25,24 @@ pub enum IntegrationStrategy {
     Merge,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConflictStrategy {
+    Abort,
+    Workspace,
+}
+
+impl OnConflictStrategy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "abort" => Ok(Self::Abort),
+            "workspace" => Ok(Self::Workspace),
+            other => Err(format!(
+                "unknown on-conflict strategy {other:?}; expected abort or workspace"
+            )),
+        }
+    }
+}
+
 impl IntegrationStrategy {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
@@ -125,6 +143,7 @@ pub type OnApplyStartedFn<'a> = Box<dyn FnMut(&TaskId) + 'a>;
 pub type OnApplyFinishedFn<'a> = Box<dyn FnMut(&TaskId, bool, String) + 'a>;
 pub type OnMergeStartedFn<'a> = Box<dyn FnMut(&TaskId) + 'a>;
 pub type OnMergeFinishedFn<'a> = Box<dyn FnMut(&TaskId, bool, String) + 'a>;
+pub type OnMergeConflictFn<'a> = Box<dyn FnMut(&TaskId, Vec<String>) + 'a>;
 pub type ConfirmApplyFn<'a> = Box<dyn FnMut(&TaskId) -> bool + 'a>;
 
 pub struct ParallelHooks<'a> {
@@ -134,6 +153,7 @@ pub struct ParallelHooks<'a> {
     pub on_apply_finished: OnApplyFinishedFn<'a>,
     pub on_merge_started: OnMergeStartedFn<'a>,
     pub on_merge_finished: OnMergeFinishedFn<'a>,
+    pub on_merge_conflict: OnMergeConflictFn<'a>,
     pub confirm_apply: ConfirmApplyFn<'a>,
 }
 
@@ -145,6 +165,8 @@ pub struct ParallelSummary {
     pub interrupted: Vec<TaskId>,
     pub applied: Vec<TaskId>,
     pub merged: Vec<TaskId>,
+    pub merge_workspaces: Vec<TaskId>,
+    pub merge_conflicts: Vec<(TaskId, Vec<String>)>,
     pub stopped_reason: String,
 }
 
@@ -165,6 +187,7 @@ pub fn run_parallel(
     task_ids: &[TaskId],
     auto_apply: bool,
     integration: IntegrationStrategy,
+    on_conflict: OnConflictStrategy,
     approval_sink: Arc<dyn ParallelApprovalSink>,
     progress: Option<SharedSink>,
     abort: Arc<AtomicBool>,
@@ -309,26 +332,73 @@ pub fn run_parallel(
         let should_merge =
             integration == IntegrationStrategy::Merge && current_head != summary.base_commit;
         if should_merge {
-            (hooks.on_merge_started)(&id);
-            match workspace::merge(repo_root, &ledger) {
-                Ok(outcome) => {
-                    (hooks.on_merge_finished)(
-                        &id,
-                        true,
-                        format!(
-                            "{} @ {} (task tip {})",
-                            outcome.branch, outcome.merge_commit, outcome.task_tip
-                        ),
-                    );
-                    summary.applied.push(id.clone());
-                    summary.merged.push(id);
+            if on_conflict == OnConflictStrategy::Workspace {
+                match crate::merge_workspace::start(repo_root, &id, &ledger) {
+                    Ok(crate::merge_workspace::StartOutcome::Integrated {
+                        branch,
+                        merge_commit,
+                        task_tip,
+                        ..
+                    }) => {
+                        (hooks.on_merge_started)(&id);
+                        (hooks.on_merge_finished)(
+                            &id,
+                            true,
+                            format!("{branch} @ {merge_commit} (task tip {task_tip})"),
+                        );
+                        summary.applied.push(id.clone());
+                        summary.merged.push(id);
+                    }
+                    Ok(crate::merge_workspace::StartOutcome::Conflicted {
+                        branch,
+                        main_head,
+                        task_tip,
+                        files,
+                        ..
+                    }) => {
+                        (hooks.on_merge_conflict)(&id, files.clone());
+                        summary.merge_workspaces.push(id.clone());
+                        summary.merge_conflicts.push((id.clone(), files.clone()));
+                        summary.stopped_reason = format!(
+                            "merge conflict retained in workspace for {id}: {} @ {} (task tip {}); files: {}",
+                            branch,
+                            main_head,
+                            task_tip,
+                            files.join(", ")
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        let detail = e.to_string();
+                        (hooks.on_merge_finished)(&id, false, detail.clone());
+                        summary.stopped_reason = format!(
+                            "merge workspace failed for {id}: {detail}; later tasks are stopped"
+                        );
+                        break;
+                    }
                 }
-                Err(e) => {
-                    let detail = e.to_string();
-                    (hooks.on_merge_finished)(&id, false, detail.clone());
-                    summary.stopped_reason =
-                        format!("merge failed for {id}: {detail}; later tasks are stopped");
-                    break;
+            } else {
+                (hooks.on_merge_started)(&id);
+                match workspace::merge(repo_root, &ledger) {
+                    Ok(outcome) => {
+                        (hooks.on_merge_finished)(
+                            &id,
+                            true,
+                            format!(
+                                "{} @ {} (task tip {})",
+                                outcome.branch, outcome.merge_commit, outcome.task_tip
+                            ),
+                        );
+                        summary.applied.push(id.clone());
+                        summary.merged.push(id);
+                    }
+                    Err(e) => {
+                        let detail = e.to_string();
+                        (hooks.on_merge_finished)(&id, false, detail.clone());
+                        summary.stopped_reason =
+                            format!("merge failed for {id}: {detail}; later tasks are stopped");
+                        break;
+                    }
                 }
             }
         } else {
@@ -467,6 +537,7 @@ mod tests {
             on_apply_finished: Box::new(|_, _, _| {}),
             on_merge_started: Box::new(|_| {}),
             on_merge_finished: Box::new(|_, _, _| {}),
+            on_merge_conflict: Box::new(|_, _| {}),
             confirm_apply: Box::new(|_| true),
         }
     }
@@ -526,6 +597,7 @@ mod tests {
             &[a.clone(), b.clone()],
             true,
             IntegrationStrategy::FastForwardOnly,
+            OnConflictStrategy::Abort,
             Arc::new(AutoParallelApprove),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -569,6 +641,7 @@ mod tests {
             &[a.clone(), b.clone()],
             true,
             IntegrationStrategy::Merge,
+            OnConflictStrategy::Abort,
             Arc::new(AutoParallelApprove),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -592,6 +665,55 @@ mod tests {
     }
 
     #[test]
+    fn workspace_conflict_strategy_retains_merge_workspace() {
+        let _provider_env = provider_env();
+        let dir = repo("on-conflict-workspace");
+        let svc = TaskService::new(dir.clone());
+        let a = task(&svc, "A");
+        let b = task(&svc, "B");
+        let lease = try_acquire(&dir, "parallel", "parallel").unwrap();
+        let mut h = hooks();
+        let summary = run_parallel(
+            &dir,
+            &svc,
+            vec![
+                provider("a.txt", "a", "a-left"),
+                provider("a.txt", "a", "a-right"),
+            ],
+            "mock".into(),
+            16,
+            &[a.clone(), b.clone()],
+            true,
+            IntegrationStrategy::Merge,
+            OnConflictStrategy::Workspace,
+            Arc::new(AutoParallelApprove),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            &lease,
+            &mut h,
+        );
+        assert_eq!(summary.completed, vec![a.clone(), b.clone()]);
+        assert_eq!(summary.applied, vec![a.clone()]);
+        assert_eq!(summary.merge_workspaces, vec![b.clone()]);
+        assert_eq!(
+            summary.merge_conflicts,
+            vec![(b.clone(), vec!["a.txt".to_string()])]
+        );
+        assert!(
+            !summary.stopped_reason.is_empty(),
+            "{}",
+            summary.stopped_reason
+        );
+        assert!(std::fs::read_to_string(dir.join("a.txt"))
+            .unwrap()
+            .contains("a-left"));
+        assert!(crate::merge_workspace::merge_path(&dir, &b).exists());
+        let (_ledger, proj, _) = svc.open_task(&b).unwrap();
+        assert_eq!(proj.merge_conflicts, vec!["a.txt".to_string()]);
+        assert_eq!(proj.merge_workspace.as_ref().unwrap().status, "conflicted");
+    }
+
+    #[test]
     fn failure_retains_worktree_and_completed_task_applies() {
         let _provider_env = provider_env();
         let dir = repo("failure");
@@ -609,6 +731,7 @@ mod tests {
             &[a.clone(), b.clone()],
             true,
             IntegrationStrategy::FastForwardOnly,
+            OnConflictStrategy::Abort,
             Arc::new(AutoParallelApprove),
             None,
             Arc::new(AtomicBool::new(false)),

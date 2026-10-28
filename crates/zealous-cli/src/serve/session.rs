@@ -72,6 +72,7 @@ pub struct ParallelShared {
     pub interrupted: Mutex<Vec<String>>,
     pub applied: Mutex<Vec<String>>,
     pub merged: Mutex<Vec<String>>,
+    pub merge_workspaces: Mutex<Vec<String>>,
     pub apply_index: AtomicUsize,
     pub finished: AtomicBool,
     pub approvals: Arc<ParallelApprovals>,
@@ -203,6 +204,12 @@ impl Session {
             "get_parallel_status" => Handled::Response(self.handle_get_parallel_status(&req)),
             "apply_task" => Handled::Response(self.handle_apply_task(&req)),
             "merge_task" => Handled::Response(self.handle_merge_task(&req)),
+            "start_merge_workspace" => Handled::Response(self.handle_start_merge_workspace(&req)),
+            "get_merge_status" => Handled::Response(self.handle_get_merge_status(&req)),
+            "continue_merge_workspace" => {
+                Handled::Response(self.handle_continue_merge_workspace(&req))
+            }
+            "abort_merge_workspace" => Handled::Response(self.handle_abort_merge_workspace(&req)),
             "get_workspace" => Handled::Response(self.handle_get_workspace(&req)),
             "remove_workspace" => Handled::Response(self.handle_remove_workspace(&req)),
             "shutdown" => {
@@ -241,6 +248,7 @@ impl Session {
                             "isolated_worktree": true,
                             "parallel_tasks": parallel_mod::MAX_PARALLEL_TASKS,
                             "merge_task": true,
+                            "merge_workspace": true,
                         }
                     }),
                 )
@@ -872,6 +880,15 @@ impl Session {
             Ok(strategy) => strategy,
             Err(e) => return err_resp(req.id, "invalid_params", e),
         };
+        let on_conflict = req
+            .params
+            .get("on_conflict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("abort");
+        let on_conflict_strategy = match parallel_mod::OnConflictStrategy::parse(on_conflict) {
+            Ok(strategy) => strategy,
+            Err(e) => return err_resp(req.id, "invalid_params", e),
+        };
         let mut task_ids: Vec<TaskId> = Vec::new();
         if all {
             match parallel_mod::select_runnable(&self.svc, max) {
@@ -938,6 +955,7 @@ impl Session {
             interrupted: Mutex::new(Vec::new()),
             applied: Mutex::new(Vec::new()),
             merged: Mutex::new(Vec::new()),
+            merge_workspaces: Mutex::new(Vec::new()),
             apply_index: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
             approvals: Arc::new(ParallelApprovals {
@@ -1021,6 +1039,45 @@ impl Session {
                         tid.as_str(),
                     ));
                 }),
+                on_merge_conflict: Box::new(|tid, files| {
+                    shared_t
+                        .merge_workspaces
+                        .lock()
+                        .unwrap()
+                        .push(tid.as_str().to_string());
+                    let main_head = std::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(&repo)
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    let task_tip = std::process::Command::new("git")
+                        .args(["rev-parse", &format!("refs/heads/zealous/{}", tid.as_str())])
+                        .current_dir(&repo)
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    let merge_branch = format!("zealous-merge/{}", tid.as_str());
+                    let params = serde_json::json!({
+                        "task_id": tid.as_str(),
+                        "merge_branch": merge_branch,
+                        "main_head": main_head,
+                        "task_tip": task_tip,
+                        "files": files
+                    });
+                    let _ = notif.send(Notification {
+                        event: "merge_workspace_started",
+                        params: params.clone(),
+                    });
+                    let _ = notif.send(Notification {
+                        event: "merge_conflict_pending",
+                        params,
+                    });
+                }),
                 on_merge_finished: Box::new(|tid, ok, detail| {
                     if ok {
                         shared_t
@@ -1050,6 +1107,7 @@ impl Session {
                 &task_ids,
                 auto_apply,
                 integration,
+                on_conflict_strategy,
                 approval_sink,
                 None,
                 shared_t.abort.clone(),
@@ -1061,12 +1119,13 @@ impl Session {
             let _ = notif.send(Notification::progress(
                 "parallel_finished",
                 &format!(
-                    "completed={} failed={} interrupted={} integrated={} merged={} base={} stopped={}",
+                    "completed={} failed={} interrupted={} integrated={} merged={} conflict_workspaces={} base={} stopped={}",
                     summary.completed.len(),
                     summary.failed.len(),
                     summary.interrupted.len(),
                     summary.applied.len(),
                     summary.merged.len(),
+                    summary.merge_workspaces.len(),
                     summary.base_commit,
                     summary.stopped_reason
                 ),
@@ -1076,7 +1135,7 @@ impl Session {
         self.parallel_join = Some(join);
         Response::ok(
             req.id,
-            serde_json::json!({ "parallel_started": true, "total": total, "base_commit": base_commit, "integrate": integrate }),
+            serde_json::json!({ "parallel_started": true, "total": total, "base_commit": base_commit, "integrate": integrate, "on_conflict": on_conflict }),
         )
     }
 
@@ -1102,6 +1161,7 @@ impl Session {
                     "interrupted": p.interrupted.lock().unwrap().clone(),
                     "applied": p.applied.lock().unwrap().clone(),
                     "merged": p.merged.lock().unwrap().clone(),
+                    "merge_workspaces": p.merge_workspaces.lock().unwrap().clone(),
                     "apply_index": p.apply_index.load(Ordering::SeqCst),
                     "total": p.task_ids.len(),
                     "apply_policy": if p.auto_apply { "auto" } else { "confirm" },
@@ -1186,6 +1246,221 @@ impl Session {
                     .send(Notification::error_occurred(&e.to_string()));
                 err_resp(req.id, "merge_failed", e.to_string())
             }
+        }
+    }
+
+    fn merge_note(
+        &self,
+        event: &'static str,
+        task_id: &TaskId,
+        status: &zealous_engine::merge_workspace::Status,
+    ) {
+        let _ = self.notif_tx.send(Notification {
+            event,
+            params: serde_json::json!({
+                "task_id": task_id.as_str(),
+                "merge_branch": status.branch,
+                "main_head": status.main_head,
+                "task_tip": status.task_tip,
+                "files": status.unresolved_files,
+                "workspace_status": status.status,
+                "merge_commit": status.merge_commit
+            }),
+        });
+    }
+
+    fn handle_start_merge_workspace(&self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let (ledger, _projection, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        let branch = zealous_engine::merge_workspace::merge_branch(&task_id);
+        let main_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let task_tip = std::process::Command::new("git")
+            .args([
+                "rev-parse",
+                &format!("refs/heads/zealous/{}", task_id.as_str()),
+            ])
+            .current_dir(&self.repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let _ = self.notif_tx.send(Notification {
+            event: "merge_workspace_started",
+            params: serde_json::json!({
+                "task_id": task_id.as_str(),
+                "merge_branch": branch,
+                "main_head": main_head,
+                "task_tip": task_tip,
+                "files": []
+            }),
+        });
+        match zealous_engine::merge_workspace::start(&self.repo_root, &task_id, &ledger) {
+            Ok(zealous_engine::merge_workspace::StartOutcome::Integrated {
+                branch,
+                base_commit,
+                task_tip,
+                merge_commit,
+            }) => {
+                let _ = self.notif_tx.send(Notification {
+                    event: "merge_task_integrated",
+                    params: serde_json::json!({
+                        "task_id": task_id.as_str(),
+                        "merge_branch": branch,
+                        "main_head": merge_commit,
+                        "task_tip": task_tip,
+                        "files": [],
+                        "merge_commit": merge_commit
+                    }),
+                });
+                Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "integrated": true,
+                        "conflicted": false,
+                        "branch": branch,
+                        "base_commit": base_commit,
+                        "task_tip": task_tip,
+                        "merge_commit": merge_commit
+                    }),
+                )
+            }
+            Ok(zealous_engine::merge_workspace::StartOutcome::Conflicted {
+                branch,
+                path,
+                main_head,
+                task_branch,
+                task_tip,
+                files,
+            }) => {
+                let _ = self.notif_tx.send(Notification {
+                    event: "merge_conflict_pending",
+                    params: serde_json::json!({
+                        "task_id": task_id.as_str(),
+                        "merge_branch": branch,
+                        "main_head": main_head,
+                        "task_tip": task_tip,
+                        "files": files,
+                        "workspace_status": "conflicted"
+                    }),
+                });
+                Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "integrated": false,
+                        "conflicted": true,
+                        "branch": task_branch,
+                        "merge_branch": branch,
+                        "path": path,
+                        "main_head": main_head,
+                        "task_tip": task_tip,
+                        "files": files
+                    }),
+                )
+            }
+            Err(e) => {
+                let _ = self
+                    .notif_tx
+                    .send(Notification::error_occurred(&e.to_string()));
+                err_resp(req.id, "merge_workspace_failed", e.to_string())
+            }
+        }
+    }
+
+    fn handle_get_merge_status(&self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let (ledger, _projection, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        match zealous_engine::merge_workspace::status(&self.repo_root, &ledger) {
+            Ok(status) => Response::ok(
+                req.id,
+                serde_json::json!({
+                    "status": status.status,
+                    "branch": status.branch,
+                    "path": status.path,
+                    "main_head": status.main_head,
+                    "task_branch": status.task_branch,
+                    "task_tip": status.task_tip,
+                    "merge_commit": status.merge_commit,
+                    "unresolved_files": status.unresolved_files
+                }),
+            ),
+            Err(e) => err_resp(req.id, "merge_workspace_not_found", e.to_string()),
+        }
+    }
+
+    fn handle_continue_merge_workspace(&self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let (ledger, _projection, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        match zealous_engine::merge_workspace::continue_merge(&self.repo_root, &ledger) {
+            Ok(commit) => {
+                let status = zealous_engine::merge_workspace::status(&self.repo_root, &ledger).ok();
+                if let Some(status) = status {
+                    self.merge_note("merge_workspace_continued", &task_id, &status);
+                }
+                Response::ok(
+                    req.id,
+                    serde_json::json!({ "merged": true, "merge_commit": commit }),
+                )
+            }
+            Err(zealous_engine::merge_workspace::MergeWorkspaceError::UnresolvedFiles(files)) => {
+                err_resp(
+                    req.id,
+                    "unresolved_conflicts",
+                    format!("unresolved conflict files: {}", files.join(", ")),
+                )
+            }
+            Err(e) => err_resp(req.id, "merge_continue_failed", e.to_string()),
+        }
+    }
+
+    fn handle_abort_merge_workspace(&self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let force = req
+            .params
+            .get("force")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let (ledger, _projection, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        let note_status = zealous_engine::merge_workspace::status(&self.repo_root, &ledger).ok();
+        match zealous_engine::merge_workspace::abort(&self.repo_root, &ledger, force) {
+            Ok(()) => {
+                if let Some(status) = note_status {
+                    self.merge_note("merge_workspace_aborted", &task_id, &status);
+                }
+                Response::ok(req.id, serde_json::json!({ "aborted": true }))
+            }
+            Err(e) => err_resp(req.id, "merge_abort_failed", e.to_string()),
         }
     }
 

@@ -293,6 +293,13 @@ pub fn spawn_parallel(
                     tid.as_str()
                 ));
             }),
+            on_merge_conflict: Box::new(|tid, files| {
+                progress_sink.progress(&format!(
+                    "parallel task {} merge conflict workspace: {}",
+                    tid.as_str(),
+                    files.join(", ")
+                ));
+            }),
             on_apply_finished: Box::new(|tid, ok, detail| {
                 let mark = if ok { "成功" } else { "失败" };
                 progress_sink.progress(&format!(
@@ -311,6 +318,7 @@ pub fn spawn_parallel(
             &task_ids,
             true,
             zealous_engine::parallel::IntegrationStrategy::FastForwardOnly,
+            zealous_engine::parallel::OnConflictStrategy::Abort,
             Arc::new(approval_sink),
             Some(progress),
             abort,
@@ -318,12 +326,13 @@ pub fn spawn_parallel(
             &mut hooks,
         );
         let _ = event_tx.send(TuiEvent::ParallelFinished(format!(
-            "completed={} failed={} interrupted={} integrated={} merged={} base={} stopped={}",
+            "completed={} failed={} interrupted={} integrated={} merged={} conflict_workspaces={} base={} stopped={}",
             summary.completed.len(),
             summary.failed.len(),
             summary.interrupted.len(),
             summary.applied.len(),
             summary.merged.len(),
+            summary.merge_workspaces.len(),
             summary.base_commit,
             summary.stopped_reason
         )));

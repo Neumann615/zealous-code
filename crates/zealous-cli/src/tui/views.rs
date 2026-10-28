@@ -40,12 +40,16 @@ pub fn render(f: &mut Frame, state: &mut TuiState) {
     render_task_list(f, cols[0], state);
     match state.screen {
         Screen::Detail => render_detail_full(f, cols[1], state),
-        Screen::Queue | Screen::Parallel => {
+        Screen::Queue | Screen::Parallel | Screen::MergeStatus => {
             let text = match state.screen {
                 Screen::Parallel => state
                     .parallel_status_text
                     .clone()
                     .unwrap_or_else(|| "(parallel status unavailable)".into()),
+                Screen::MergeStatus => state
+                    .merge_status_text
+                    .clone()
+                    .unwrap_or_else(|| "(merge status unavailable)".into()),
                 _ => state
                     .queue_status_text
                     .clone()
@@ -163,6 +167,15 @@ fn projection_lines(state: &TuiState, full: bool) -> Vec<Line<'static>> {
                 if let Some(commit) = &proj.merge_commit {
                     lines.push(Line::from(format!("  merge commit: {commit}")));
                 }
+                if let Some(merge_ws) = &proj.merge_workspace {
+                    lines.push(Line::from(format!(
+                        "  merge ws: {} [{}]",
+                        merge_ws.branch, merge_ws.status
+                    )));
+                }
+                for file in &proj.merge_conflicts {
+                    lines.push(Line::from(format!("  conflict: {file}")));
+                }
                 if proj.workspace_removed {
                     lines.push(Line::from("  (workspace 已清理)"));
                 }
@@ -219,7 +232,7 @@ fn render_detail_full(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let mut lines = projection_lines(state, true);
     if state.screen == Screen::Detail {
         lines.push(Line::from(format!(
-            "[{}] 事件流(R 运行/恢复 · P apply · M merge · x 中断 · a 批准 · d 拒绝 · e 事件流 · Esc 返回)",
+            "[{}] 事件流(R 运行/恢复 · P apply · m merge · Shift+M 冲突工作区 · Shift+S 状态 · C 继续 · A 中止 · x 中断 · a 批准 · d 拒绝 · e 事件流 · Esc 返回)",
             if state.events_expanded {
                 "已展开"
             } else {
@@ -299,6 +312,27 @@ fn render_confirm_modal(f: &mut Frame, state: &TuiState) {
             vec![
                 "将对 Completed isolated 任务执行 --no-ff 三方合并。".to_string(),
                 "Git 无法自动合并时立即 abort,不保留冲突 index。".to_string(),
+            ],
+        ),
+        super::state::ConfirmKind::MergeWorkspace => (
+            "Merge Workspace".to_string(),
+            vec![
+                "将在独立 worktree 中尝试三方合并。".to_string(),
+                "冲突会保留在现场,主工作区保持干净。".to_string(),
+            ],
+        ),
+        super::state::ConfirmKind::MergeContinue => (
+            "Merge Continue".to_string(),
+            vec![
+                "提交你已在 merge workspace 中 stage 的手动解决结果。".to_string(),
+                "unresolved files 非空时会拒绝。".to_string(),
+            ],
+        ),
+        super::state::ConfirmKind::MergeAbort => (
+            "Merge Abort".to_string(),
+            vec![
+                "中止并清理当前 merge workspace。".to_string(),
+                "存在额外修改时将拒绝,需 CLI --force。".to_string(),
             ],
         ),
         super::state::ConfirmKind::WorkspaceRemove => (
@@ -568,6 +602,8 @@ pub(crate) mod tests {
             applied_commit: None,
             applied_strategy: None,
             merge_commit: None,
+            merge_workspace: None,
+            merge_conflicts: Vec::new(),
             workspace_removed: false,
             interrupted_count: 1,
             last_event_seq: 9,

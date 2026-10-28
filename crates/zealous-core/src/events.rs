@@ -222,6 +222,21 @@ pub enum EventPayload {
         branch: String,
         applied_commit: String,
     },
+    /// spec 159:冲突解决工作区已创建并开始合并
+    MergeWorkspacePrepared {
+        branch: String,
+        path: String,
+        main_head: String,
+        task_branch: String,
+        task_tip: String,
+    },
+    MergeConflictPending {
+        files: Vec<String>,
+    },
+    MergeWorkspaceResolved {
+        merge_commit: String,
+    },
+    MergeWorkspaceAborted,
     /// spec 158:任务分支已三方合并回主工作区(仅无冲突成功时落账)
     ExecutionWorkspaceMerged {
         branch: String,

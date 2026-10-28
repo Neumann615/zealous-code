@@ -12,7 +12,9 @@ pub use events::{
     TaskStatus, EVENT_SCHEMA_VERSION, MAX_WORKERS,
 };
 pub use ids::{AgentRunId, TaskId, ToolCallId};
-pub use projection::{AppliedStrategy, FoldError, TaskProjection};
+pub use projection::{
+    AppliedStrategy, ExecutionWorkspaceView, FoldError, MergeWorkspaceView, TaskProjection,
+};
 
 // 状态机流转的唯一裁决在 `transition::can_transition`;
 // 账本健康检查(seq 连续、孤立引用)在 `projection::fold`。

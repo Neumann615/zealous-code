@@ -725,3 +725,198 @@ fn parallel_merge_endpoint() -> String {
     });
     format!("http://{addr}/v1")
 }
+
+#[test]
+fn cli_merge_workspace_conflict_continue_flow() {
+    let repo = base_repo("merge-workspace-cli");
+    let endpoint = conflicting_parallel_endpoint();
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let mut ids = Vec::new();
+    for title in ["conflict left", "conflict right"] {
+        let out = Command::new(zealous)
+            .args(["task", "new", title])
+            .current_dir(&repo)
+            .env("ZEALOUS_BASE_URL", &endpoint)
+            .env("ZEALOUS_API_KEY", "e2e-secret-key")
+            .env("ZEALOUS_MODEL", "mock-model")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        ids.push(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("task created: "))
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+    }
+
+    let out = Command::new(zealous)
+        .args([
+            "parallel",
+            "run",
+            ids[0].as_str(),
+            ids[1].as_str(),
+            "--auto-apply",
+            "--yes",
+        ])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "LEFT"
+    );
+
+    let out = Command::new(zealous)
+        .args(["task", "merge-workspace", ids[1].as_str()])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let started = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{started}");
+    assert!(started.contains("status:        conflicted"), "{started}");
+    assert!(started.contains("note.txt"), "{started}");
+    let workspace = repo.join(".zealous").join("merges").join(&ids[1]);
+    assert!(workspace.exists());
+    assert_eq!(git(&repo, &["status", "--porcelain"]).trim(), "");
+
+    let status = Command::new(zealous)
+        .args(["task", "merge-status", ids[1].as_str()])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let status_text = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(
+        status_text.contains("status:        conflicted"),
+        "{status_text}"
+    );
+    assert!(status_text.contains("unresolved files:"), "{status_text}");
+    assert!(status_text.contains("note.txt"), "{status_text}");
+
+    let continue_before = Command::new(zealous)
+        .args(["task", "merge-continue", ids[1].as_str(), "--yes"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(continue_before.status.code(), Some(1));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&continue_before.stdout),
+        String::from_utf8_lossy(&continue_before.stderr)
+    );
+    assert!(
+        combined.contains("unresolved conflict files: note.txt"),
+        "{combined}"
+    );
+
+    std::fs::write(workspace.join("note.txt"), "USER-RESOLVED\n").unwrap();
+    git(&workspace, &["add", "note.txt"]);
+    let out = Command::new(zealous)
+        .args(["task", "merge-continue", ids[1].as_str(), "--yes"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let continued = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{continued}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "USER-RESOLVED"
+    );
+    assert!(!workspace.exists());
+    assert!(repo.join(".zealous/worktrees").join(&ids[1]).exists());
+    assert_eq!(git(&repo, &["status", "--porcelain"]).trim(), "");
+
+    let ledger = std::fs::read_to_string(
+        repo.join(".zealous/tasks")
+            .join(&ids[1])
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    for needle in [
+        "MergeWorkspacePrepared",
+        "MergeConflictPending",
+        "MergeWorkspaceResolved",
+        "ExecutionWorkspaceMerged",
+    ] {
+        assert!(ledger.contains(needle), "missing {needle}");
+    }
+    assert!(!ledger.contains("e2e-secret-key"), "{ledger}");
+}
+
+fn conflicting_parallel_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let len = text
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&raw).to_string();
+        let left = request.contains("conflict left");
+        let content = if request.contains("tool `edit_file` result") {
+            r#"{"action":"message","text":"done"}"#
+        } else if request.contains("edit conflict") {
+            if left {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"LEFT"}}"#
+            } else {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"RIGHT"}}"#
+            }
+        } else if left {
+            r#"{"action":"plan","plan":"edit conflict left","workers":[]}"#
+        } else {
+            r#"{"action":"plan","plan":"edit conflict right","workers":[]}"#
+        };
+        let body = chat_body(content);
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    format!("http://{addr}/v1")
+}

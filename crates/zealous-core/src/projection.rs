@@ -68,6 +68,19 @@ pub struct ExecutionWorkspaceView {
     pub status: String,
 }
 
+/// spec 159:冲突解决工作区视图(只来自事件投影)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MergeWorkspaceView {
+    pub branch: String,
+    pub path: String,
+    pub main_head: String,
+    pub task_branch: String,
+    pub task_tip: String,
+    /// conflicted / resolved / integrated / aborted
+    pub status: String,
+    pub merge_commit: Option<String>,
+}
+
 /// Task 的完整投影:所有 UI/恢复判定只读这里,不读原始事件。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TaskProjection {
@@ -93,6 +106,10 @@ pub struct TaskProjection {
     pub applied_strategy: Option<AppliedStrategy>,
     /// spec 158:三方合并生成的 merge commit
     pub merge_commit: Option<String>,
+    /// spec 159:冲突解决工作区状态
+    pub merge_workspace: Option<MergeWorkspaceView>,
+    /// spec 159:待处理冲突文件;Resolved/Aborted/Integrated 后清空
+    pub merge_conflicts: Vec<String>,
     /// spec 155:workspace 是否已清理
     pub workspace_removed: bool,
 }
@@ -144,6 +161,8 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
         applied_commit: None,
         applied_strategy: None,
         merge_commit: None,
+        merge_workspace: None,
+        merge_conflicts: Vec::new(),
         workspace_removed: false,
     };
 
@@ -367,6 +386,71 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
             EventPayload::ErrorOccurred { scope, message } => {
                 proj.last_error = Some((scope.clone(), message.clone()));
             }
+            EventPayload::MergeWorkspacePrepared {
+                branch,
+                path,
+                main_head,
+                task_branch,
+                task_tip,
+            } => {
+                if let Some(existing) = &proj.merge_workspace {
+                    if existing.status != "aborted" {
+                        return Err(FoldError::OrphanReference {
+                            seq: event.seq,
+                            detail: "merge workspace 重复准备".into(),
+                        });
+                    }
+                }
+                proj.merge_workspace = Some(MergeWorkspaceView {
+                    branch: branch.clone(),
+                    path: path.clone(),
+                    main_head: main_head.clone(),
+                    task_branch: task_branch.clone(),
+                    task_tip: task_tip.clone(),
+                    status: "conflicted".into(),
+                    merge_commit: None,
+                });
+                proj.merge_conflicts.clear();
+            }
+            EventPayload::MergeConflictPending { files } => match &mut proj.merge_workspace {
+                Some(ws) if ws.status == "conflicted" => {
+                    proj.merge_conflicts = files.clone();
+                }
+                _ => {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "conflict 引用非 conflicted merge workspace".into(),
+                    })
+                }
+            },
+            EventPayload::MergeWorkspaceResolved { merge_commit } => {
+                match &mut proj.merge_workspace {
+                    Some(ws) if ws.status == "conflicted" => {
+                        ws.status = "resolved".into();
+                        ws.merge_commit = Some(merge_commit.clone());
+                        proj.merge_conflicts.clear();
+                    }
+                    _ => {
+                        return Err(FoldError::OrphanReference {
+                            seq: event.seq,
+                            detail: "resolve 引用非 conflicted merge workspace".into(),
+                        })
+                    }
+                }
+            }
+            EventPayload::MergeWorkspaceAborted => match &mut proj.merge_workspace {
+                Some(ws) if ws.status == "conflicted" => {
+                    ws.status = "aborted".into();
+                    ws.merge_commit = None;
+                    proj.merge_conflicts.clear();
+                }
+                _ => {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "abort 引用非 conflicted merge workspace".into(),
+                    })
+                }
+            },
             EventPayload::ExecutionWorkspacePrepared {
                 kind,
                 branch,
@@ -422,6 +506,12 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
                     proj.applied_commit = Some(merge_commit.clone());
                     proj.applied_strategy = Some(AppliedStrategy::ThreeWayMerge);
                     proj.merge_commit = Some(merge_commit.clone());
+                    if let Some(merge_ws) = &mut proj.merge_workspace {
+                        if merge_ws.status == "resolved" {
+                            merge_ws.status = "integrated".into();
+                        }
+                    }
+                    proj.merge_conflicts.clear();
                     let _ = task_tip;
                 }
                 _ => {
@@ -581,6 +671,83 @@ mod spec155_tests {
         assert_eq!(proj.applied_strategy, Some(AppliedStrategy::ThreeWayMerge));
         assert_eq!(proj.merge_commit.as_deref(), Some("merge"));
         assert_eq!(proj.execution_workspace.as_ref().unwrap().status, "applied");
+    }
+
+    #[test]
+    fn merge_workspace_lifecycle_fold() {
+        let tid = TaskId::generate();
+        let events = vec![
+            ev(
+                &tid,
+                1,
+                EventPayload::TaskCreated {
+                    title: "t".into(),
+                    repo_root: "r".into(),
+                },
+            ),
+            ev(
+                &tid,
+                2,
+                EventPayload::ExecutionWorkspacePrepared {
+                    kind: "git-worktree".into(),
+                    branch: "zealous/t1".into(),
+                    path: "r/.zealous/worktrees/t1".into(),
+                    base_branch: "main".into(),
+                    base_commit: "base".into(),
+                },
+            ),
+            ev(
+                &tid,
+                3,
+                EventPayload::MergeWorkspacePrepared {
+                    branch: "zealous-merge/t1".into(),
+                    path: "r/.zealous/merges/t1".into(),
+                    main_head: "main".into(),
+                    task_branch: "zealous/t1".into(),
+                    task_tip: "task".into(),
+                },
+            ),
+            ev(
+                &tid,
+                4,
+                EventPayload::MergeConflictPending {
+                    files: vec!["shared.md".into()],
+                },
+            ),
+        ];
+        let proj = fold(&tid, &events).unwrap();
+        let merge_ws = proj.merge_workspace.as_ref().unwrap();
+        assert_eq!(merge_ws.status, "conflicted");
+        assert_eq!(proj.merge_conflicts, vec!["shared.md".to_string()]);
+
+        let events = [
+            events,
+            vec![
+                ev(
+                    &tid,
+                    5,
+                    EventPayload::MergeWorkspaceResolved {
+                        merge_commit: "merge".into(),
+                    },
+                ),
+                ev(
+                    &tid,
+                    6,
+                    EventPayload::ExecutionWorkspaceMerged {
+                        branch: "zealous/t1".into(),
+                        base_commit: "base".into(),
+                        task_tip: "task".into(),
+                        merge_commit: "merge".into(),
+                        conflicted: false,
+                    },
+                ),
+            ],
+        ]
+        .concat();
+        let proj = fold(&tid, &events).unwrap();
+        assert_eq!(proj.merge_workspace.unwrap().status, "integrated");
+        assert!(proj.merge_conflicts.is_empty());
+        assert_eq!(proj.applied_strategy, Some(AppliedStrategy::ThreeWayMerge));
     }
 
     #[test]

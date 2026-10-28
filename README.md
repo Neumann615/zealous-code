@@ -59,6 +59,15 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    zealous task merge <task-id>
    ```
 
+   若三方合并存在冲突,可创建独立冲突解决工作区;主工作区保持干净,
+   你在 `.zealous/merges/<task-id>/` 中手动解决并 stage 后继续:
+
+   ```bash
+   zealous task merge-workspace <task-id>
+   zealous task merge-status <task-id>
+   zealous task merge-continue <task-id>
+   zealous task merge-abort <task-id>
+   ```
 
    多个 isolated 任务可串行执行并按顺序 fast-forward:
 
@@ -72,6 +81,7 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    ```bash
    zealous parallel run <task-id-1> <task-id-2> --auto-apply
    zealous parallel run <task-id-1> <task-id-2> --integrate merge
+   zealous parallel run <task-id-1> <task-id-2> --integrate merge --on-conflict workspace
    zealous parallel status
    ```
 
@@ -182,7 +192,12 @@ node scripts/update-agent-assets.mjs
 | `↑/↓` | 选择任务 | | `R` | 运行/恢复 |
 | `r` | 刷新列表 | | `x` | 中断任务 |
 | `Enter` | 打开详情 | | `a` / `d` | 批准/拒绝当前审批 |
-| `n` | 新建任务表单 | | `e` | 展开/收起事件流 |
+| `n` | 新建任务表单 | | `P` | apply |
+| `q` | 退出 | | `m` | merge |
+|  |  | | `Shift+M` | 创建 merge workspace |
+|  |  | | `Shift+S` | 查看 merge 状态 |
+|  |  | | `C` / `A` | 继续 / 中止 merge |
+|  |  | | `e` | 展开/收起事件流 |
 | `q` | 退出 | | `Esc` | 返回列表 |
 
 新建表单:title 必填;brief file 可选(相对当前 Git 仓库根)。
