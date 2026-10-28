@@ -90,6 +90,28 @@
   - 原 task worktree 保留;
   - 任务分支 tip `9012db509fda162afffb7a3fa471d21688e3370a` 保留。
 
+## LOCAL TRIAL release 回归 —— PASS
+
+- RC zip SHA256:`17BB4928B4CA2648C99CC73545C24FADBBFA54FBF99FE6344B581015685CE0CF`
+- 解压二进制:`%TEMP%\zealous-159-localtrial-e80886e9\bin\zealous.exe`
+- 仓库:`%TEMP%\zealous-159-localtrial-e80886e9`
+- base:`d42eac1c8249d925fad55a4baf7bc54d1b940918`
+- 任务:
+  - `task_01M622S3AFPA52492ZB953HR3N`:`value=0 → value=RELEASE-A`
+  - `task_01M622S3B2R29Z436X9VV5YVBB`:`value=0 → value=RELEASE-B`
+- 结果:
+  - 第一个任务 fast-forward 至
+    `454b4b23d90d2cd83274c65a4bdc21fa67343e18`;
+  - 第二个任务 `merge-workspace` 进入 conflicted;
+  - 主工作区保持干净;
+  - 用户在 merge workspace 写入
+    `value=RELEASE-RESOLVED` 并 stage;
+  - `merge-continue --yes` 成功,merge commit:
+    `0ac28cbb7cb89f5f3ef0c93118cd255f9fca3ca2`;
+  - merge workspace 清理,原 task worktree 保留;
+  - strategy=`three_way_merge`,merge workspace status=`integrated`;
+  - 无敏感信息泄漏。
+
 ## 账本审计
 
 对 DM1-DM4 全部任务账本检查:
