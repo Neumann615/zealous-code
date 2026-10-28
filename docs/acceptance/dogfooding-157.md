@@ -96,3 +96,16 @@
 PDF1 / PDF2 / PDF3 全部 PASS。无 P0 / P1。Alpha 的确定性行为是:
 第二个并行任务在第一个 apply 后不会自动 rebase / 三方合并,而是拒绝并保留
 worktree,交由用户手动处理。
+
+## 阶段末本地 bundle(spec 157)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-parallel157.bundle | 427818 | F27F4770439706207058FE9D28951A51DCD0170EDBA49240C8A301BED1534906 |
+
+- `git bundle verify` 通过,包含 main 至 RC record commit
+  `a376e8c04062814f56e99948dc5d8d9cf5ab5663`;
+- 本提交为 bundle rotation commit,按 spec 150 三段溯源模型不进入 bundle;
+- verify 通过后删除旧 `zealous-code-main-spec156.bundle`
+  (`6D31AA149D…CD623`,为新 bundle 历史前缀);
+- archive bundle 保留;OFFLINE RC lock 已刷新;仍不推 remote。
