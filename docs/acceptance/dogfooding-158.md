@@ -64,6 +64,24 @@
   - B worktree / branch 保留;
   - B ledger 记录 `workspace_merge` 错误,未落成功 Merged 事件。
 
+## LOCAL TRIAL release 回归 —— PASS
+
+- RC zip SHA256:`1CCAE69DD256E1DF945D748B2EB7CC6982AC94CC8D1649EAFA145E4D1FAC7580`
+- 解压二进制:`%TEMP%\zealous-158-localtrial-8f1a8d60\bin\zealous.exe`
+- 仓库:`%TEMP%\zealous-158-localtrial-8f1a8d60`
+- base:`ef8840d3ac9ca424b6416fdb8dae437b28c5c2df`
+- 任务:
+  - `task_01M61ZPNT1T2SV7HBBC9P2EXNE` 修改 `docs/A.md`
+  - `task_01M61ZPNTGSD5JT80FJJDEK919` 修改 `src/B.rs`
+- 结果:
+  - 两任务 Completed;
+  - 第一个任务 fast-forward;
+  - 第二个任务三方合并成功,merge commit:
+    `22653a6a3d4ca41435a8fe9b78cbe34e143b60e0`;
+  - 主分支同时包含两边修改,工作区干净;
+  - 第二个任务 workspace strategy=`three_way_merge`;
+  - 无敏感信息泄漏。
+
 ## 账本审计
 
 对 DM1 / DM2 / DM3 全部任务账本检查:
