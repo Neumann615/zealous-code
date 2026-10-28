@@ -127,3 +127,16 @@
 DM1 / DM2 / DM3 / DM4 全部 PASS。无 P0 / P1。
 Zealous 不自动选择 ours/theirs,不自动修改冲突文件,不改写任务分支;
 所有冲突解决均由用户在独立 merge workspace 手动完成并 stage。
+
+## 阶段末本地 bundle(spec 159)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-mergeworkspace159.bundle | 461740 | 5511C464136C1094DE7C02030F30C7497DD52833E2152C4991AB0FD06C52CBB7 |
+
+- `git bundle verify` 通过,包含 main 至 RC record commit
+  `197d50be0adaee36099556d212e3ef48ec7aed6e`;
+- 本提交为 bundle rotation commit,按 spec 150 三段溯源模型不进入 bundle;
+- verify 通过后删除旧 `zealous-code-main-parallelmerge158.bundle`
+  (`D677C72E05…4A64E`,为新 bundle 历史前缀);
+- archive bundle 保留;OFFLINE RC lock 已刷新;仍不自动推送 remote。
