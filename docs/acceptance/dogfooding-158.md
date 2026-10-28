@@ -98,3 +98,16 @@
 
 DM1 / DM2 / DM3 全部 PASS。无 P0 / P1。冲突处理保持 fail-closed,
 不自动选择侧,不自动 rebase,不自动解决冲突。
+
+## 阶段末本地 bundle(spec 158)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-parallelmerge158.bundle | 439251 | D677C72E05E2D12F151607D924DCA3BBC260FA731BE35D0D58C0E2058C24A64E |
+
+- `git bundle verify` 通过,包含 main 至 RC record commit
+  `4f0640af51adc77be757b56c0d4de140ff0f72a9`;
+- 本提交为 bundle rotation commit,按 spec 150 三段溯源模型不进入 bundle;
+- verify 通过后删除旧 `zealous-code-main-parallel157.bundle`
+  (`F27F4770439…534906`,为新 bundle 历史前缀);
+- archive bundle 保留;OFFLINE RC lock 已刷新;仍不自动推送 remote。
