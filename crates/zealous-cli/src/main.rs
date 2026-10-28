@@ -49,6 +49,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: QueueCmd,
     },
+    /// 并行任务 Alpha(spec 157;最多两个 isolated tasks)
+    Parallel {
+        #[command(subcommand)]
+        cmd: ParallelCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -74,6 +79,35 @@ enum QueueCmd {
         quiet: bool,
     },
     /// 查看队列状态(active / runnable / not runnable)
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ParallelCmd {
+    /// 并行执行任务(显式 IDs 按顺序;--all 按 TaskId 升序取前 max 个)
+    Run {
+        /// 按顺序执行并后续按此顺序 apply 的 task ids(与 --all 互斥)
+        task_ids: Vec<String>,
+        /// 取全部可运行 Queued 任务的前 max 个
+        #[arg(long)]
+        all: bool,
+        /// Alpha 最大并发,默认 2,上限 2
+        #[arg(long, default_value_t = 2)]
+        max: usize,
+        /// 所有任务终态后自动按顺序 fast-forward apply
+        #[arg(long)]
+        auto_apply: bool,
+        /// 全部工具审批自动通过
+        #[arg(long)]
+        yes: bool,
+        /// 全部工具审批自动拒绝
+        #[arg(long)]
+        no: bool,
+        /// 只保留审批请求、错误与最终结果
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// 查看并行状态(active / runnable / not runnable)
     Status,
 }
 
@@ -312,6 +346,18 @@ fn main() {
                 quiet,
             } => cmd_queue_run(task_ids, all, auto_apply, yes, no, quiet),
             QueueCmd::Status => cmd_queue_status(),
+        },
+        Cmd::Parallel { cmd } => match cmd {
+            ParallelCmd::Run {
+                task_ids,
+                all,
+                max,
+                auto_apply,
+                yes,
+                no,
+                quiet,
+            } => cmd_parallel_run(task_ids, all, max, auto_apply, yes, no, quiet),
+            ParallelCmd::Status => cmd_parallel_status(),
         },
         Cmd::Config {
             cmd: ConfigCmd::Check,
@@ -727,6 +773,233 @@ fn cmd_queue_run(
     if !summary.stopped_reason.is_empty() {
         println!("queue 停止: {}", summary.stopped_reason);
         return 1;
+    }
+    0
+}
+
+/// CLI parallel approval adapter: engine serializes calls and adds task binding;
+/// StdinApproval remains responsible for actual user interaction.
+struct ParallelStdinApproval {
+    inner: Arc<dyn ApprovalSink>,
+}
+
+impl zealous_engine::parallel::ParallelApprovalSink for ParallelStdinApproval {
+    fn decide(
+        &self,
+        task_id: &zealous_core::TaskId,
+        info: &zealous_engine::approval::ApprovalRequestInfo,
+    ) -> ApprovalDecision {
+        let mut scoped = info.clone();
+        scoped.summary = format!(
+            "task: {}\ncall: {}\n{}",
+            task_id.as_str(),
+            info.call_id,
+            info.summary
+        );
+        self.inner.decide(&scoped)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_parallel_run(
+    task_ids: Vec<String>,
+    all: bool,
+    max: usize,
+    auto_apply: bool,
+    yes: bool,
+    no: bool,
+    quiet: bool,
+) -> i32 {
+    if all && !task_ids.is_empty() {
+        return err("parallel 启动失败: --all 与显式 task ids 互斥");
+    }
+    if !all && task_ids.is_empty() {
+        return err("parallel 启动失败: 需要显式 task ids 或 --all");
+    }
+    if let Err(e) = zealous_engine::parallel::validate_limit(max) {
+        return err(format!("parallel 启动失败: {e}"));
+    }
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let ids = if all {
+        match zealous_engine::parallel::select_runnable(&svc, max) {
+            Ok((runnable, not_runnable)) => {
+                if runnable.is_empty() {
+                    println!("(no runnable queued tasks)");
+                    return 0;
+                }
+                if !not_runnable.is_empty() {
+                    println!("not runnable:");
+                    for (id, reason) in &not_runnable {
+                        println!("  {id}  {reason}");
+                    }
+                }
+                runnable
+            }
+            Err(e) => return err(e),
+        }
+    } else {
+        let mut parsed = Vec::new();
+        for raw in &task_ids {
+            match zealous_core::TaskId::parse(raw) {
+                Ok(id) => parsed.push(id),
+                Err(e) => return err(format!("无效 task id {raw}: {e}")),
+            }
+        }
+        parsed
+    };
+    if !all {
+        if let Err((i, id, reason)) = zealous_engine::parallel::validate_explicit(&svc, &ids) {
+            return err(format!(
+                "parallel 启动失败(未执行任何任务): 第 {} 个任务 {id}: {reason}",
+                i + 1
+            ));
+        }
+    }
+    let config = match ProviderConfig::resolve() {
+        Ok(c) => c,
+        Err(e) => return err(format!("provider 配置无效: {e}")),
+    };
+    println!(
+        "parallel: {} 个任务, isolated, max=1 batch/{}, auto_apply={auto_apply}",
+        ids.len(),
+        ids.len()
+    );
+    let lease = match zealous_engine::lease::try_acquire(&repo, "parallel", "parallel") {
+        Ok(l) => l,
+        Err(e) => return err(e.to_string()),
+    };
+    let model = config.model.clone();
+    let provider: Arc<dyn Provider> = Arc::new(OpenAiCompatProvider::new(config));
+    let providers = ids.iter().map(|_| provider.clone()).collect::<Vec<_>>();
+    let auto = if yes {
+        Some(ApprovalDecision::Approve)
+    } else if no {
+        Some(ApprovalDecision::Reject)
+    } else {
+        None
+    };
+    let abort = Arc::new(AtomicBool::new(false));
+    if let Err(e) = ctrlc::set_handler({
+        let abort = abort.clone();
+        move || abort.store(true, Ordering::Relaxed)
+    }) {
+        return err(format!("install ctrl-c handler: {e}"));
+    }
+    let stdin_sink: Arc<dyn ApprovalSink> = Arc::new(StdinApproval::new(auto, abort.clone()));
+    let sink = Arc::new(ParallelStdinApproval { inner: stdin_sink });
+    let progress: Option<zealous_engine::progress::SharedSink> =
+        Some(Arc::new(CliProgress { quiet }));
+    let confirm = move |tid: &zealous_core::TaskId| -> bool {
+        print!(
+            "任务 {} 已完成,将其 fast-forward 应用回主分支? [y/N] ",
+            tid.as_str()
+        );
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        let t = line.trim().to_ascii_lowercase();
+        t == "y" || t == "yes"
+    };
+    let mut hooks = zealous_engine::parallel::ParallelHooks {
+        on_task_started: Box::new(|tid, i, total| {
+            println!(
+                "=== parallel [{i}/{total}] task {} 开始(isolated) ===",
+                tid.as_str()
+            );
+        }),
+        on_task_finished: Box::new(|tid, status| {
+            println!("=== parallel task {} 结束: {status:?} ===", tid.as_str());
+        }),
+        on_apply_started: Box::new(|tid| {
+            println!("=== parallel task {} apply 开始 ===", tid.as_str());
+        }),
+        on_apply_finished: Box::new(|tid, ok, detail| {
+            println!(
+                "=== parallel task {} apply {}: {detail} ===",
+                tid.as_str(),
+                if ok { "成功" } else { "失败" }
+            );
+        }),
+        confirm_apply: Box::new(confirm),
+    };
+    let summary = zealous_engine::parallel::run_parallel(
+        &repo, &svc, providers, model, 24, &ids, auto_apply, sink, progress, abort, &lease,
+        &mut hooks,
+    );
+    println!(
+        "parallel 完成: applied {} / completed {}, failed {}, interrupted {}, base {}",
+        summary.applied.len(),
+        summary.completed.len(),
+        summary.failed.len(),
+        summary.interrupted.len(),
+        summary.base_commit
+    );
+    if !summary.stopped_reason.is_empty() {
+        println!("parallel 停止: {}", summary.stopped_reason);
+        return 1;
+    }
+    0
+}
+
+fn cmd_parallel_status() -> i32 {
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    if zealous_engine::lease::is_held(&repo) {
+        let info = zealous_engine::lease::peek_info(&repo);
+        println!("active:");
+        match info {
+            Some(info) => {
+                println!(
+                    "  pid {} task {} mode {}",
+                    info.pid, info.task_id, info.mode
+                );
+                if info.mode == "parallel" {
+                    println!("  task ids: {}", info.task_ids.join(", "));
+                    println!("  active ids: {}", info.active_task_ids.join(", "));
+                }
+            }
+            None => println!("  (metadata 不可读)"),
+        }
+    } else {
+        println!("active: (none)");
+    }
+    match zealous_engine::parallel::select_runnable(
+        &svc,
+        zealous_engine::parallel::MAX_PARALLEL_TASKS,
+    ) {
+        Ok((runnable, not_runnable)) => {
+            println!("runnable parallel (--all order):");
+            if runnable.is_empty() {
+                println!("  (none)");
+            }
+            for (i, id) in runnable.iter().enumerate() {
+                println!("  {}. {}", i + 1, id.as_str());
+            }
+            println!("not runnable:");
+            if not_runnable.is_empty() {
+                println!("  (none)");
+            }
+            for (id, reason) in &not_runnable {
+                println!("  {id}  {reason}");
+            }
+        }
+        Err(e) => return err(e),
     }
     0
 }

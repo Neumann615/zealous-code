@@ -27,6 +27,10 @@ pub enum TuiEvent {
     Progress(String),
     /// spec 156:队列结束(汇总文本)
     QueueFinished(String),
+    /// spec 157:parallel 结束(汇总文本)
+    ParallelFinished(String),
+    /// queue/parallel 将决策通道交回主循环
+    ApprovalChannel(std::sync::mpsc::Sender<zealous_core::ApprovalDecision>),
 }
 
 /// 启动一次运行/恢复;立即返回,结果经 event_tx 回传。
@@ -145,8 +149,9 @@ pub fn spawn_queue(
         let model = config.model.clone();
         let provider: Arc<dyn zealous_engine::provider::Provider> =
             Arc::new(zealous_engine::provider::OpenAiCompatProvider::new(config));
-        let (approval_sink, request_rx, _decision) =
+        let (approval_sink, request_rx, decision) =
             crate::tui::approval::channel("queue".into(), abort.clone());
+        let _ = event_tx.send(TuiEvent::ApprovalChannel(decision));
         {
             let tx = event_tx.clone();
             std::thread::spawn(move || {
@@ -214,4 +219,101 @@ impl ProgressSink for NotifProgressSink2 {
     fn important(&self, line: &str) {
         let _ = self.tx.send(TuiEvent::Progress(line.to_string()));
     }
+}
+
+/// spec 157:后台并行 batch(Shift+A 确认后调用);auto-apply=true。
+pub fn spawn_parallel(
+    svc: TaskService,
+    task_ids: Vec<TaskId>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    progress_sink: Arc<dyn ProgressSink>,
+    abort: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let config = match ProviderConfig::resolve() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = event_tx.send(TuiEvent::Failure(format!(
+                    "provider 配置无效: {e}(可用 .env 或 ZEALOUS_* 环境变量)"
+                )));
+                return;
+            }
+        };
+        let lease =
+            match zealous_engine::lease::try_acquire(svc.repo_root(), "parallel", "parallel") {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = event_tx.send(TuiEvent::Failure(format!("already_running: {e}")));
+                    return;
+                }
+            };
+        let model = config.model.clone();
+        let provider: Arc<dyn zealous_engine::provider::Provider> =
+            Arc::new(zealous_engine::provider::OpenAiCompatProvider::new(config));
+        let providers = task_ids
+            .iter()
+            .map(|_| provider.clone())
+            .collect::<Vec<_>>();
+        let (approval_sink, request_rx, decision) =
+            crate::tui::approval::parallel_channel(abort.clone());
+        let _ = event_tx.send(TuiEvent::ApprovalChannel(decision));
+        {
+            let tx = event_tx.clone();
+            std::thread::spawn(move || {
+                for req in request_rx {
+                    if tx.send(TuiEvent::Approval(req)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let progress = Arc::new(NotifProgressSink2 {
+            tx: event_tx.clone(),
+        });
+        let mut hooks = zealous_engine::parallel::ParallelHooks {
+            on_task_started: Box::new(|tid, i, total| {
+                progress_sink.progress(&format!(
+                    "[{i}/{total}] parallel task {} 开始(isolated)",
+                    tid.as_str()
+                ));
+            }),
+            on_task_finished: Box::new(|tid, status| {
+                progress_sink.progress(&format!("parallel task {} 结束: {status:?}", tid.as_str()));
+            }),
+            on_apply_started: Box::new(|tid| {
+                progress_sink.progress(&format!("parallel task {} apply 开始", tid.as_str()));
+            }),
+            on_apply_finished: Box::new(|tid, ok, detail| {
+                let mark = if ok { "成功" } else { "失败" };
+                progress_sink.progress(&format!(
+                    "parallel task {} apply {mark}: {detail}",
+                    tid.as_str()
+                ));
+            }),
+            confirm_apply: Box::new(|_| true),
+        };
+        let summary = zealous_engine::parallel::run_parallel(
+            svc.repo_root(),
+            &svc,
+            providers,
+            model,
+            24,
+            &task_ids,
+            true,
+            Arc::new(approval_sink),
+            Some(progress),
+            abort,
+            &lease,
+            &mut hooks,
+        );
+        let _ = event_tx.send(TuiEvent::ParallelFinished(format!(
+            "completed={} failed={} interrupted={} applied={} base={} stopped={}",
+            summary.completed.len(),
+            summary.failed.len(),
+            summary.interrupted.len(),
+            summary.applied.len(),
+            summary.base_commit,
+            summary.stopped_reason
+        )));
+    });
 }

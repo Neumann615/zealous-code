@@ -46,6 +46,27 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    zealous task run <task-id>
    ```
 
+   可选使用任务专属 worktree,避免影响主工作区 WIP:
+
+   ```bash
+   zealous task run <task-id> --isolate
+   zealous task apply <task-id>
+   ```
+
+   多个 isolated 任务可串行执行并按顺序 fast-forward:
+
+   ```bash
+   zealous queue run <task-id-1> <task-id-2> --auto-apply
+   ```
+
+   Alpha 也支持最多两个 isolated 任务并行执行;所有任务共享同一 base,
+   结束后按输入顺序 fast-forward,第二个任务通常需手动 merge/rebase:
+
+   ```bash
+   zealous parallel run <task-id-1> <task-id-2> --auto-apply
+   zealous parallel status
+   ```
+
 5. 或进入可视化工作台:
 
    ```bash
@@ -90,7 +111,9 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
 
 ## Known Limitations
 
-- V1 单并发任务(app-server 亦为单客户端、单并发 run)。
+- 全局同一时间只允许一个 run batch;parallel Alpha 最多同时运行 2 个 isolated 任务。
+- parallel 多任务共享同一 base;第一个任务 apply 后,后续任务不会自动三方合并,需手动 merge/rebase。
+- app-server 为单客户端、单并发 run/queue/parallel worker。
 - 不是 OS sandbox(见 Security Model)。
 - Windows 优先;macOS / Linux 未完整验证。
 - 真实模型 smoke 等发布验证会消耗模型额度。

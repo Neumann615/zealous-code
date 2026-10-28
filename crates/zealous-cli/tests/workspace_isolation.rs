@@ -458,3 +458,130 @@ fn serve_isolated_run_get_workspace_apply() {
     let r = proc.wait_response(id, deadline, &mut notes);
     assert_eq!(r["ok"], true);
 }
+
+#[test]
+fn cli_parallel_two_tasks_same_base_and_apply_conflict() {
+    let repo = base_repo("parallel-cli");
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let endpoint = stage_mock_endpoint();
+    let mut ids = Vec::new();
+    for title in ["parallel one", "parallel two"] {
+        let out = Command::new(zealous)
+            .args(["task", "new", title])
+            .current_dir(&repo)
+            .env("ZEALOUS_BASE_URL", &endpoint)
+            .env("ZEALOUS_API_KEY", "e2e-secret-key")
+            .env("ZEALOUS_MODEL", "mock-model")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        ids.push(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("task created: "))
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+    }
+
+    let out = Command::new(zealous)
+        .args([
+            "parallel",
+            "run",
+            ids[0].as_str(),
+            ids[1].as_str(),
+            "--auto-apply",
+            "--yes",
+        ])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Alpha semantics: both complete from one base; first applies, second rejects
+    // because the base moved. Exit 1 is intentional.
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("apply 失败"), "{text}");
+    assert!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .contains("NEW-VALUE"),
+        "first task should fast-forward"
+    );
+    assert!(repo.join(".zealous/worktrees").join(&ids[1]).exists());
+
+    for id in &ids {
+        let out = Command::new(zealous)
+            .args(["task", "status", id])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(status.contains("status: Completed"), "{status}");
+    }
+    let text = ledger_text(&repo);
+    for needle in ["e2e-secret-key", "Authorization", "Bearer "] {
+        assert!(!text.contains(needle), "账本泄漏: {needle}");
+    }
+}
+
+/// State-independent mock: infer the next action from prior conversation state,
+/// so two concurrent tasks can share one endpoint without a global call order.
+fn stage_mock_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let len = text
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&raw).to_string();
+        let content = if request.contains("tool `edit_file` result") {
+            r#"{"action":"message","text":"done"}"#
+        } else if request.contains("edit shared note") {
+            r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}}"#
+        } else {
+            r#"{"action":"plan","plan":"edit shared note","workers":[]}"#
+        };
+        let body = chat_body(content);
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    format!("http://{addr}/v1")
+}

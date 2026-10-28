@@ -1,12 +1,14 @@
 //! 连接状态与请求路由(spec 100 + 110 §2/§3):会话不拥有任务状态,
 //! 事实来自 TaskService(投影/账本);engine 是唯一写入者。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use zealous_core::{ApprovalDecision, TaskId, TaskStatus};
 use zealous_engine::approval::ApprovalSink;
+use zealous_engine::parallel as parallel_mod;
 use zealous_engine::provider::{OpenAiCompatProvider, ProviderConfig};
 use zealous_engine::queue as queue_mod;
 use zealous_engine::task_service::TaskService;
@@ -58,6 +60,96 @@ pub struct QueueShared {
     pub finished: AtomicBool,
 }
 
+/// spec 157:parallel batch 状态(线程 ↔ 会话)
+pub struct ParallelShared {
+    pub abort: Arc<AtomicBool>,
+    pub task_ids: Vec<TaskId>,
+    pub active: Mutex<Vec<String>>,
+    pub auto_apply: bool,
+    pub base_commit: String,
+    pub completed: Mutex<Vec<String>>,
+    pub failed: Mutex<Vec<String>>,
+    pub interrupted: Mutex<Vec<String>>,
+    pub applied: Mutex<Vec<String>>,
+    pub apply_index: AtomicUsize,
+    pub finished: AtomicBool,
+    pub approvals: Arc<ParallelApprovals>,
+}
+
+/// parallel 审批绑定:task_id + call_id → decision sender
+pub struct ParallelApprovals {
+    pub pending: Mutex<HashMap<String, mpsc::Sender<ApprovalDecision>>>,
+}
+
+impl ParallelApprovals {
+    fn insert(&self, key: String, tx: mpsc::Sender<ApprovalDecision>) {
+        self.pending
+            .lock()
+            .expect("parallel approvals poisoned")
+            .insert(key, tx);
+    }
+
+    fn remove(&self, key: &str) {
+        self.pending
+            .lock()
+            .expect("parallel approvals poisoned")
+            .remove(key);
+    }
+
+    fn decide(&self, key: &str, decision: ApprovalDecision) -> bool {
+        let mut pending = self.pending.lock().expect("parallel approvals poisoned");
+        match pending.remove(key) {
+            Some(tx) => tx.send(decision).is_ok(),
+            None => false,
+        }
+    }
+}
+
+struct ParallelApprovalSink {
+    shared: Arc<ParallelShared>,
+    notif: mpsc::Sender<Notification>,
+}
+
+impl parallel_mod::ParallelApprovalSink for ParallelApprovalSink {
+    fn decide(
+        &self,
+        task_id: &TaskId,
+        info: &zealous_engine::approval::ApprovalRequestInfo,
+    ) -> ApprovalDecision {
+        let key = format!("{}:{}", task_id.as_str(), info.call_id);
+        let (tx, rx) = mpsc::channel();
+        self.shared.approvals.insert(key.clone(), tx);
+        let sent = self.notif.send(Notification::approval_requested(
+            task_id.as_str(),
+            &info.call_id,
+            &info.tool,
+            &format!("{:?}", info.risk),
+            &info.summary,
+        ));
+        if sent.is_err() {
+            self.shared.approvals.remove(&key);
+            return ApprovalDecision::Reject;
+        }
+        loop {
+            if self.shared.abort.load(Ordering::Relaxed) {
+                self.shared.approvals.remove(&key);
+                return ApprovalDecision::Reject;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(decision) => {
+                    self.shared.approvals.remove(&key);
+                    return decision;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.shared.approvals.remove(&key);
+                    return ApprovalDecision::Reject;
+                }
+            }
+        }
+    }
+}
+
 pub struct Session {
     pub svc: TaskService,
     pub repo_root: PathBuf,
@@ -66,6 +158,8 @@ pub struct Session {
     pub run: Option<RunState>,
     pub queue: Option<Arc<QueueShared>>,
     pub queue_join: Option<std::thread::JoinHandle<()>>,
+    pub parallel: Option<Arc<ParallelShared>>,
+    pub parallel_join: Option<std::thread::JoinHandle<()>>,
     pub notif_tx: mpsc::Sender<Notification>,
 }
 
@@ -79,6 +173,8 @@ impl Session {
             run: None,
             queue: None,
             queue_join: None,
+            parallel: None,
+            parallel_join: None,
             notif_tx,
         }
     }
@@ -101,12 +197,16 @@ impl Session {
             "run_queue" => Handled::Response(self.handle_run_queue(&req)),
             "stop_queue" => Handled::Response(self.handle_stop_queue(&req)),
             "get_queue_status" => Handled::Response(self.handle_get_queue_status(&req)),
+            "run_parallel" => Handled::Response(self.handle_run_parallel(&req)),
+            "stop_parallel" => Handled::Response(self.handle_stop_parallel(&req)),
+            "get_parallel_status" => Handled::Response(self.handle_get_parallel_status(&req)),
             "apply_task" => Handled::Response(self.handle_apply_task(&req)),
             "get_workspace" => Handled::Response(self.handle_get_workspace(&req)),
             "remove_workspace" => Handled::Response(self.handle_remove_workspace(&req)),
             "shutdown" => {
                 self.wait_worker();
                 self.wait_queue();
+                self.wait_parallel();
                 Handled::Shutdown(Response::ok(req.id, serde_json::json!({ "bye": true })))
             }
             other => Handled::Response(err_resp(
@@ -137,6 +237,7 @@ impl Session {
                             "max_workers": 3,
                             "concurrent_runs": 1,
                             "isolated_worktree": true,
+                            "parallel_tasks": parallel_mod::MAX_PARALLEL_TASKS,
                         }
                     }),
                 )
@@ -403,15 +504,37 @@ impl Session {
             }
         };
 
-        // task 绑定:必须匹配当前运行任务
-        let Some(run) = &self.run else {
-            return err_resp(req.id, "no_pending_approval", "当前没有运行中的任务");
-        };
         let param_task = req
             .params
             .get("task_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        let param_call = req
+            .params
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if self.run.is_none() {
+            if let Some(parallel) = &self.parallel {
+                let key = format!("{param_task}:{param_call}");
+                if !param_task.is_empty()
+                    && !param_call.is_empty()
+                    && parallel.approvals.decide(&key, decision)
+                {
+                    return Response::ok(req.id, serde_json::json!({ "decided": decision_str }));
+                }
+                return err_resp(
+                    req.id,
+                    "no_pending_approval",
+                    "task/call 不匹配当前 parallel 待决审批",
+                );
+            }
+            return err_resp(req.id, "no_pending_approval", "当前没有运行中的任务");
+        }
+        // task 绑定:必须匹配当前运行任务
+        let Some(run) = &self.run else {
+            return err_resp(req.id, "no_pending_approval", "当前没有运行中的任务");
+        };
         if param_task != run.task_id.as_str() {
             return err_resp(
                 req.id,
@@ -421,11 +544,6 @@ impl Session {
         }
 
         // call_id 绑定:必须与当前 pending 一致(未知/重复/过期均拒绝)
-        let param_call = req
-            .params
-            .get("call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
         let current_call = run.handles.pending.lock().expect("pending slot").clone();
         match current_call {
             Some(pending_call) if !param_call.is_empty() && pending_call == param_call => {}
@@ -696,6 +814,263 @@ impl Session {
             None => Response::ok(
                 req.id,
                 serde_json::json!({ "active": null, "total": 0, "finished": true }),
+            ),
+        }
+    }
+
+    /// spec 157:等待 parallel worker 结束(shutdown)
+    fn wait_parallel(&mut self) {
+        if let Some(join) = self.parallel_join.take() {
+            let _ = join.join();
+        }
+    }
+
+    fn reap_parallel(&mut self) {
+        if let Some(p) = &self.parallel {
+            if p.finished.load(Ordering::SeqCst) {
+                self.wait_parallel();
+                self.parallel = None;
+            }
+        }
+    }
+
+    fn handle_run_parallel(&mut self, req: &Request) -> Response {
+        self.reap_parallel();
+        if let Some(p) = &self.parallel {
+            if !p.finished.load(Ordering::SeqCst) {
+                return err_resp(req.id, "already_running", "已有 parallel batch 在运行");
+            }
+        }
+        let all = req
+            .params
+            .get("all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let max = req
+            .params
+            .get("max")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(parallel_mod::MAX_PARALLEL_TASKS);
+        if let Err(e) = parallel_mod::validate_limit(max) {
+            return err_resp(req.id, "invalid_params", e);
+        }
+        let auto_apply = req
+            .params
+            .get("auto_apply")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut task_ids: Vec<TaskId> = Vec::new();
+        if all {
+            match parallel_mod::select_runnable(&self.svc, max) {
+                Ok((runnable, _)) => task_ids = runnable,
+                Err(e) => return err_resp(req.id, "internal", e),
+            }
+            if task_ids.is_empty() {
+                return err_resp(req.id, "no_runnable_tasks", "(no runnable queued tasks)");
+            }
+        } else if let Some(arr) = req.params.get("task_ids").and_then(|v| v.as_array()) {
+            if arr.len() > parallel_mod::MAX_PARALLEL_TASKS {
+                return err_resp(
+                    req.id,
+                    "invalid_params",
+                    format!(
+                        "Alpha supports at most {} tasks",
+                        parallel_mod::MAX_PARALLEL_TASKS
+                    ),
+                );
+            }
+            for v in arr {
+                match v.as_str().map(TaskId::parse) {
+                    Some(Ok(id)) => task_ids.push(id),
+                    _ => return err_resp(req.id, "invalid_params", "task_ids 含非法任务 ID"),
+                }
+            }
+        } else {
+            return err_resp(req.id, "invalid_params", "task_ids 或 all 必填");
+        }
+        if !all {
+            if let Err((i, id, reason)) = parallel_mod::validate_explicit(&self.svc, &task_ids) {
+                return err_resp(
+                    req.id,
+                    "parallel_start_failed",
+                    format!("第 {} 个任务 {id}: {reason}", i + 1),
+                );
+            }
+        }
+        if ProviderConfig::resolve().is_err() {
+            return err_resp(req.id, "internal", "provider 配置无效");
+        }
+        let base_commit = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let lease =
+            match zealous_engine::lease::try_acquire(&self.repo_root, "parallel", "parallel") {
+                Ok(l) => l,
+                Err(e) => return err_resp(req.id, "already_running", e.to_string()),
+            };
+        let total = task_ids.len();
+        let shared = Arc::new(ParallelShared {
+            abort: Arc::new(AtomicBool::new(false)),
+            task_ids: task_ids.clone(),
+            active: Mutex::new(task_ids.iter().map(|id| id.as_str().to_string()).collect()),
+            auto_apply,
+            base_commit: base_commit.clone(),
+            completed: Mutex::new(Vec::new()),
+            failed: Mutex::new(Vec::new()),
+            interrupted: Mutex::new(Vec::new()),
+            applied: Mutex::new(Vec::new()),
+            apply_index: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
+            approvals: Arc::new(ParallelApprovals {
+                pending: Mutex::new(HashMap::new()),
+            }),
+        });
+        let notif = self.notif_tx.clone();
+        let svc = self.svc.clone();
+        let repo = self.repo_root.clone();
+        let shared_t = shared.clone();
+        let join = std::thread::spawn(move || {
+            let _lease = lease;
+            let config = match ProviderConfig::resolve() {
+                Ok(c) => c,
+                Err(e) => {
+                    shared_t.finished.store(true, Ordering::SeqCst);
+                    let _ = notif.send(Notification::error_occurred(&format!(
+                        "provider 配置无效: {e}"
+                    )));
+                    return;
+                }
+            };
+            let model = config.model.clone();
+            let provider: Arc<dyn zealous_engine::provider::Provider> =
+                Arc::new(OpenAiCompatProvider::new(config));
+            let providers = task_ids
+                .iter()
+                .map(|_| provider.clone())
+                .collect::<Vec<_>>();
+            let approval_sink = Arc::new(ParallelApprovalSink {
+                shared: shared_t.clone(),
+                notif: notif.clone(),
+            });
+            let mut hooks = parallel_mod::ParallelHooks {
+                on_task_started: Box::new(|tid, i, total| {
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_started",
+                        &format!("{} ({i}/{total})", tid.as_str()),
+                    ));
+                }),
+                on_task_finished: Box::new(|tid, status| {
+                    let label = tid.as_str().to_string();
+                    match status {
+                        TaskStatus::Completed => {
+                            shared_t.completed.lock().unwrap().push(label.clone())
+                        }
+                        TaskStatus::Interrupted => {
+                            shared_t.interrupted.lock().unwrap().push(label.clone())
+                        }
+                        _ => shared_t.failed.lock().unwrap().push(label.clone()),
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_finished",
+                        &format!("{} {:?}", label, status),
+                    ));
+                }),
+                on_apply_started: Box::new(|tid| {
+                    shared_t.apply_index.fetch_add(1, Ordering::SeqCst);
+                    let _ = notif.send(Notification::progress(
+                        "parallel_apply_started",
+                        tid.as_str(),
+                    ));
+                }),
+                on_apply_finished: Box::new(|tid, ok, detail| {
+                    if ok {
+                        shared_t
+                            .applied
+                            .lock()
+                            .unwrap()
+                            .push(tid.as_str().to_string());
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "parallel_apply_finished",
+                        &format!("{} {} {}", tid.as_str(), ok, detail),
+                    ));
+                }),
+                confirm_apply: Box::new(|_| auto_apply),
+            };
+            let summary = parallel_mod::run_parallel(
+                &repo,
+                &svc,
+                providers,
+                model,
+                24,
+                &task_ids,
+                auto_apply,
+                approval_sink,
+                None,
+                shared_t.abort.clone(),
+                &_lease,
+                &mut hooks,
+            );
+            *shared_t.active.lock().unwrap() = Vec::new();
+            shared_t.finished.store(true, Ordering::SeqCst);
+            let _ = notif.send(Notification::progress(
+                "parallel_finished",
+                &format!(
+                    "completed={} failed={} interrupted={} applied={} base={} stopped={}",
+                    summary.completed.len(),
+                    summary.failed.len(),
+                    summary.interrupted.len(),
+                    summary.applied.len(),
+                    summary.base_commit,
+                    summary.stopped_reason
+                ),
+            ));
+        });
+        self.parallel = Some(shared);
+        self.parallel_join = Some(join);
+        Response::ok(
+            req.id,
+            serde_json::json!({ "parallel_started": true, "total": total, "base_commit": base_commit }),
+        )
+    }
+
+    fn handle_stop_parallel(&mut self, req: &Request) -> Response {
+        match &self.parallel {
+            Some(p) if !p.finished.load(Ordering::SeqCst) => {
+                p.abort.store(true, Ordering::SeqCst);
+                Response::ok(req.id, serde_json::json!({ "stopping": true }))
+            }
+            _ => err_resp(req.id, "invalid_params", "当前没有运行中的 parallel batch"),
+        }
+    }
+
+    fn handle_get_parallel_status(&self, req: &Request) -> Response {
+        match &self.parallel {
+            Some(p) => Response::ok(
+                req.id,
+                serde_json::json!({
+                    "active": *p.active.lock().unwrap(),
+                    "pending": [],
+                    "completed": p.completed.lock().unwrap().clone(),
+                    "failed": p.failed.lock().unwrap().clone(),
+                    "interrupted": p.interrupted.lock().unwrap().clone(),
+                    "applied": p.applied.lock().unwrap().clone(),
+                    "apply_index": p.apply_index.load(Ordering::SeqCst),
+                    "total": p.task_ids.len(),
+                    "apply_policy": if p.auto_apply { "auto" } else { "confirm" },
+                    "base_commit": p.base_commit,
+                    "finished": p.finished.load(Ordering::SeqCst),
+                }),
+            ),
+            None => Response::ok(
+                req.id,
+                serde_json::json!({ "active": [], "total": 0, "finished": true }),
             ),
         }
     }

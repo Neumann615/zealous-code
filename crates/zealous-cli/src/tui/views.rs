@@ -40,6 +40,24 @@ pub fn render(f: &mut Frame, state: &mut TuiState) {
     render_task_list(f, cols[0], state);
     match state.screen {
         Screen::Detail => render_detail_full(f, cols[1], state),
+        Screen::Queue | Screen::Parallel => {
+            let text = match state.screen {
+                Screen::Parallel => state
+                    .parallel_status_text
+                    .clone()
+                    .unwrap_or_else(|| "(parallel status unavailable)".into()),
+                _ => state
+                    .queue_status_text
+                    .clone()
+                    .unwrap_or_else(|| "(queue status unavailable)".into()),
+            };
+            let lines: Vec<Line<'static>> =
+                text.lines().map(|l| Line::from(l.to_string())).collect();
+            f.render_widget(
+                Paragraph::new(lines).block(Block::new().borders(Borders::ALL).title("状态")),
+                cols[1],
+            );
+        }
         _ => render_detail_summary(f, cols[1], state),
     }
     render_help(f, chunks[1], state);
@@ -273,6 +291,19 @@ fn render_confirm_modal(f: &mut Frame, state: &TuiState) {
                 "worktree 中的未提交改动不会被删除(需 CLI --force)。".to_string(),
             ],
         ),
+        super::state::ConfirmKind::ParallelRun => {
+            let mut lines = vec![
+                "Run up to 2 queued tasks in parallel isolated worktrees?".to_string(),
+                String::new(),
+            ];
+            for id in &state.parallel_ids {
+                lines.push(format!("  Task: {}", id.as_str()));
+            }
+            lines.push(String::new());
+            lines.push("All tasks share one base commit.".into());
+            lines.push("Completed tasks will be fast-forward applied in input order.".into());
+            ("Parallel".to_string(), lines)
+        }
         super::state::ConfirmKind::QueueRun => {
             let mut lines = vec![
                 "Run queued tasks in isolated worktrees?".to_string(),
@@ -312,7 +343,13 @@ fn render_approval_modal(f: &mut Frame, state: &mut TuiState) {
     let inner = area.inner(ratatui::layout::Margin::new(1, 1));
     let visible = inner.height.saturating_sub(3) as usize;
     const CONTENT_WIDTH: usize = 62;
-    let summary_lines = wrap_lines(&req.summary, CONTENT_WIDTH);
+    let summary_lines = wrap_lines(
+        &format!(
+            "task: {}\ncall: {}\n{}",
+            req.task_id, req.call_id, req.summary
+        ),
+        CONTENT_WIDTH,
+    );
     let total = summary_lines.len();
     state.set_approval_total(total);
     let scroll = state.approval_scroll.min(total.saturating_sub(1));
@@ -530,11 +567,13 @@ pub(crate) mod tests {
     fn approval_modal_shows_summary() {
         let mut s = TuiState::new();
         s.approval_arrived(super::super::state::ApprovalRequestUi {
+            task_id: "task_9".into(),
             call_id: "call_9".into(),
             summary: "write_file 新建文件: out.txt\n--- 完整新内容 ---\nbody".into(),
         });
         // 去空格比较(CJK 渲染占格)
         let text = render_to_string(&mut s).replace(' ', "");
+        assert!(text.contains("task_9"), "{text}");
         assert!(text.contains("call_9"), "{text}");
         assert!(text.contains("out.txt"), "{text}");
         assert!(text.contains("body"), "{text}");

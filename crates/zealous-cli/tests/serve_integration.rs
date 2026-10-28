@@ -455,3 +455,199 @@ fn run_task_again_after_finish_in_same_session() {
     assert!(resp["ok"].as_bool().unwrap());
     let _ = next_id;
 }
+
+#[test]
+fn serve_parallel_two_tasks_approvals_and_status() {
+    let repo = unique_dir("parallel");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {:?}", out.stderr);
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), ".zealous/\n").unwrap();
+    std::fs::write(repo.join("note.txt"), "OLD\n").unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    ]);
+
+    let endpoint = parallel_stage_endpoint();
+    let mut proc = spawn_serve(&repo, &endpoint);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut next_id = 1u64;
+
+    let mut notifications: Vec<serde_json::Value> = Vec::new();
+    macro_rules! request {
+        ($cmd:expr, $params:expr) => {{
+            let id = next_id;
+            next_id += 1;
+            proc.send(&serde_json::json!({"id": id, "cmd": $cmd, "params": $params}));
+            let resp =
+                proc.wait_response(&proc.lines_rx, id, deadline, |n| notifications.push(n));
+            assert!(resp["ok"].as_bool().unwrap(), "{} failed: {resp}", $cmd);
+            resp
+        }};
+    }
+
+    request!("initialize", serde_json::json!({"version": 1}));
+    let mut task_ids = Vec::new();
+    for title in ["parallel one", "parallel two"] {
+        let resp = request!("create_task", serde_json::json!({"title": title}));
+        task_ids.push(resp["result"]["task_id"].as_str().unwrap().to_string());
+    }
+    let run_resp = request!(
+        "run_parallel",
+        serde_json::json!({"task_ids": task_ids, "auto_apply": true})
+    );
+    assert_eq!(run_resp["result"]["total"], 2, "{run_resp}");
+    assert!(run_resp["result"]["base_commit"].as_str().is_some());
+
+    // Engine serializes approvals, but an approval can race ahead of the
+    // run_parallel response. Replay captured notifications before live stdout.
+    let mut captured = std::mem::take(&mut notifications);
+    let mut decided = 0;
+    while decided < 2 {
+        let v = if let Some(v) = captured.pop() {
+            v
+        } else if let Some(v) = notifications.pop() {
+            v
+        } else {
+            loop {
+                assert!(Instant::now() < deadline, "parallel approval timeout");
+                let Ok(line) = proc.lines_rx.recv_timeout(Duration::from_millis(200)) else {
+                    continue;
+                };
+                let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if v["event"].as_str() == Some("approval_requested") {
+                    break v;
+                }
+            }
+        };
+        assert_eq!(v["event"].as_str(), Some("approval_requested"), "{v}");
+        let id = next_id;
+        next_id += 1;
+        proc.send(&serde_json::json!({
+            "id": id,
+            "cmd": "decide_approval",
+            "params": {
+                "task_id": v["params"]["task_id"],
+                "call_id": v["params"]["call_id"],
+                "decision": "approve"
+            }
+        }));
+        let resp = proc.wait_response(&proc.lines_rx, id, deadline, |n| notifications.push(n));
+        assert!(resp["ok"].as_bool().unwrap(), "approval: {resp}");
+        decided += 1;
+    }
+
+    let v = notifications
+        .iter()
+        .position(|v| {
+            v["event"].as_str() == Some("progress")
+                && v["params"]["level"].as_str() == Some("parallel_finished")
+        })
+        .map(|i| notifications.remove(i))
+        .unwrap_or_else(|| loop {
+            assert!(Instant::now() < deadline, "parallel_finished timeout");
+            let Ok(line) = proc.lines_rx.recv_timeout(Duration::from_millis(200)) else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["event"].as_str() == Some("progress")
+                && v["params"]["level"].as_str() == Some("parallel_finished")
+            {
+                break v;
+            }
+        });
+    let line = v["params"]["line"].as_str().unwrap_or_default();
+    assert!(line.contains("applied=1"), "{line}");
+
+    let status = request!("get_parallel_status", serde_json::json!({}));
+    assert_eq!(status["result"]["total"], 2, "{status}");
+    assert_eq!(
+        status["result"]["completed"].as_array().map(Vec::len),
+        Some(2),
+        "{status}"
+    );
+    assert_eq!(
+        status["result"]["applied"].as_array().map(Vec::len),
+        Some(1),
+        "{status}"
+    );
+    for id in &task_ids {
+        let task = request!("get_task", serde_json::json!({"task_id": id}));
+        assert_eq!(task["result"]["status"], "Completed", "{task}");
+    }
+    assert!(repo.join(".zealous/worktrees").join(&task_ids[1]).exists());
+    assert!(std::fs::read_to_string(repo.join("note.txt"))
+        .unwrap()
+        .contains("NEW"));
+
+    let shutdown_id = next_id;
+    proc.send(&serde_json::json!({"id": shutdown_id, "cmd": "shutdown", "params": {}}));
+    let resp = proc.wait_response(&proc.lines_rx, shutdown_id, deadline, |_| {});
+    assert!(resp["ok"].as_bool().unwrap(), "{resp}");
+}
+
+fn parallel_stage_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let len = text
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&raw).to_string();
+        let content = if request.contains("tool `edit_file` result") {
+            r#"{"action":"message","text":"done"}"#
+        } else if request.contains("edit note") {
+            r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD","new_text":"NEW"}}"#
+        } else {
+            r#"{"action":"plan","plan":"edit note","workers":[]}"#
+        };
+        let body = chat_body(content);
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    format!("http://{addr}/v1")
+}

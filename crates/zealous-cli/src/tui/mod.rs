@@ -194,7 +194,9 @@ pub(crate) fn apply_event(
     ev: TuiEvent,
 ) {
     match ev {
+        TuiEvent::ApprovalChannel(tx) => *decision_tx = Some(tx),
         TuiEvent::Approval(req) => state.approval_arrived(state::ApprovalRequestUi {
+            task_id: req.task_id,
             call_id: req.call_id,
             summary: req.summary,
         }),
@@ -216,11 +218,18 @@ pub(crate) fn apply_event(
             state.running = false;
             state.set_error(msg);
         }
+        TuiEvent::ParallelFinished(summary) => {
+            state.running = false;
+            *decision_tx = None;
+            state.push_important(&format!("parallel: {summary}"));
+            refresh_task_list(state, svc);
+        }
         TuiEvent::Progress(msg) => {
             state.push_progress(msg);
         }
         TuiEvent::QueueFinished(summary) => {
             state.running = false;
+            *decision_tx = None;
             state.push_important(&format!("queue: {summary}"));
             refresh_task_list(state, svc);
         }
@@ -296,6 +305,23 @@ fn handle_key(
                                 }
                             }
                             Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
+                state::ConfirmKind::ParallelRun => {
+                    if !state.running {
+                        let ids = state.parallel_ids.clone();
+                        if !ids.is_empty() {
+                            state.running = true;
+                            state.abort_requested = false;
+                            abort.store(false, Ordering::Relaxed);
+                            runner::spawn_parallel(
+                                TaskService::new(svc.repo_root().to_path_buf()),
+                                ids,
+                                event_tx.clone(),
+                                progress_sink.clone(),
+                                abort.clone(),
+                            );
                         }
                     }
                 }
@@ -377,7 +403,24 @@ fn handle_key(
             KeyCode::Up | KeyCode::Char('k') => state.select_prev(),
             KeyCode::Char('r') => state.refresh_tasks(list_tasks(svc)),
             KeyCode::Char('n') => state.open_form(),
-            KeyCode::Char('A') => {
+            KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // spec 157:确认后并行运行最多两个 runnable queued tasks
+                match zealous_engine::parallel::select_runnable(
+                    svc,
+                    zealous_engine::parallel::MAX_PARALLEL_TASKS,
+                ) {
+                    Ok((runnable, _)) => {
+                        if runnable.is_empty() {
+                            state.set_error("(no runnable queued tasks)".into());
+                        } else {
+                            state.parallel_ids = runnable;
+                            state.open_confirm(state::ConfirmKind::ParallelRun);
+                        }
+                    }
+                    Err(e) => state.set_error(e.clone()),
+                }
+            }
+            KeyCode::Char('a') => {
                 // spec 156:确认后串行运行全部可运行 queued 任务(auto apply)
                 match zealous_engine::queue::select_runnable(svc) {
                     Ok((runnable, _)) => {
@@ -387,6 +430,45 @@ fn handle_key(
                             state.queue_ids = runnable;
                             state.open_confirm(state::ConfirmKind::QueueRun);
                         }
+                    }
+                    Err(e) => state.set_error(e.clone()),
+                }
+            }
+            KeyCode::Char('Q') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match zealous_engine::parallel::select_runnable(
+                    svc,
+                    zealous_engine::parallel::MAX_PARALLEL_TASKS,
+                ) {
+                    Ok((runnable, not_runnable)) => {
+                        let mut text = String::new();
+                        if zealous_engine::lease::is_held(svc.repo_root()) {
+                            if let Some(info) = zealous_engine::lease::peek_info(svc.repo_root()) {
+                                text.push_str(&format!(
+                                    "active: pid {} task {} mode {}\n",
+                                    info.pid, info.task_id, info.mode
+                                ));
+                                if info.mode == "parallel" {
+                                    text.push_str(&format!(
+                                        "tasks: {}\n",
+                                        info.task_ids.join(", ")
+                                    ));
+                                }
+                            }
+                        } else {
+                            text.push_str("active: (none)\n");
+                        }
+                        text.push_str(&format!("runnable parallel ({}):\n", runnable.len()));
+                        for id in &runnable {
+                            text.push_str(&format!("  {}\n", id.as_str()));
+                        }
+                        if !not_runnable.is_empty() {
+                            text.push_str("not runnable:\n");
+                            for (id, reason) in &not_runnable {
+                                text.push_str(&format!("  {}  {reason}\n", id.as_str()));
+                            }
+                        }
+                        state.parallel_status_text = Some(text);
+                        state.screen = Screen::Parallel;
                     }
                     Err(e) => state.set_error(e.clone()),
                 }
@@ -433,7 +515,7 @@ fn handle_key(
             }
             _ => {}
         },
-        Screen::Queue => match key.code {
+        Screen::Queue | Screen::Parallel => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => state.screen = Screen::List,
             _ => {}
         },

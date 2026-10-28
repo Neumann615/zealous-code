@@ -96,6 +96,68 @@ pub fn channel(
     )
 }
 
+/// spec 157:parallel 审批通道。task id 在 decide 时绑定,所有请求共用
+/// 一个决策通道;engine 层已按到达顺序串行化。
+pub struct ParallelChannelApprovalSink {
+    request_tx: mpsc::Sender<ApprovalRequest>,
+    decision_rx: Mutex<mpsc::Receiver<ApprovalDecision>>,
+    abort: Arc<AtomicBool>,
+}
+
+pub fn parallel_channel(
+    abort: Arc<AtomicBool>,
+) -> (
+    ParallelChannelApprovalSink,
+    mpsc::Receiver<ApprovalRequest>,
+    mpsc::Sender<ApprovalDecision>,
+) {
+    let (request_tx, request_rx) = mpsc::channel();
+    let (decision_tx, decision_rx) = mpsc::channel();
+    (
+        ParallelChannelApprovalSink {
+            request_tx,
+            decision_rx: Mutex::new(decision_rx),
+            abort,
+        },
+        request_rx,
+        decision_tx,
+    )
+}
+
+impl zealous_engine::parallel::ParallelApprovalSink for ParallelChannelApprovalSink {
+    fn decide(
+        &self,
+        task_id: &zealous_core::TaskId,
+        info: &zealous_engine::approval::ApprovalRequestInfo,
+    ) -> ApprovalDecision {
+        let req = ApprovalRequest {
+            task_id: task_id.as_str().to_string(),
+            call_id: info.call_id.clone(),
+            tool: info.tool.clone(),
+            risk: format!("{:?}", info.risk),
+            summary: info.summary.clone(),
+        };
+        if self.request_tx.send(req).is_err() {
+            return ApprovalDecision::Reject;
+        }
+        loop {
+            if self.abort.load(Ordering::Relaxed) {
+                return ApprovalDecision::Reject;
+            }
+            match self
+                .decision_rx
+                .lock()
+                .expect("parallel decision rx poisoned")
+                .try_recv()
+            {
+                Ok(decision) => return decision,
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(POLL_INTERVAL),
+                Err(mpsc::TryRecvError::Disconnected) => return ApprovalDecision::Reject,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

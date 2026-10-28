@@ -7,6 +7,7 @@ use zealous_engine::task_service::TaskSummary;
 /// 审批请求的 UI 形态(来自 channel sink)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequestUi {
+    pub task_id: String,
     pub call_id: String,
     pub summary: String,
 }
@@ -28,6 +29,8 @@ pub enum Screen {
     Form,
     /// 队列状态视图(spec 156)
     Queue,
+    /// 并行状态视图(spec 157)
+    Parallel,
 }
 
 /// 新建任务表单草稿
@@ -48,6 +51,8 @@ pub enum ConfirmKind {
     WorkspaceRemove,
     /// spec 156:串行运行全部可运行 queued 任务(auto apply)
     QueueRun,
+    /// spec 157:并行运行最多两个 runnable queued tasks(auto apply)
+    ParallelRun,
 }
 
 /// TUI 全部 UI 状态;任务事实以投影/账本为准,这里只有派生显示数据
@@ -62,6 +67,10 @@ pub struct TuiState {
     pub queue_ids: Vec<TaskId>,
     /// spec 156:queue status 文本(Q 视图)
     pub queue_status_text: Option<String>,
+    /// spec 157:待并行运行任务(确认弹窗展示)
+    pub parallel_ids: Vec<TaskId>,
+    /// spec 157:parallel status 文本(Shift+Q 视图)
+    pub parallel_status_text: Option<String>,
     pub tasks: Vec<TaskSummary>,
     pub selected: usize,
     pub detail: Option<TaskProjection>,
@@ -99,6 +108,8 @@ impl TuiState {
             workspace_visible: false,
             queue_ids: Vec::new(),
             queue_status_text: None,
+            parallel_ids: Vec::new(),
+            parallel_status_text: None,
             tasks: Vec::new(),
             selected: 0,
             detail: None,
@@ -344,6 +355,18 @@ mod tests {
     }
 
     #[test]
+    fn parallel_run_confirmation_and_status_screen() {
+        let mut s = TuiState::new();
+        s.parallel_ids = vec![TaskId::generate()];
+        s.open_confirm(ConfirmKind::ParallelRun);
+        assert_eq!(s.confirm, Some(ConfirmKind::ParallelRun));
+        assert_eq!(s.take_confirm(), Some(ConfirmKind::ParallelRun));
+        s.parallel_status_text = Some("active: parallel".into());
+        s.screen = Screen::Parallel;
+        assert_eq!(s.screen, Screen::Parallel);
+    }
+
+    #[test]
     fn form_input_and_validation() {
         let mut s = TuiState::new();
         s.open_form();
@@ -370,6 +393,7 @@ mod tests {
         let mut s = TuiState::new();
         assert!(s.pending_approval.is_none());
         s.approval_arrived(ApprovalRequestUi {
+            task_id: "task_1".into(),
             call_id: "call_1".into(),
             summary: "write_file ...".into(),
         });
@@ -433,6 +457,7 @@ mod scroll_tests {
     fn approval_scroll_clamps_and_reports_end() {
         let mut s = TuiState::new();
         s.approval_arrived(ApprovalRequestUi {
+            task_id: "task_c".into(),
             call_id: "c".into(),
             summary: "x".into(),
         });
@@ -454,12 +479,14 @@ mod scroll_tests {
     fn approval_arrived_resets_scroll() {
         let mut s = TuiState::new();
         s.approval_arrived(ApprovalRequestUi {
+            task_id: "task_1".into(),
             call_id: "1".into(),
             summary: "a".into(),
         });
         s.set_approval_total(5);
         s.approval_scroll_down(4);
         s.approval_arrived(ApprovalRequestUi {
+            task_id: "task_2".into(),
             call_id: "2".into(),
             summary: "b".into(),
         });

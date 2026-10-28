@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use zealous_core::time::rfc3339_from_unix_millis;
+use zealous_core::TaskId;
 
 fn now_rfc3339() -> String {
     let ms = std::time::SystemTime::now()
@@ -29,12 +30,16 @@ pub struct LeaseInfo {
     pub task_id: String,
     pub mode: String,
     pub started_at: String,
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub active_task_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseError {
     /// 已有运行中的任务(携带持有者元数据;读取失败时字段为 unknown)
-    AlreadyRunning(LeaseInfo),
+    AlreadyRunning(Box<LeaseInfo>),
     Io(String),
 }
 
@@ -97,6 +102,30 @@ impl RunLease {
                 task_id: task_id.into(),
                 mode: mode.into(),
                 started_at: now_rfc3339(),
+                task_ids: Vec::new(),
+                active_task_ids: Vec::new(),
+            },
+        )
+    }
+
+    pub fn set_parallel(
+        &self,
+        repo_root: &Path,
+        task_ids: &[TaskId],
+        active_task_ids: &[TaskId],
+    ) -> Result<(), LeaseError> {
+        write_info(
+            repo_root,
+            &LeaseInfo {
+                pid: std::process::id(),
+                task_id: "parallel".into(),
+                mode: "parallel".into(),
+                started_at: now_rfc3339(),
+                task_ids: task_ids.iter().map(|id| id.as_str().to_string()).collect(),
+                active_task_ids: active_task_ids
+                    .iter()
+                    .map(|id| id.as_str().to_string())
+                    .collect(),
             },
         )
     }
@@ -131,8 +160,10 @@ pub fn try_acquire(repo_root: &Path, task_id: &str, mode: &str) -> Result<RunLea
             task_id: "(unknown)".into(),
             mode: "(unknown)".into(),
             started_at: "(unknown)".into(),
+            task_ids: Vec::new(),
+            active_task_ids: Vec::new(),
         });
-        return Err(LeaseError::AlreadyRunning(info));
+        return Err(LeaseError::AlreadyRunning(Box::new(info)));
     }
     write_info(
         repo_root,
@@ -141,6 +172,8 @@ pub fn try_acquire(repo_root: &Path, task_id: &str, mode: &str) -> Result<RunLea
             task_id: task_id.into(),
             mode: mode.into(),
             started_at: now_rfc3339(),
+            task_ids: Vec::new(),
+            active_task_ids: Vec::new(),
         },
     )?;
     Ok(RunLease {
