@@ -63,6 +63,23 @@
     `4263bb5a0427b3d6c23d40073e7e6b55c3ba80bb`;
   - 主工作区最终 `value=A`。
 
+## LOCAL TRIAL release 回归 —— PASS
+
+- RC zip SHA256:`4D785E1A8B50D4A229C5C76E22C034EB72C43F7BCCFFF0CD46471AE994B1E5B7`
+- 解压二进制:`%TEMP%\zealous-157-localtrial-c32a74b8\bin\zealous.exe`
+- 仓库:`%TEMP%\zealous-157-localtrial-c32a74b8`
+- base:`8c44714b035f799ee62e1427f2eab868a7950ec7`
+- 任务:
+  - `task_01M61X8DYWXMZSXYMTD6R78J8D` 修改 `left.md`
+  - `task_01M61X8DZANK17974N330YVV27` 修改 `right.md`
+- 结果:
+  - 两任务均 Completed;
+  - 输入顺序第一任务 fast-forward 成功,主 HEAD →
+    `e2c392fe33a5306013f31fd1711e2e6ee99de2bd`;
+  - 第二任务因共享 base 前进被拒绝,worktree 保留;
+  - 审批摘要包含 task id + call id;
+  - 无敏感信息泄漏。
+
 ## 账本审计
 
 对 PDF1/PDF2/PDF3 全部任务账本检查:
