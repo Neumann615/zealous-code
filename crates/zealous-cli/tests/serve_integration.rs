@@ -469,7 +469,8 @@ fn serve_parallel_two_tasks_approvals_and_status() {
     };
     git(&["init", "-q", "-b", "main"]);
     std::fs::write(repo.join(".gitignore"), ".zealous/\n").unwrap();
-    std::fs::write(repo.join("note.txt"), "OLD\n").unwrap();
+    std::fs::write(repo.join("one.txt"), "ONE-OLD\n").unwrap();
+    std::fs::write(repo.join("two.txt"), "TWO-OLD\n").unwrap();
     git(&["add", "-A"]);
     git(&[
         "-c",
@@ -571,7 +572,7 @@ fn serve_parallel_two_tasks_approvals_and_status() {
             }
         });
     let line = v["params"]["line"].as_str().unwrap_or_default();
-    assert!(line.contains("applied=1"), "{line}");
+    assert!(line.contains("integrated=1"), "{line}");
 
     let status = request!("get_parallel_status", serde_json::json!({}));
     assert_eq!(status["result"]["total"], 2, "{status}");
@@ -590,9 +591,24 @@ fn serve_parallel_two_tasks_approvals_and_status() {
         assert_eq!(task["result"]["status"], "Completed", "{task}");
     }
     assert!(repo.join(".zealous/worktrees").join(&task_ids[1]).exists());
-    assert!(std::fs::read_to_string(repo.join("note.txt"))
+    assert!(std::fs::read_to_string(repo.join("one.txt"))
         .unwrap()
-        .contains("NEW"));
+        .contains("ONE-DONE"));
+    assert!(std::fs::read_to_string(repo.join("two.txt"))
+        .unwrap()
+        .contains("TWO-OLD"));
+
+    // spec 158:app-server 显式三方合并第二个共享 base 的 Completed task。
+    let merge = request!("merge_task", serde_json::json!({"task_id": task_ids[1]}));
+    assert_eq!(merge["result"]["merged"], true, "{merge}");
+    assert!(std::fs::read_to_string(repo.join("two.txt"))
+        .unwrap()
+        .contains("TWO-DONE"));
+    let merged_task = request!("get_task", serde_json::json!({"task_id": task_ids[1]}));
+    assert_eq!(
+        merged_task["result"]["applied_strategy"], "ThreeWayMerge",
+        "{merged_task}"
+    );
 
     let shutdown_id = next_id;
     proc.send(&serde_json::json!({"id": shutdown_id, "cmd": "shutdown", "params": {}}));
@@ -631,12 +647,19 @@ fn parallel_stage_endpoint() -> String {
             }
         }
         let request = String::from_utf8_lossy(&raw).to_string();
+        let one = request.contains("parallel one");
         let content = if request.contains("tool `edit_file` result") {
             r#"{"action":"message","text":"done"}"#
-        } else if request.contains("edit note") {
-            r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD","new_text":"NEW"}}"#
+        } else if request.contains("edit target") {
+            if one {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"one.txt","old_text":"ONE-OLD","new_text":"ONE-DONE"}}"#
+            } else {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"two.txt","old_text":"TWO-OLD","new_text":"TWO-DONE"}}"#
+            }
+        } else if one {
+            r#"{"action":"plan","plan":"edit target one","workers":[]}"#
         } else {
-            r#"{"action":"plan","plan":"edit note","workers":[]}"#
+            r#"{"action":"plan","plan":"edit target two","workers":[]}"#
         };
         let body = chat_body(content);
         let _ = stream.write_all(

@@ -585,3 +585,143 @@ fn stage_mock_endpoint() -> String {
     });
     format!("http://{addr}/v1")
 }
+
+#[test]
+fn cli_parallel_merge_strategy_integrates_both_tasks() {
+    let repo = base_repo("parallel-merge-cli");
+    std::fs::write(repo.join("left.txt"), "LEFT\n").unwrap();
+    std::fs::write(repo.join("right.txt"), "RIGHT\n").unwrap();
+    git(&repo, &["add", "left.txt", "right.txt"]);
+    git(&repo, &["commit", "-q", "-m", "merge targets"]);
+    let endpoint = parallel_merge_endpoint();
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let mut ids = Vec::new();
+    for title in ["parallel merge left", "parallel merge right"] {
+        let out = Command::new(zealous)
+            .args(["task", "new", title])
+            .current_dir(&repo)
+            .env("ZEALOUS_BASE_URL", &endpoint)
+            .env("ZEALOUS_API_KEY", "e2e-secret-key")
+            .env("ZEALOUS_MODEL", "mock-model")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        ids.push(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("task created: "))
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+    }
+
+    let out = Command::new(zealous)
+        .args([
+            "parallel",
+            "run",
+            ids[0].as_str(),
+            ids[1].as_str(),
+            "--auto-apply",
+            "--integrate",
+            "merge",
+            "--yes",
+        ])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("merged 1"), "{text}");
+    assert!(std::fs::read_to_string(repo.join("left.txt"))
+        .unwrap()
+        .contains("LEFT-DONE"));
+    assert!(std::fs::read_to_string(repo.join("right.txt"))
+        .unwrap()
+        .contains("RIGHT-DONE"));
+    let merges = git(&repo, &["log", "--oneline", "--merges"]);
+    assert!(merges.contains(&format!("zealous/{}", ids[1])), "{merges}");
+    for id in &ids {
+        let out = Command::new(zealous)
+            .args(["task", "workspace", id])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        let ws = String::from_utf8_lossy(&out.stdout);
+        assert!(ws.contains("status:         applied"), "{ws}");
+    }
+    let second = std::fs::read_to_string(
+        repo.join(".zealous/tasks")
+            .join(&ids[1])
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    assert!(second.contains("ExecutionWorkspaceMerged"), "{second}");
+    assert!(!second.contains("e2e-secret-key"), "{second}");
+}
+
+fn parallel_merge_endpoint() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let len = text
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let request = String::from_utf8_lossy(&raw).to_string();
+        let left = request.contains("parallel merge left");
+        let content = if request.contains("tool `edit_file` result") {
+            r#"{"action":"message","text":"done"}"#
+        } else if request.contains("edit target") {
+            if left {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"left.txt","old_text":"LEFT","new_text":"LEFT-DONE"}}"#
+            } else {
+                r#"{"action":"tool","tool":"edit_file","args":{"path":"right.txt","old_text":"RIGHT","new_text":"RIGHT-DONE"}}"#
+            }
+        } else if left {
+            r#"{"action":"plan","plan":"edit target left","workers":[]}"#
+        } else {
+            r#"{"action":"plan","plan":"edit target right","workers":[]}"#
+        };
+        let body = chat_body(content);
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    });
+    format!("http://{addr}/v1")
+}

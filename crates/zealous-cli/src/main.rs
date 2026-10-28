@@ -94,9 +94,12 @@ enum ParallelCmd {
         /// Alpha 最大并发,默认 2,上限 2
         #[arg(long, default_value_t = 2)]
         max: usize,
-        /// 所有任务终态后自动按顺序 fast-forward apply
+        /// 所有任务终态后自动按顺序集成(ff-only 或 merge)
         #[arg(long)]
         auto_apply: bool,
+        /// 集成策略:ff-only(默认)或 merge(spec 158)
+        #[arg(long, default_value = "ff-only")]
+        integrate: String,
         /// 全部工具审批自动通过
         #[arg(long)]
         yes: bool,
@@ -151,6 +154,13 @@ enum TaskCmd {
     Events { task_id: String },
     /// 将已完成 isolated 任务 fast-forward 应用回主工作区(spec 155)
     Apply {
+        task_id: String,
+        /// 跳过确认(仅限你已确认变更内容)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 将因主分支前进而无法 fast-forward 的已完成 isolated 任务三方合并回主工作区(spec 158)
+    Merge {
         task_id: String,
         /// 跳过确认(仅限你已确认变更内容)
         #[arg(long)]
@@ -329,6 +339,7 @@ fn main() {
             } => cmd_run(&task_id, yes, no, quiet, isolate),
             TaskCmd::Events { task_id } => cmd_events(&task_id),
             TaskCmd::Apply { task_id, yes } => cmd_apply(&task_id, yes),
+            TaskCmd::Merge { task_id, yes } => cmd_merge(&task_id, yes),
             TaskCmd::Workspace { task_id } => cmd_workspace(&task_id),
             TaskCmd::WorkspaceRemove {
                 task_id,
@@ -353,10 +364,11 @@ fn main() {
                 all,
                 max,
                 auto_apply,
+                integrate,
                 yes,
                 no,
                 quiet,
-            } => cmd_parallel_run(task_ids, all, max, auto_apply, yes, no, quiet),
+            } => cmd_parallel_run(task_ids, all, max, auto_apply, integrate, yes, no, quiet),
             ParallelCmd::Status => cmd_parallel_status(),
         },
         Cmd::Config {
@@ -806,6 +818,7 @@ fn cmd_parallel_run(
     all: bool,
     max: usize,
     auto_apply: bool,
+    integrate: String,
     yes: bool,
     no: bool,
     quiet: bool,
@@ -819,6 +832,10 @@ fn cmd_parallel_run(
     if let Err(e) = zealous_engine::parallel::validate_limit(max) {
         return err(format!("parallel 启动失败: {e}"));
     }
+    let integration = match zealous_engine::parallel::IntegrationStrategy::parse(&integrate) {
+        Ok(strategy) => strategy,
+        Err(e) => return err(format!("parallel 启动失败: {e}")),
+    };
     let repo = match repo_root() {
         Ok(r) => r,
         Err(e) => return err(e),
@@ -867,7 +884,7 @@ fn cmd_parallel_run(
         Err(e) => return err(format!("provider 配置无效: {e}")),
     };
     println!(
-        "parallel: {} 个任务, isolated, max=1 batch/{}, auto_apply={auto_apply}",
+        "parallel: {} 个任务, isolated, max=1 batch/{}, auto_apply={auto_apply}, integrate={integrate}",
         ids.len(),
         ids.len()
     );
@@ -930,16 +947,39 @@ fn cmd_parallel_run(
                 if ok { "成功" } else { "失败" }
             );
         }),
+        on_merge_started: Box::new(|tid| {
+            println!("=== parallel task {} merge 开始 ===", tid.as_str());
+        }),
+        on_merge_finished: Box::new(|tid, ok, detail| {
+            println!(
+                "=== parallel task {} merge {}: {detail} ===",
+                tid.as_str(),
+                if ok { "成功" } else { "失败" }
+            );
+        }),
         confirm_apply: Box::new(confirm),
     };
     let summary = zealous_engine::parallel::run_parallel(
-        &repo, &svc, providers, model, 24, &ids, auto_apply, sink, progress, abort, &lease,
+        &repo,
+        &svc,
+        providers,
+        model,
+        24,
+        &ids,
+        auto_apply,
+        integration,
+        sink,
+        progress,
+        abort,
+        &lease,
         &mut hooks,
     );
     println!(
-        "parallel 完成: applied {} / completed {}, failed {}, interrupted {}, base {}",
+        "parallel 完成: integrated {} (ff {}) / completed {}, merged {}, failed {}, interrupted {}, base {}",
         summary.applied.len(),
+        summary.applied.len().saturating_sub(summary.merged.len()),
         summary.completed.len(),
+        summary.merged.len(),
         summary.failed.len(),
         summary.interrupted.len(),
         summary.base_commit
@@ -1159,6 +1199,97 @@ fn cmd_apply(task_id: &str, yes: bool) -> i32 {
     }
 }
 
+fn cmd_merge(task_id: &str, yes: bool) -> i32 {
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let tid = match zealous_core::TaskId::parse(task_id) {
+        Ok(t) => t,
+        Err(e) => return err(e.to_string()),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let (ledger, proj, _) = match svc.open_task(&tid) {
+        Ok(x) => x,
+        Err(e) => return err(e.to_string()),
+    };
+    let ledger = std::sync::Arc::new(ledger);
+    let ws = match &proj.execution_workspace {
+        Some(w) => w.clone(),
+        None => return err("任务不是 isolated 模式"),
+    };
+    if let Some(applied) = &proj.applied_commit {
+        println!("已应用/合并过(幂等): {applied}");
+        return 0;
+    }
+    if proj.status != TaskStatus::Completed {
+        return err("任务尚未 Completed,不能 merge");
+    }
+    let tip = match git_out(&repo, &["rev-parse", &format!("refs/heads/{}", ws.branch)]) {
+        Ok(t) => t.trim().to_string(),
+        Err(e) => return err(e),
+    };
+    let head = match git_out(&repo, &["rev-parse", "HEAD"]) {
+        Ok(t) => t.trim().to_string(),
+        Err(e) => return err(e),
+    };
+    println!("base:       {} @ {}", ws.base_branch, ws.base_commit);
+    println!("main HEAD:  {head}");
+    println!("task tip:   {} @ {}", ws.branch, tip);
+    println!("将三方合并的 commits:");
+    match git_out(
+        &repo,
+        &[
+            "log",
+            "--oneline",
+            &format!("{}..{}", ws.base_commit, ws.branch),
+        ],
+    ) {
+        Ok(l) => print!("{}", l),
+        Err(e) => return err(e),
+    }
+    println!("变更文件:");
+    match git_out(
+        &repo,
+        &[
+            "diff",
+            "--name-status",
+            &format!("{}..{}", ws.base_commit, ws.branch),
+        ],
+    ) {
+        Ok(l) => print!("{}", l),
+        Err(e) => return err(e),
+    }
+    println!("Git 无法自动合并时将立即 merge --abort,不保留冲突 index。");
+    if !yes {
+        print!("确认三方合并? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return err("读取确认失败");
+        }
+        let t = line.trim().to_ascii_lowercase();
+        if t != "y" && t != "yes" {
+            println!("已取消");
+            return 0;
+        }
+    }
+    match zealous_engine::workspace::merge(&repo, &ledger) {
+        Ok(out) => {
+            println!(
+                "merged: {} @ {} (task tip {})",
+                out.branch, out.merge_commit, out.task_tip
+            );
+            0
+        }
+        Err(e) => err(format!("merge: {e}")),
+    }
+}
+
 fn cmd_workspace(task_id: &str) -> i32 {
     let repo = match repo_root() {
         Ok(r) => r,
@@ -1189,6 +1320,16 @@ fn cmd_workspace(task_id: &str) -> i32 {
     println!("status:         {}", ws.status);
     if let Some(applied) = &proj.applied_commit {
         println!("applied_commit: {applied}");
+    }
+    if let Some(strategy) = &proj.applied_strategy {
+        let text = match strategy {
+            zealous_core::AppliedStrategy::FastForward => "fast_forward",
+            zealous_core::AppliedStrategy::ThreeWayMerge => "three_way_merge",
+        };
+        println!("applied_strategy: {text}");
+    }
+    if let Some(commit) = &proj.merge_commit {
+        println!("merge_commit:    {commit}");
     }
     println!("workspace_removed: {}", proj.workspace_removed);
     // 活分支 tip(来自 git 事实,仅展示)

@@ -55,6 +55,22 @@ pub enum WorkspaceError {
         actual: String,
     },
     NotFastForward,
+    /// merge 仍可用 fast-forward,应使用 apply
+    FastForwardAvailable,
+    /// 任务分支已包含在 base branch
+    AlreadyIntegrated,
+    /// 主 HEAD 不是 workspace base 的后代
+    BaseNotAncestorOfHead,
+    /// 三方合并冲突(已执行 merge --abort)
+    MergeConflict {
+        files: Vec<String>,
+    },
+    /// 冲突后未能恢复干净 index
+    MergeAbortFailed {
+        detail: String,
+    },
+    /// 任务已 integrated,merge 幂等场景由调用方区分
+    AlreadyIntegratedRecord,
     /// 任务分支缺失
     BranchMissing {
         branch: String,
@@ -105,6 +121,24 @@ impl std::fmt::Display for WorkspaceError {
             }
             WorkspaceError::NotFastForward => {
                 write!(f, "任务分支与 base 分支分叉,无法 fast-forward")
+            }
+            WorkspaceError::FastForwardAvailable => {
+                write!(f, "主 HEAD 仍等于 base,请使用 task apply(fast-forward)")
+            }
+            WorkspaceError::AlreadyIntegrated => {
+                write!(f, "任务分支已包含于 base branch")
+            }
+            WorkspaceError::BaseNotAncestorOfHead => {
+                write!(f, "主 HEAD 不是任务 base commit 的后代")
+            }
+            WorkspaceError::MergeConflict { files } => {
+                write!(f, "merge conflict: {}", files.join(", "))
+            }
+            WorkspaceError::MergeAbortFailed { detail } => {
+                write!(f, "merge 冲突后 abort 失败,index 可能不干净: {detail}")
+            }
+            WorkspaceError::AlreadyIntegratedRecord => {
+                write!(f, "workspace 已 applied/merged")
             }
             WorkspaceError::BranchMissing { branch } => write!(f, "任务分支缺失: {branch}"),
             WorkspaceError::NotApplied => write!(
@@ -402,6 +436,149 @@ pub fn apply(repo_root: &Path, ledger: &Ledger) -> Result<ApplyOutcome, Workspac
         branch: ws.branch,
         applied_commit,
         already: false,
+    })
+}
+
+#[derive(Debug)]
+pub struct MergeOutcome {
+    pub branch: String,
+    pub base_commit: String,
+    pub task_tip: String,
+    pub merge_commit: String,
+}
+
+/// spec 158:显式三方合并。仅在 ff 不可用、主分支仍包含原 base、工作区
+/// 干净且 Git 可自动合并时成功;冲突立即 abort并 fail-closed。
+pub fn merge(repo_root: &Path, ledger: &Ledger) -> Result<MergeOutcome, WorkspaceError> {
+    let proj = ledger
+        .fold_now()
+        .map_err(|e| WorkspaceError::Ledger(e.to_string()))?;
+    let ws = proj
+        .execution_workspace
+        .clone()
+        .ok_or(WorkspaceError::NotIsolated)?;
+    if proj.applied_commit.is_some() {
+        return Err(WorkspaceError::AlreadyIntegratedRecord);
+    }
+    if proj.status != TaskStatus::Completed {
+        return Err(WorkspaceError::TaskNotCompleted);
+    }
+    let current_branch = git(repo_root, &["branch", "--show-current"])?
+        .trim()
+        .to_string();
+    if current_branch != ws.base_branch {
+        return Err(WorkspaceError::NotOnBaseBranch {
+            expected: ws.base_branch.clone(),
+            actual: current_branch,
+        });
+    }
+    let head = git(repo_root, &["rev-parse", "HEAD"])?.trim().to_string();
+    if head == ws.base_commit {
+        return Err(WorkspaceError::FastForwardAvailable);
+    }
+    if !git_ok(
+        repo_root,
+        &["merge-base", "--is-ancestor", &ws.base_commit, "HEAD"],
+    ) {
+        return Err(WorkspaceError::BaseNotAncestorOfHead);
+    }
+    let state = worktree::read_state(repo_root).map_err(WorkspaceError::Git)?;
+    if state.has_user_changes() {
+        let details = state
+            .of(worktree::EntryKind::UserChange)
+            .iter()
+            .take(5)
+            .map(|e| format!("\n  {}", e.raw))
+            .collect::<String>();
+        return Err(WorkspaceError::DirtyWorktree { details });
+    }
+    let branch_ref = format!("refs/heads/{}", ws.branch);
+    if !git_ok(repo_root, &["rev-parse", "--verify", &branch_ref]) {
+        return Err(WorkspaceError::BranchMissing {
+            branch: ws.branch.clone(),
+        });
+    }
+    if !git_ok(
+        repo_root,
+        &["merge-base", "--is-ancestor", &ws.base_commit, &branch_ref],
+    ) {
+        return Err(WorkspaceError::NotFastForward);
+    }
+    if git_ok(
+        repo_root,
+        &["merge-base", "--is-ancestor", &branch_ref, "HEAD"],
+    ) {
+        return Err(WorkspaceError::AlreadyIntegrated);
+    }
+    let task_tip = git(repo_root, &["rev-parse", &branch_ref])?
+        .trim()
+        .to_string();
+
+    let merge_result = std::process::Command::new("git")
+        .args(["merge", "--no-ff", &ws.branch])
+        .current_dir(repo_root)
+        .output()
+        .map_err(|e| WorkspaceError::Git(format!("spawn git merge: {e}")))?;
+    if !merge_result.status.success() {
+        let conflict_output = std::process::Command::new("git")
+            .args(["diff", "--name-only", "--diff-filter=U"])
+            .current_dir(repo_root)
+            .output()
+            .map_err(|e| WorkspaceError::Git(format!("spawn git diff: {e}")))?;
+        let files = String::from_utf8_lossy(&conflict_output.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let abort = std::process::Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(repo_root)
+            .output()
+            .map_err(|e| WorkspaceError::Git(format!("spawn git merge --abort: {e}")))?;
+        if !abort.status.success() {
+            return Err(WorkspaceError::MergeAbortFailed {
+                detail: String::from_utf8_lossy(&abort.stderr).into(),
+            });
+        }
+        let porcelain = git(repo_root, &["status", "--porcelain"])?
+            .trim()
+            .to_string();
+        if !porcelain.is_empty() {
+            return Err(WorkspaceError::MergeAbortFailed { detail: porcelain });
+        }
+        let message = if files.is_empty() {
+            "merge conflict: (git did not report conflicted paths)".to_string()
+        } else {
+            format!("merge conflict: {}", files.join(", "))
+        };
+        let _ = ledger.append(
+            AgentRef::User,
+            EventPayload::ErrorOccurred {
+                scope: "workspace_merge".into(),
+                message: message.clone(),
+            },
+        );
+        return Err(WorkspaceError::MergeConflict { files });
+    }
+
+    let merge_commit = git(repo_root, &["rev-parse", "HEAD"])?.trim().to_string();
+    ledger
+        .append(
+            AgentRef::User,
+            EventPayload::ExecutionWorkspaceMerged {
+                branch: ws.branch.clone(),
+                base_commit: ws.base_commit.clone(),
+                task_tip: task_tip.clone(),
+                merge_commit: merge_commit.clone(),
+                conflicted: false,
+            },
+        )
+        .map_err(|e| WorkspaceError::Ledger(e.to_string()))?;
+    Ok(MergeOutcome {
+        branch: ws.branch,
+        base_commit: ws.base_commit,
+        task_tip,
+        merge_commit,
     })
 }
 
@@ -733,6 +910,78 @@ mod tests {
         assert_eq!(
             proj.applied_commit,
             Some(proj.execution_workspace.unwrap().base_commit)
+        );
+    }
+
+    #[test]
+    fn merge_rejects_when_fast_forward_is_still_available() {
+        let (dir, tid, ledger) = task_repo("merge-ff");
+        let ws = run_and_complete(&dir, &tid, &ledger);
+        commit_in_worktree(&ws.path, "feat: isolated");
+        let err = merge(&dir, &ledger).unwrap_err();
+        assert_eq!(err, WorkspaceError::FastForwardAvailable);
+    }
+
+    #[test]
+    fn merge_no_conflict_creates_merge_commit_and_projection() {
+        let (dir, tid, ledger) = task_repo("merge-clean");
+        let ws = run_and_complete(&dir, &tid, &ledger);
+        commit_in_worktree(&ws.path, "feat: task change");
+        std::fs::write(dir.join("main-change.txt"), "main\n").unwrap();
+        git(&dir, &["add", "main-change.txt"]);
+        git(&dir, &["commit", "-q", "-m", "main moved"]);
+        let before = git(&dir, &["rev-parse", "HEAD"]).trim().to_string();
+        let out = merge(&dir, &ledger).unwrap();
+        assert_ne!(out.merge_commit, before);
+        assert!(dir.join("feat.txt").exists());
+        assert!(dir.join("main-change.txt").exists());
+        assert!(ws.path.exists(), "任务 worktree 必须保留");
+        let proj = ledger.fold_now().unwrap();
+        assert_eq!(
+            proj.applied_commit.as_deref(),
+            Some(out.merge_commit.as_str())
+        );
+        assert_eq!(
+            proj.applied_strategy,
+            Some(zealous_core::AppliedStrategy::ThreeWayMerge)
+        );
+        assert_eq!(
+            proj.merge_commit.as_deref(),
+            Some(out.merge_commit.as_str())
+        );
+        let log = git(&dir, &["log", "--oneline", "--merges"]);
+        assert!(log.contains(&ws.branch), "{log}");
+    }
+
+    #[test]
+    fn merge_conflict_aborts_and_keeps_worktree() {
+        let (dir, tid, ledger) = task_repo("merge-conflict");
+        let ws = run_and_complete(&dir, &tid, &ledger);
+        std::fs::write(ws.path.join("base.txt"), "task side\n").unwrap();
+        git(&ws.path, &["add", "base.txt"]);
+        git(&ws.path, &["commit", "-q", "-m", "task conflict"]);
+        std::fs::write(dir.join("base.txt"), "main side\n").unwrap();
+        git(&dir, &["add", "base.txt"]);
+        git(&dir, &["commit", "-q", "-m", "main conflict"]);
+        let err = merge(&dir, &ledger).unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::MergeConflict { ref files } if *files == vec!["base.txt".to_string()]),
+            "{err:?}"
+        );
+        let status = git(&dir, &["status", "--porcelain"]);
+        assert!(status.trim().is_empty(), "{status}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt"))
+                .unwrap()
+                .trim_end(),
+            "main side"
+        );
+        assert!(ws.path.exists());
+        let proj = ledger.fold_now().unwrap();
+        assert!(proj.applied_commit.is_none());
+        assert_eq!(
+            proj.last_error,
+            Some(("workspace_merge".into(), "merge conflict: base.txt".into()))
         );
     }
 

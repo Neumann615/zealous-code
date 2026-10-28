@@ -48,6 +48,13 @@ pub struct PendingApproval {
     pub summary: String,
 }
 
+/// spec 158:workspace 集成策略(只来自事件投影)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum AppliedStrategy {
+    FastForward,
+    ThreeWayMerge,
+}
+
 /// spec 155:isolated 运行的工作区视图(只来自事件投影)
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ExecutionWorkspaceView {
@@ -82,6 +89,10 @@ pub struct TaskProjection {
     pub execution_workspace: Option<ExecutionWorkspaceView>,
     /// spec 155:已应用回主工作区的 commit
     pub applied_commit: Option<String>,
+    /// spec 158:集成策略;旧账本在事件补齐前保持 None
+    pub applied_strategy: Option<AppliedStrategy>,
+    /// spec 158:三方合并生成的 merge commit
+    pub merge_commit: Option<String>,
     /// spec 155:workspace 是否已清理
     pub workspace_removed: bool,
 }
@@ -131,6 +142,8 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
         last_event_seq: 0,
         execution_workspace: None,
         applied_commit: None,
+        applied_strategy: None,
+        merge_commit: None,
         workspace_removed: false,
     };
 
@@ -385,11 +398,36 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
                     ws.current_commit = applied_commit.clone();
                     ws.status = "applied".into();
                     proj.applied_commit = Some(applied_commit.clone());
+                    proj.applied_strategy = Some(AppliedStrategy::FastForward);
                 }
                 _ => {
                     return Err(FoldError::OrphanReference {
                         seq: event.seq,
                         detail: "apply 引用未准备的 workspace 或分支不匹配".into(),
+                    })
+                }
+            },
+            EventPayload::ExecutionWorkspaceMerged {
+                branch,
+                base_commit,
+                task_tip,
+                merge_commit,
+                conflicted,
+            } => match &mut proj.execution_workspace {
+                Some(ws)
+                    if ws.branch == *branch && ws.base_commit == *base_commit && !conflicted =>
+                {
+                    ws.current_commit = merge_commit.clone();
+                    ws.status = "applied".into();
+                    proj.applied_commit = Some(merge_commit.clone());
+                    proj.applied_strategy = Some(AppliedStrategy::ThreeWayMerge);
+                    proj.merge_commit = Some(merge_commit.clone());
+                    let _ = task_tip;
+                }
+                _ => {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "merge 引用未准备的 workspace、base 不匹配或声明冲突".into(),
                     })
                 }
             },
@@ -487,6 +525,7 @@ mod spec155_tests {
         ));
         let proj = fold(&tid, &events).unwrap();
         assert_eq!(proj.applied_commit.as_deref(), Some("def"));
+        assert_eq!(proj.applied_strategy, Some(AppliedStrategy::FastForward));
         assert_eq!(proj.execution_workspace.as_ref().unwrap().status, "applied");
 
         events.push(ev(
@@ -500,6 +539,48 @@ mod spec155_tests {
         let proj = fold(&tid, &events).unwrap();
         assert!(proj.workspace_removed);
         assert_eq!(proj.execution_workspace.as_ref().unwrap().status, "removed");
+    }
+
+    #[test]
+    fn workspace_merge_fold() {
+        let tid = TaskId::generate();
+        let events = vec![
+            ev(
+                &tid,
+                1,
+                EventPayload::TaskCreated {
+                    title: "t".into(),
+                    repo_root: "r".into(),
+                },
+            ),
+            ev(
+                &tid,
+                2,
+                EventPayload::ExecutionWorkspacePrepared {
+                    kind: "git-worktree".into(),
+                    branch: "zealous/t1".into(),
+                    path: "r/.zealous/worktrees/t1".into(),
+                    base_branch: "main".into(),
+                    base_commit: "abc".into(),
+                },
+            ),
+            ev(
+                &tid,
+                3,
+                EventPayload::ExecutionWorkspaceMerged {
+                    branch: "zealous/t1".into(),
+                    base_commit: "abc".into(),
+                    task_tip: "task".into(),
+                    merge_commit: "merge".into(),
+                    conflicted: false,
+                },
+            ),
+        ];
+        let proj = fold(&tid, &events).unwrap();
+        assert_eq!(proj.applied_commit.as_deref(), Some("merge"));
+        assert_eq!(proj.applied_strategy, Some(AppliedStrategy::ThreeWayMerge));
+        assert_eq!(proj.merge_commit.as_deref(), Some("merge"));
+        assert_eq!(proj.execution_workspace.as_ref().unwrap().status, "applied");
     }
 
     #[test]

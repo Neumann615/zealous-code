@@ -290,6 +290,22 @@ fn handle_key(
                         }
                     }
                 }
+                state::ConfirmKind::Merge => {
+                    if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, _proj, _)) => {
+                                match zealous_engine::workspace::merge(svc.repo_root(), &ledger) {
+                                    Ok(out) => state.push_important(&format!(
+                                        "merged: {} @ {} (task tip {})",
+                                        out.branch, out.merge_commit, out.task_tip
+                                    )),
+                                    Err(e) => state.push_important(&format!("merge 失败: {e}")),
+                                }
+                            }
+                            Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
                 state::ConfirmKind::Apply => {
                     if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
                         match svc.open_task(&task_id) {
@@ -541,6 +557,9 @@ fn handle_key(
             }
             KeyCode::Char('P') => {
                 state.open_confirm(state::ConfirmKind::Apply);
+            }
+            KeyCode::Char('M') => {
+                state.open_confirm(state::ConfirmKind::Merge);
             }
             KeyCode::Char('D') if state.workspace_visible => {
                 state.open_confirm(state::ConfirmKind::WorkspaceRemove);

@@ -71,6 +71,7 @@ pub struct ParallelShared {
     pub failed: Mutex<Vec<String>>,
     pub interrupted: Mutex<Vec<String>>,
     pub applied: Mutex<Vec<String>>,
+    pub merged: Mutex<Vec<String>>,
     pub apply_index: AtomicUsize,
     pub finished: AtomicBool,
     pub approvals: Arc<ParallelApprovals>,
@@ -201,6 +202,7 @@ impl Session {
             "stop_parallel" => Handled::Response(self.handle_stop_parallel(&req)),
             "get_parallel_status" => Handled::Response(self.handle_get_parallel_status(&req)),
             "apply_task" => Handled::Response(self.handle_apply_task(&req)),
+            "merge_task" => Handled::Response(self.handle_merge_task(&req)),
             "get_workspace" => Handled::Response(self.handle_get_workspace(&req)),
             "remove_workspace" => Handled::Response(self.handle_remove_workspace(&req)),
             "shutdown" => {
@@ -238,6 +240,7 @@ impl Session {
                             "concurrent_runs": 1,
                             "isolated_worktree": true,
                             "parallel_tasks": parallel_mod::MAX_PARALLEL_TASKS,
+                            "merge_task": true,
                         }
                     }),
                 )
@@ -860,6 +863,15 @@ impl Session {
             .get("auto_apply")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let integrate = req
+            .params
+            .get("integrate")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ff-only");
+        let integration = match parallel_mod::IntegrationStrategy::parse(integrate) {
+            Ok(strategy) => strategy,
+            Err(e) => return err_resp(req.id, "invalid_params", e),
+        };
         let mut task_ids: Vec<TaskId> = Vec::new();
         if all {
             match parallel_mod::select_runnable(&self.svc, max) {
@@ -925,6 +937,7 @@ impl Session {
             failed: Mutex::new(Vec::new()),
             interrupted: Mutex::new(Vec::new()),
             applied: Mutex::new(Vec::new()),
+            merged: Mutex::new(Vec::new()),
             apply_index: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
             approvals: Arc::new(ParallelApprovals {
@@ -1001,6 +1014,31 @@ impl Session {
                         &format!("{} {} {}", tid.as_str(), ok, detail),
                     ));
                 }),
+                on_merge_started: Box::new(|tid| {
+                    shared_t.apply_index.fetch_add(1, Ordering::SeqCst);
+                    let _ = notif.send(Notification::progress(
+                        "parallel_merge_started",
+                        tid.as_str(),
+                    ));
+                }),
+                on_merge_finished: Box::new(|tid, ok, detail| {
+                    if ok {
+                        shared_t
+                            .applied
+                            .lock()
+                            .unwrap()
+                            .push(tid.as_str().to_string());
+                        shared_t
+                            .merged
+                            .lock()
+                            .unwrap()
+                            .push(tid.as_str().to_string());
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "parallel_merge_finished",
+                        &format!("{} {} {}", tid.as_str(), ok, detail),
+                    ));
+                }),
                 confirm_apply: Box::new(|_| auto_apply),
             };
             let summary = parallel_mod::run_parallel(
@@ -1011,6 +1049,7 @@ impl Session {
                 24,
                 &task_ids,
                 auto_apply,
+                integration,
                 approval_sink,
                 None,
                 shared_t.abort.clone(),
@@ -1022,11 +1061,12 @@ impl Session {
             let _ = notif.send(Notification::progress(
                 "parallel_finished",
                 &format!(
-                    "completed={} failed={} interrupted={} applied={} base={} stopped={}",
+                    "completed={} failed={} interrupted={} integrated={} merged={} base={} stopped={}",
                     summary.completed.len(),
                     summary.failed.len(),
                     summary.interrupted.len(),
                     summary.applied.len(),
+                    summary.merged.len(),
                     summary.base_commit,
                     summary.stopped_reason
                 ),
@@ -1036,7 +1076,7 @@ impl Session {
         self.parallel_join = Some(join);
         Response::ok(
             req.id,
-            serde_json::json!({ "parallel_started": true, "total": total, "base_commit": base_commit }),
+            serde_json::json!({ "parallel_started": true, "total": total, "base_commit": base_commit, "integrate": integrate }),
         )
     }
 
@@ -1061,6 +1101,7 @@ impl Session {
                     "failed": p.failed.lock().unwrap().clone(),
                     "interrupted": p.interrupted.lock().unwrap().clone(),
                     "applied": p.applied.lock().unwrap().clone(),
+                    "merged": p.merged.lock().unwrap().clone(),
                     "apply_index": p.apply_index.load(Ordering::SeqCst),
                     "total": p.task_ids.len(),
                     "apply_policy": if p.auto_apply { "auto" } else { "confirm" },
@@ -1104,6 +1145,50 @@ impl Session {
     }
 
     /// get_workspace(spec 155):workspace 状态必须来自事件投影
+    /// merge_task(spec 158):显式三方合并 Completed isolated task
+    fn handle_merge_task(&self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let (ledger, _projection, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        let _ = self
+            .notif_tx
+            .send(Notification::progress("merge_started", task_id.as_str()));
+        match zealous_engine::workspace::merge(&self.repo_root, &ledger) {
+            Ok(outcome) => {
+                let _ = self.notif_tx.send(Notification::progress(
+                    "merge_finished",
+                    &format!(
+                        "{} {} {}",
+                        task_id.as_str(),
+                        outcome.task_tip,
+                        outcome.merge_commit
+                    ),
+                ));
+                Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "merged": true,
+                        "branch": outcome.branch,
+                        "base_commit": outcome.base_commit,
+                        "task_tip": outcome.task_tip,
+                        "merge_commit": outcome.merge_commit
+                    }),
+                )
+            }
+            Err(e) => {
+                let _ = self
+                    .notif_tx
+                    .send(Notification::error_occurred(&e.to_string()));
+                err_resp(req.id, "merge_failed", e.to_string())
+            }
+        }
+    }
+
     fn handle_get_workspace(&mut self, req: &Request) -> Response {
         let task_id = match self.parse_task(req) {
             Ok(id) => id,

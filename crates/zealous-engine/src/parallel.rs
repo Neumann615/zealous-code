@@ -19,6 +19,24 @@ use zealous_core::{ApprovalDecision, TaskId, TaskStatus};
 
 pub const MAX_PARALLEL_TASKS: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationStrategy {
+    FastForwardOnly,
+    Merge,
+}
+
+impl IntegrationStrategy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "ff-only" => Ok(Self::FastForwardOnly),
+            "merge" => Ok(Self::Merge),
+            other => Err(format!(
+                "unknown integrate strategy {other:?}; expected ff-only or merge"
+            )),
+        }
+    }
+}
+
 pub fn validate_limit(max: usize) -> Result<(), String> {
     if max == 0 {
         Err("--max must be at least 1".into())
@@ -105,6 +123,8 @@ pub type OnTaskStartedFn<'a> = Box<dyn FnMut(&TaskId, usize, usize) + 'a>;
 pub type OnTaskFinishedFn<'a> = Box<dyn FnMut(&TaskId, TaskStatus) + 'a>;
 pub type OnApplyStartedFn<'a> = Box<dyn FnMut(&TaskId) + 'a>;
 pub type OnApplyFinishedFn<'a> = Box<dyn FnMut(&TaskId, bool, String) + 'a>;
+pub type OnMergeStartedFn<'a> = Box<dyn FnMut(&TaskId) + 'a>;
+pub type OnMergeFinishedFn<'a> = Box<dyn FnMut(&TaskId, bool, String) + 'a>;
 pub type ConfirmApplyFn<'a> = Box<dyn FnMut(&TaskId) -> bool + 'a>;
 
 pub struct ParallelHooks<'a> {
@@ -112,6 +132,8 @@ pub struct ParallelHooks<'a> {
     pub on_task_finished: OnTaskFinishedFn<'a>,
     pub on_apply_started: OnApplyStartedFn<'a>,
     pub on_apply_finished: OnApplyFinishedFn<'a>,
+    pub on_merge_started: OnMergeStartedFn<'a>,
+    pub on_merge_finished: OnMergeFinishedFn<'a>,
     pub confirm_apply: ConfirmApplyFn<'a>,
 }
 
@@ -122,6 +144,7 @@ pub struct ParallelSummary {
     pub failed: Vec<TaskId>,
     pub interrupted: Vec<TaskId>,
     pub applied: Vec<TaskId>,
+    pub merged: Vec<TaskId>,
     pub stopped_reason: String,
 }
 
@@ -141,6 +164,7 @@ pub fn run_parallel(
     max_turns: u64,
     task_ids: &[TaskId],
     auto_apply: bool,
+    integration: IntegrationStrategy,
     approval_sink: Arc<dyn ParallelApprovalSink>,
     progress: Option<SharedSink>,
     abort: Arc<AtomicBool>,
@@ -281,30 +305,59 @@ pub fn run_parallel(
                 format!("user rejected apply for {id}; later tasks are stopped");
             continue;
         }
-        (hooks.on_apply_started)(&id);
-        match workspace::apply(repo_root, &ledger) {
-            Ok(outcome) => {
-                (hooks.on_apply_finished)(
-                    &id,
-                    true,
-                    format!(
-                        "{} @ {}{}",
-                        outcome.branch,
-                        outcome.applied_commit,
-                        if outcome.already {
-                            " (already applied)"
-                        } else {
-                            ""
-                        }
-                    ),
-                );
-                summary.applied.push(id);
+        let current_head = git_head(repo_root).unwrap_or_default();
+        let should_merge =
+            integration == IntegrationStrategy::Merge && current_head != summary.base_commit;
+        if should_merge {
+            (hooks.on_merge_started)(&id);
+            match workspace::merge(repo_root, &ledger) {
+                Ok(outcome) => {
+                    (hooks.on_merge_finished)(
+                        &id,
+                        true,
+                        format!(
+                            "{} @ {} (task tip {})",
+                            outcome.branch, outcome.merge_commit, outcome.task_tip
+                        ),
+                    );
+                    summary.applied.push(id.clone());
+                    summary.merged.push(id);
+                }
+                Err(e) => {
+                    let detail = e.to_string();
+                    (hooks.on_merge_finished)(&id, false, detail.clone());
+                    summary.stopped_reason =
+                        format!("merge failed for {id}: {detail}; later tasks are stopped");
+                    break;
+                }
             }
-            Err(e) => {
-                let detail = e.to_string();
-                (hooks.on_apply_finished)(&id, false, detail.clone());
-                summary.stopped_reason =
-                    format!("apply failed for {id}: {detail}; later tasks are stopped");
+        } else {
+            (hooks.on_apply_started)(&id);
+            match workspace::apply(repo_root, &ledger) {
+                Ok(outcome) => {
+                    (hooks.on_apply_finished)(
+                        &id,
+                        true,
+                        format!(
+                            "{} @ {}{}",
+                            outcome.branch,
+                            outcome.applied_commit,
+                            if outcome.already {
+                                " (already applied)"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                    summary.applied.push(id);
+                }
+                Err(e) => {
+                    let detail = e.to_string();
+                    (hooks.on_apply_finished)(&id, false, detail.clone());
+                    summary.stopped_reason =
+                        format!("apply failed for {id}: {detail}; later tasks are stopped");
+                    break;
+                }
             }
         }
     }
@@ -412,6 +465,8 @@ mod tests {
             on_task_finished: Box::new(|_, _| {}),
             on_apply_started: Box::new(|_| {}),
             on_apply_finished: Box::new(|_, _, _| {}),
+            on_merge_started: Box::new(|_| {}),
+            on_merge_finished: Box::new(|_, _, _| {}),
             confirm_apply: Box::new(|_| true),
         }
     }
@@ -470,6 +525,7 @@ mod tests {
             16,
             &[a.clone(), b.clone()],
             true,
+            IntegrationStrategy::FastForwardOnly,
             Arc::new(AutoParallelApprove),
             None,
             Arc::new(AtomicBool::new(false)),
@@ -493,6 +549,49 @@ mod tests {
     }
 
     #[test]
+    fn merge_strategy_integrates_both_independent_tasks() {
+        let _provider_env = provider_env();
+        let dir = repo("integrate-merge");
+        let svc = TaskService::new(dir.clone());
+        let a = task(&svc, "A");
+        let b = task(&svc, "B");
+        let lease = try_acquire(&dir, "parallel", "parallel").unwrap();
+        let mut h = hooks();
+        let summary = run_parallel(
+            &dir,
+            &svc,
+            vec![
+                provider("a.txt", "a", "a-done"),
+                provider("b.txt", "b", "b-done"),
+            ],
+            "mock".into(),
+            16,
+            &[a.clone(), b.clone()],
+            true,
+            IntegrationStrategy::Merge,
+            Arc::new(AutoParallelApprove),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            &lease,
+            &mut h,
+        );
+        assert!(
+            summary.stopped_reason.is_empty(),
+            "{}",
+            summary.stopped_reason
+        );
+        assert_eq!(summary.completed, vec![a.clone(), b.clone()]);
+        assert_eq!(summary.applied, vec![a.clone(), b.clone()]);
+        assert_eq!(summary.merged, vec![b.clone()]);
+        assert!(std::fs::read_to_string(dir.join("a.txt"))
+            .unwrap()
+            .contains("a-done"));
+        assert!(std::fs::read_to_string(dir.join("b.txt"))
+            .unwrap()
+            .contains("b-done"));
+    }
+
+    #[test]
     fn failure_retains_worktree_and_completed_task_applies() {
         let _provider_env = provider_env();
         let dir = repo("failure");
@@ -509,6 +608,7 @@ mod tests {
             16,
             &[a.clone(), b.clone()],
             true,
+            IntegrationStrategy::FastForwardOnly,
             Arc::new(AutoParallelApprove),
             None,
             Arc::new(AtomicBool::new(false)),

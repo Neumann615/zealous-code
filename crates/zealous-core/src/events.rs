@@ -222,6 +222,14 @@ pub enum EventPayload {
         branch: String,
         applied_commit: String,
     },
+    /// spec 158:任务分支已三方合并回主工作区(仅无冲突成功时落账)
+    ExecutionWorkspaceMerged {
+        branch: String,
+        base_commit: String,
+        task_tip: String,
+        merge_commit: String,
+        conflicted: bool,
+    },
     /// spec 155:任务 worktree 与分支已清理
     ExecutionWorkspaceRemoved {
         branch: String,

@@ -283,6 +283,16 @@ pub fn spawn_parallel(
             on_apply_started: Box::new(|tid| {
                 progress_sink.progress(&format!("parallel task {} apply 开始", tid.as_str()));
             }),
+            on_merge_started: Box::new(|tid| {
+                progress_sink.progress(&format!("parallel task {} merge 开始", tid.as_str()));
+            }),
+            on_merge_finished: Box::new(|tid, ok, detail| {
+                let mark = if ok { "成功" } else { "失败" };
+                progress_sink.progress(&format!(
+                    "parallel task {} merge {mark}: {detail}",
+                    tid.as_str()
+                ));
+            }),
             on_apply_finished: Box::new(|tid, ok, detail| {
                 let mark = if ok { "成功" } else { "失败" };
                 progress_sink.progress(&format!(
@@ -300,6 +310,7 @@ pub fn spawn_parallel(
             24,
             &task_ids,
             true,
+            zealous_engine::parallel::IntegrationStrategy::FastForwardOnly,
             Arc::new(approval_sink),
             Some(progress),
             abort,
@@ -307,11 +318,12 @@ pub fn spawn_parallel(
             &mut hooks,
         );
         let _ = event_tx.send(TuiEvent::ParallelFinished(format!(
-            "completed={} failed={} interrupted={} applied={} base={} stopped={}",
+            "completed={} failed={} interrupted={} integrated={} merged={} base={} stopped={}",
             summary.completed.len(),
             summary.failed.len(),
             summary.interrupted.len(),
             summary.applied.len(),
+            summary.merged.len(),
             summary.base_commit,
             summary.stopped_reason
         )));

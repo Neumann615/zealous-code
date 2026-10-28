@@ -48,6 +48,7 @@ pub const PROGRESS_RING_CAP: usize = 200;
 pub enum ConfirmKind {
     IsolatedRun,
     Apply,
+    Merge,
     WorkspaceRemove,
     /// spec 156:串行运行全部可运行 queued 任务(auto apply)
     QueueRun,
@@ -364,6 +365,14 @@ mod tests {
         s.parallel_status_text = Some("active: parallel".into());
         s.screen = Screen::Parallel;
         assert_eq!(s.screen, Screen::Parallel);
+    }
+
+    #[test]
+    fn merge_confirmation_state() {
+        let mut s = TuiState::new();
+        s.open_confirm(ConfirmKind::Merge);
+        assert_eq!(s.confirm, Some(ConfirmKind::Merge));
+        assert_eq!(s.take_confirm(), Some(ConfirmKind::Merge));
     }
 
     #[test]

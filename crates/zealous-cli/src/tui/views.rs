@@ -153,6 +153,16 @@ fn projection_lines(state: &TuiState, full: bool) -> Vec<Line<'static>> {
                 if let Some(applied) = &proj.applied_commit {
                     lines.push(Line::from(format!("  applied: {applied}")));
                 }
+                if let Some(strategy) = &proj.applied_strategy {
+                    let text = match strategy {
+                        zealous_core::AppliedStrategy::FastForward => "fast_forward",
+                        zealous_core::AppliedStrategy::ThreeWayMerge => "three_way_merge",
+                    };
+                    lines.push(Line::from(format!("  strategy: {text}")));
+                }
+                if let Some(commit) = &proj.merge_commit {
+                    lines.push(Line::from(format!("  merge commit: {commit}")));
+                }
                 if proj.workspace_removed {
                     lines.push(Line::from("  (workspace 已清理)"));
                 }
@@ -209,7 +219,7 @@ fn render_detail_full(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let mut lines = projection_lines(state, true);
     if state.screen == Screen::Detail {
         lines.push(Line::from(format!(
-            "[{}] 事件流(R 运行/恢复 · x 中断 · a 批准 · d 拒绝 · e 事件流 · Esc 返回)",
+            "[{}] 事件流(R 运行/恢复 · P apply · M merge · x 中断 · a 批准 · d 拒绝 · e 事件流 · Esc 返回)",
             if state.events_expanded {
                 "已展开"
             } else {
@@ -282,6 +292,13 @@ fn render_confirm_modal(f: &mut Frame, state: &TuiState) {
             vec![
                 "将把任务分支 fast-forward 应用回主工作区。".to_string(),
                 "要求:主分支未前进、主工作区干净。".to_string(),
+            ],
+        ),
+        super::state::ConfirmKind::Merge => (
+            "Merge".to_string(),
+            vec![
+                "将对 Completed isolated 任务执行 --no-ff 三方合并。".to_string(),
+                "Git 无法自动合并时立即 abort,不保留冲突 index。".to_string(),
             ],
         ),
         super::state::ConfirmKind::WorkspaceRemove => (
@@ -549,6 +566,8 @@ pub(crate) mod tests {
             last_error: Some(("orchestrator".into(), "验证失败".into())),
             execution_workspace: None,
             applied_commit: None,
+            applied_strategy: None,
+            merge_commit: None,
             workspace_removed: false,
             interrupted_count: 1,
             last_event_seq: 9,

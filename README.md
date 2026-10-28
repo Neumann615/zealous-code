@@ -53,6 +53,13 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    zealous task apply <task-id>
    ```
 
+   若并行任务共享的 base 已因前一个任务 apply 而前进,可显式三方合并:
+
+   ```bash
+   zealous task merge <task-id>
+   ```
+
+
    多个 isolated 任务可串行执行并按顺序 fast-forward:
 
    ```bash
@@ -64,8 +71,10 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
 
    ```bash
    zealous parallel run <task-id-1> <task-id-2> --auto-apply
+   zealous parallel run <task-id-1> <task-id-2> --integrate merge
    zealous parallel status
    ```
+
 
 5. 或进入可视化工作台:
 
@@ -112,7 +121,7 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
 ## Known Limitations
 
 - 全局同一时间只允许一个 run batch;parallel Alpha 最多同时运行 2 个 isolated 任务。
-- parallel 多任务共享同一 base;第一个任务 apply 后,后续任务不会自动三方合并,需手动 merge/rebase。
+- parallel 默认 `--integrate ff-only`;显式 `--integrate merge` 时对无冲突任务生成三方 merge commit,冲突则 abort 并保留 worktree。
 - app-server 为单客户端、单并发 run/queue/parallel worker。
 - 不是 OS sandbox(见 Security Model)。
 - Windows 优先;macOS / Linux 未完整验证。
