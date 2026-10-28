@@ -2,16 +2,16 @@
 
 ## Traceability (all values measured at build time; three-stage model)
 
-- Runtime source commit: e0715c3843e731ed49c49770a486adc15a5bb471
+- Runtime source commit: c2e16d70bb31f441473a6aa373fc667842e55351
 - RC record commit: (filled after commit; diff vs runtime source must be
   acceptance/release docs only - spec 150 three-stage model)
 - Bundle rotation commit: (created after the RC record commit; NOT part of
   the bundle; see bundle rotation log)
 - Rustc release: 1.99.0 (measured via rustc -vV)
 - Host triple: x86_64-pc-windows-gnu (measured via rustc -vV)
-- Build time: 2026-10-29 03:29:34 UTC
+- Build time: 2026-10-29 04:20:59 UTC
 - Target platform: Windows x64
-- Distribution: OFFLINE EXTERNAL CANDIDATE, NOT PUBLISHED
+- Distribution: LOCAL TRIAL (NOT for external release)
 
 ## Quality gates (all PASS)
 
@@ -31,8 +31,8 @@
 ## Artifact
 
 - Path: dist/zealous-0.1.0-x86_64-pc-windows-gnu.zip
-- Size: 3081355 bytes
-- SHA256: 1CCAE69DD256E1DF945D748B2EB7CC6982AC94CC8D1649EAFA145E4D1FAC7580
+- Size: 3146971 bytes
+- SHA256: 17BB4928B4CA2648C99CC73545C24FADBBFA54FBF99FE6344B581015685CE0CF
 - Manifest: zealous.exe (single entry)
 
 ## Security boundary
