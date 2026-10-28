@@ -58,6 +58,35 @@
   (2FE45EA7…23E403C,为新 bundle 历史前缀);
 - 本提交为 bundle rotation commit,不进入 bundle(spec 150 既定限制);
 - offline RC lock 已刷新至新候选包;archive bundle 保留;仍不推 remote。
+## DF1 三任务真实串行队列(spec 156 补验收)—— PASS
+
+- 执行日期:2026-10-29;
+- 二进制:OFFLINE RC zip 解压结果 `%TEMP%\zealous-dogfooding-156-df1c-4d46afe7\bin\zealous.exe`(SHA256 与 RC 156 一致:`706C0A4A04C3345AEC063E7E987D34B505A08CC272402CCABE7CBAE23B171E7A`);
+- 模型:智谱 `glm-5.3-flash`;
+- 临时仓库:`%TEMP%\zealous-dogfooding-156-df1c-4d46afe7`;
+- base commit:`57517e70ac59611637d13b15f357dab956b4f557`;
+- 命令:`zealous queue run <task-1> <task-2> <task-3> --auto-apply --yes`。
+
+### 任务与结果
+
+| # | Task | 目标 | 状态 | apply 后主 HEAD |
+| --- | --- | --- | --- | --- |
+| 1 | `task_01M61V572QTENQNS56FFM0AHGJ` | `version.txt`: `0.1.0` → `0.2.0` | Completed | `df15483aa2cc0ad9e5bd918408cc2f08e177d427` |
+| 2 | `task_01M61V57347DB1YH2GNK6DMBD0` | 基于 `0.2.0` 更新 `README.md` | Completed | `bebbe3fa2fcc83606275c3d6e85a88ff01b3c3a8` |
+| 3 | `task_01M61V573JPRH4X1VJYK8P9WAM` | 新增并验证 `verify.ps1` | Completed | `3017cc64d272902c19a9b3e16808dd338a82795c` |
+
+- 队列输出 `applied 3 / completed 3`,退出码 0;
+- 三个任务均自动创建 isolated worktree 并基于上一步 apply 后的主 HEAD;
+- 主分支最终包含三个任务 rollback/apply commits,内容分别为 `version=0.2.0`、README `Version 0.2.0`、`verify.ps1`;
+- T1/T2 均有审批记录;`verify.ps1` 的 shell 调用被记录为 T2 审批动作;
+- 每任务 pending approvals = 0,状态均为 Completed;
+- 无路径越界、未审批写入或敏感信息泄漏。
+
+### 附加强验证
+
+- 首次准备仓库时 brief 文件保持 untracked,Task 1 完成后 apply 被 UserChange 守卫拒绝,队列停止且后续任务保持 Queued——fail-closed 正确;
+- 该轮只是测试数据准备问题,不计产品缺陷。brief 纳入初始提交后,全新三任务队列完整通过。
+
 ## DF2 失败停止(spec 156 队列)—— PASS
 
 - mock ok3_then_500:任务 1 三次请求 OK(Completed+apply);
