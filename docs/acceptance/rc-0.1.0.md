@@ -2,16 +2,16 @@
 
 ## Traceability (all values measured at build time; three-stage model)
 
-- Runtime source commit: 8c149091ba4129902aece4722acf8581be6ce3e3
+- Runtime source commit: 80bc7818b4ac578edfcc93c25e090e7ab0a5592a
 - RC record commit: (filled after commit; diff vs runtime source must be
   acceptance/release docs only - spec 150 three-stage model)
 - Bundle rotation commit: (created after the RC record commit; NOT part of
   the bundle; see bundle rotation log)
 - Rustc release: 1.99.0 (measured via rustc -vV)
 - Host triple: x86_64-pc-windows-gnu (measured via rustc -vV)
-- Build time: 2026-10-30 00:38:44 UTC
+- Build time: 2026-10-30 00:41:19 UTC
 - Target platform: Windows x64
-- Distribution: LOCAL TRIAL (NOT for external release)
+- Distribution: OFFLINE EXTERNAL CANDIDATE, NOT PUBLISHED
 
 ## Quality gates (all PASS)
 
