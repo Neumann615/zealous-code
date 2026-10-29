@@ -97,6 +97,23 @@
   - B/C 集成不受 A 失败阻塞;
   - 主工作区干净。
 
+## LOCAL TRIAL release 回归 —— PASS
+
+- RC zip SHA256:`52120E388B4161D5AF7E181AC472A9A2D6C24250C1E4ED870B4C953542EC5027`
+- 解压二进制:`%TEMP%\zealous-161-localtrial-e6a60d3d\bin\zealous.exe`
+- 仓库:`%TEMP%\zealous-161-localtrial-e6a60d3d`
+- base:`d5cffc5f46f5c2c02ab88f3d7904b775d4182b04`
+- 三任务分别修改 `docs/A.md`、`src/B.rs`、`tests/C.txt`
+- 结果:
+  - 三任务 Completed;
+  - A fast-forward 至
+    `1b33de644f79a5c112b2f676214f389b9ca43357`;
+  - B merge 至
+    `345968fa2cc1c1aeeec847f1e58737e32bfd7e06`;
+  - C merge 至
+    `7bfe7b9b982c68d86748fd0e331f998ed005b92f`;
+  - 主工作区干净,三组变更全部保留。
+
 ## 账本审计
 
 对 DT1 / DT2 / DT3(含首轮与有效重跑)/ DT4 全部任务账本检查:
