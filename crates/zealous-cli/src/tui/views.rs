@@ -369,6 +369,19 @@ fn render_confirm_modal(f: &mut Frame, state: &TuiState) {
             lines.push("Completed tasks will be fast-forward applied in input order.".into());
             ("Parallel".to_string(), lines)
         }
+        super::state::ConfirmKind::ParallelIntegrate => {
+            let mut lines = vec![
+                "Integrate completed isolated tasks?".to_string(),
+                String::new(),
+            ];
+            for (i, id) in state.parallel_ids.iter().enumerate() {
+                let strategy = if i == 0 { "apply" } else { "merge" };
+                lines.push(format!("{}. {} — {strategy}", i + 1, id.as_str()));
+            }
+            lines.push(String::new());
+            lines.push("Conflict policy: workspace".into());
+            ("Parallel Integrate".to_string(), lines)
+        }
         super::state::ConfirmKind::QueueRun => {
             let mut lines = vec![
                 "Run queued tasks in isolated worktrees?".to_string(),

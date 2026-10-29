@@ -496,6 +496,20 @@ fn handle_key(
                         }
                     }
                 }
+                state::ConfirmKind::ParallelIntegrate => {
+                    if !state.running {
+                        let ids = state.parallel_ids.clone();
+                        if !ids.is_empty() {
+                            state.running = true;
+                            runner::spawn_parallel_integrate(
+                                TaskService::new(svc.repo_root().to_path_buf()),
+                                ids,
+                                event_tx.clone(),
+                                progress_sink.clone(),
+                            );
+                        }
+                    }
+                }
                 state::ConfirmKind::QueueRun => {
                     if !state.running {
                         let ids = state.queue_ids.clone();
@@ -575,7 +589,7 @@ fn handle_key(
             KeyCode::Char('r') => state.refresh_tasks(list_tasks(svc)),
             KeyCode::Char('n') => state.open_form(),
             KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                // spec 157:确认后并行运行最多两个 runnable queued tasks
+                // spec 157/161:确认后并行运行最多三个 runnable queued tasks
                 match zealous_engine::parallel::select_runnable(
                     svc,
                     zealous_engine::parallel::MAX_PARALLEL_TASKS,
@@ -589,6 +603,41 @@ fn handle_key(
                         }
                     }
                     Err(e) => state.set_error(e.clone()),
+                }
+            }
+            KeyCode::Char('I') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let mut integrable = Vec::new();
+                for summary in list_tasks(svc) {
+                    if integrable.len() == zealous_engine::parallel::MAX_PARALLEL_TASKS {
+                        break;
+                    }
+                    if summary.status != zealous_core::TaskStatus::Completed {
+                        continue;
+                    }
+                    if let Ok((_, proj, _)) = svc.open_task(&summary.task_id) {
+                        let eligible = proj.execution_workspace.is_some()
+                            && proj.applied_commit.is_none()
+                            && !proj.workspace_removed
+                            && proj
+                                .merge_workspace
+                                .as_ref()
+                                .map(|w| w.status != "conflicted" && w.status != "resolved")
+                                .unwrap_or(true)
+                            && proj
+                                .execution_workspace
+                                .as_ref()
+                                .map(|w| std::path::Path::new(&w.path).exists())
+                                .unwrap_or(false);
+                        if eligible {
+                            integrable.push(summary.task_id);
+                        }
+                    }
+                }
+                if integrable.is_empty() {
+                    state.set_error("(no integrable completed tasks)".into());
+                } else {
+                    state.parallel_ids = integrable;
+                    state.open_confirm(state::ConfirmKind::ParallelIntegrate);
                 }
             }
             KeyCode::Char('a') => {

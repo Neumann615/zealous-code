@@ -59,8 +59,10 @@ pub enum ConfirmKind {
     WorkspaceRemove,
     /// spec 156:串行运行全部可运行 queued 任务(auto apply)
     QueueRun,
-    /// spec 157:并行运行最多两个 runnable queued tasks(auto apply)
+    /// spec 157/161:并行运行最多三个 runnable queued tasks(auto integrate)
     ParallelRun,
+    /// spec 161:恢复集成已完成 isolated tasks
+    ParallelIntegrate,
 }
 
 /// TUI 全部 UI 状态;任务事实以投影/账本为准,这里只有派生显示数据
@@ -378,6 +380,8 @@ mod tests {
         s.parallel_status_text = Some("active: parallel".into());
         s.screen = Screen::Parallel;
         assert_eq!(s.screen, Screen::Parallel);
+        s.open_confirm(ConfirmKind::ParallelIntegrate);
+        assert_eq!(s.take_confirm(), Some(ConfirmKind::ParallelIntegrate));
     }
 
     #[test]

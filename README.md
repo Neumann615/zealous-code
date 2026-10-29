@@ -88,7 +88,8 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    ```bash
    zealous parallel run <task-id-1> <task-id-2> --auto-apply
    zealous parallel run <task-id-1> <task-id-2> --integrate merge
-   zealous parallel run <task-id-1> <task-id-2> --integrate merge --on-conflict workspace
+   zealous parallel run <task-a> <task-b> <task-c> --max 3 --integrate merge --on-conflict workspace
+   zealous parallel integrate <remaining-task-id> --integrate merge --on-conflict workspace
    zealous parallel status
    ```
 
@@ -138,7 +139,7 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
 ## Known Limitations
 
 - 全局同一时间只允许一个 run batch;parallel Alpha 最多同时运行 2 个 isolated 任务。
-- parallel 默认 `--integrate ff-only`;显式 `--integrate merge` 时对无冲突任务生成三方 merge commit,冲突则 abort 并保留 worktree。
+- parallel 默认 `--max 2`,Alpha 显式 `--max 3` 最多三任务并发;默认 `--integrate ff-only`,显式 merge 时按输入顺序 fast-forward / 三方 merge,`--on-conflict workspace` 保留冲突工作区。
 - app-server 为单客户端、单并发 run/queue/parallel worker。
 - 不是 OS sandbox(见 Security Model)。
 - Windows 优先;macOS / Linux 未完整验证。

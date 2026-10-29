@@ -91,7 +91,7 @@ enum ParallelCmd {
         /// 取全部可运行 Queued 任务的前 max 个
         #[arg(long)]
         all: bool,
-        /// Alpha 最大并发,默认 2,上限 2
+        /// Alpha 最大并发,默认 2,上限 3
         #[arg(long, default_value_t = 2)]
         max: usize,
         /// 所有任务终态后自动按顺序集成(ff-only 或 merge)
@@ -112,6 +112,17 @@ enum ParallelCmd {
         /// 只保留审批请求、错误与最终结果
         #[arg(long)]
         quiet: bool,
+    },
+    /// 冲突停止后按输入顺序恢复集成已完成任务(spec 161)
+    Integrate {
+        /// 按顺序集成的 task ids
+        task_ids: Vec<String>,
+        /// 集成策略:ff-only(默认)或 merge
+        #[arg(long, default_value = "ff-only")]
+        integrate: String,
+        /// merge 冲突策略:abort(默认)或 workspace
+        #[arg(long, default_value = "abort")]
+        on_conflict: String,
     },
     /// 查看并行状态(active / runnable / not runnable)
     Status,
@@ -423,6 +434,11 @@ fn main() {
                 no,
                 quiet,
             ),
+            ParallelCmd::Integrate {
+                task_ids,
+                integrate,
+                on_conflict,
+            } => cmd_parallel_integrate(task_ids, integrate, on_conflict),
             ParallelCmd::Status => cmd_parallel_status(),
         },
         Cmd::Config {
@@ -887,6 +903,12 @@ fn cmd_parallel_run(
     if let Err(e) = zealous_engine::parallel::validate_limit(max) {
         return err(format!("parallel 启动失败: {e}"));
     }
+    if !all && task_ids.len() > max {
+        return err(format!(
+            "parallel 启动失败: 显式 task ids 数量 {} 超过 --max {max}",
+            task_ids.len()
+        ));
+    }
     let integration = match zealous_engine::parallel::IntegrationStrategy::parse(&integrate) {
         Ok(strategy) => strategy,
         Err(e) => return err(format!("parallel 启动失败: {e}")),
@@ -932,7 +954,9 @@ fn cmd_parallel_run(
         parsed
     };
     if !all {
-        if let Err((i, id, reason)) = zealous_engine::parallel::validate_explicit(&svc, &ids) {
+        if let Err((i, id, reason)) =
+            zealous_engine::parallel::validate_explicit_with_max(&svc, &ids, max)
+        {
             return err(format!(
                 "parallel 启动失败(未执行任何任务): 第 {} 个任务 {id}: {reason}",
                 i + 1
@@ -1058,6 +1082,105 @@ fn cmd_parallel_run(
     );
     if !summary.stopped_reason.is_empty() {
         println!("parallel 停止: {}", summary.stopped_reason);
+        return 1;
+    }
+    0
+}
+
+fn cmd_parallel_integrate(task_ids: Vec<String>, integrate: String, on_conflict: String) -> i32 {
+    if task_ids.is_empty() {
+        return err("parallel integrate 失败: 至少提供一个 task id");
+    }
+    if task_ids.len() > zealous_engine::parallel::MAX_PARALLEL_TASKS {
+        return err(format!(
+            "parallel integrate 失败: Alpha 最多支持 {} 个任务",
+            zealous_engine::parallel::MAX_PARALLEL_TASKS
+        ));
+    }
+    let integration = match zealous_engine::parallel::IntegrationStrategy::parse(&integrate) {
+        Ok(strategy) => strategy,
+        Err(e) => return err(format!("parallel integrate 失败: {e}")),
+    };
+    let on_conflict_strategy =
+        match zealous_engine::parallel::OnConflictStrategy::parse(&on_conflict) {
+            Ok(strategy) => strategy,
+            Err(e) => return err(format!("parallel integrate 失败: {e}")),
+        };
+    let repo = match repo_root() {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let mut ids = Vec::new();
+    for raw in &task_ids {
+        match zealous_core::TaskId::parse(raw) {
+            Ok(id) => ids.push(id),
+            Err(e) => return err(format!("无效 task id {raw}: {e}")),
+        }
+    }
+    let lease = match zealous_engine::lease::try_acquire(&repo, "parallel", "parallel") {
+        Ok(l) => l,
+        Err(e) => return err(e.to_string()),
+    };
+    println!(
+        "parallel integrate: {} 个任务, integrate={integrate}, on_conflict={on_conflict}",
+        ids.len()
+    );
+    let mut hooks = zealous_engine::parallel::ParallelHooks {
+        on_task_started: Box::new(|_, _, _| {}),
+        on_task_finished: Box::new(|tid, status| {
+            println!("=== integrate task {} 状态: {status:?} ===", tid.as_str());
+        }),
+        on_apply_started: Box::new(|tid| {
+            println!("=== integrate task {} apply 开始 ===", tid.as_str());
+        }),
+        on_apply_finished: Box::new(|tid, ok, detail| {
+            println!(
+                "=== integrate task {} apply {}: {detail} ===",
+                tid.as_str(),
+                if ok { "成功" } else { "失败" }
+            );
+        }),
+        on_merge_started: Box::new(|tid| {
+            println!("=== integrate task {} merge 开始 ===", tid.as_str());
+        }),
+        on_merge_finished: Box::new(|tid, ok, detail| {
+            println!(
+                "=== integrate task {} merge {}: {detail} ===",
+                tid.as_str(),
+                if ok { "成功" } else { "失败" }
+            );
+        }),
+        on_merge_conflict: Box::new(|tid, files| {
+            println!(
+                "=== integrate task {} merge 冲突保留 workspace ===",
+                tid.as_str()
+            );
+            println!("conflicted files: {}", files.join(", "));
+        }),
+        confirm_apply: Box::new(|_| true),
+    };
+    let summary = zealous_engine::parallel::integrate(
+        &repo,
+        &svc,
+        &ids,
+        integration,
+        on_conflict_strategy,
+        &lease,
+        &mut hooks,
+    );
+    println!(
+        "parallel integrate 完成: integrated {} / completed {}, merged {}, conflict workspaces {}",
+        summary.applied.len(),
+        summary.completed.len(),
+        summary.merged.len(),
+        summary.merge_workspaces.len()
+    );
+    if !summary.stopped_reason.is_empty() {
+        println!("parallel integrate 停止: {}", summary.stopped_reason);
         return 1;
     }
     0

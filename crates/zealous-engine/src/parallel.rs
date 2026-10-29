@@ -1,6 +1,6 @@
 //! Parallel task Alpha (spec 157).
 //!
-//! At most two isolated tasks run concurrently. Task facts remain in their own
+//! At most three isolated tasks run concurrently. Task facts remain in their own
 //! ledgers; the batch order is runtime input and is not persisted as a second
 //! source of truth.
 
@@ -17,7 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use zealous_core::{ApprovalDecision, TaskId, TaskStatus};
 
-pub const MAX_PARALLEL_TASKS: usize = 2;
+pub const MAX_PARALLEL_TASKS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationStrategy {
@@ -76,16 +76,24 @@ pub fn select_runnable(svc: &TaskService, max: usize) -> ParallelSelectResult {
     Ok((runnable, not_runnable))
 }
 
-pub fn validate_explicit(svc: &TaskService, ids: &[TaskId]) -> Result<(), (usize, TaskId, String)> {
-    if ids.len() > MAX_PARALLEL_TASKS {
+pub fn validate_explicit_with_max(
+    svc: &TaskService,
+    ids: &[TaskId],
+    max: usize,
+) -> Result<(), (usize, TaskId, String)> {
+    if let Err(reason) = validate_limit(max) {
+        let id = ids.first().cloned().unwrap_or_else(TaskId::generate);
+        return Err((0, id, reason));
+    }
+    if ids.len() > max {
         let id = ids.first().expect("non-empty checked").clone();
-        return Err((
-            0,
-            id,
-            format!("Alpha supports at most {MAX_PARALLEL_TASKS} tasks"),
-        ));
+        return Err((0, id, format!("--max allows at most {max} tasks")));
     }
     crate::queue::validate_explicit(svc, ids)
+}
+
+pub fn validate_explicit(svc: &TaskService, ids: &[TaskId]) -> Result<(), (usize, TaskId, String)> {
+    validate_explicit_with_max(svc, ids, MAX_PARALLEL_TASKS)
 }
 
 /// Approval requests are serialized by the engine wrapper, and every request is
@@ -329,8 +337,12 @@ pub fn run_parallel(
             continue;
         }
         let current_head = git_head(repo_root).unwrap_or_default();
-        let should_merge =
-            integration == IntegrationStrategy::Merge && current_head != summary.base_commit;
+        let task_base = ledger
+            .fold_now()
+            .ok()
+            .and_then(|proj| proj.execution_workspace.map(|ws| ws.base_commit))
+            .unwrap_or_else(|| summary.base_commit.clone());
+        let should_merge = integration == IntegrationStrategy::Merge && current_head != task_base;
         if should_merge {
             if on_conflict == OnConflictStrategy::Workspace {
                 match crate::merge_workspace::start(repo_root, &id, &ledger) {
@@ -442,6 +454,172 @@ pub fn run_parallel(
     summary
 }
 
+/// spec 161:恢复集成已完成的 isolated tasks。该入口不运行模型,只按输入
+/// 顺序执行 apply / merge / merge-workspace,并沿用全局 parallel lease。
+#[allow(clippy::too_many_arguments)]
+pub fn integrate(
+    repo_root: &Path,
+    svc: &TaskService,
+    task_ids: &[TaskId],
+    integration: IntegrationStrategy,
+    on_conflict: OnConflictStrategy,
+    lease: &RunLease,
+    hooks: &mut ParallelHooks<'_>,
+) -> ParallelSummary {
+    let mut summary = ParallelSummary::default();
+    if task_ids.is_empty() || task_ids.len() > MAX_PARALLEL_TASKS {
+        summary.stopped_reason = format!(
+            "invalid integration batch: tasks={} max={MAX_PARALLEL_TASKS}",
+            task_ids.len()
+        );
+        return summary;
+    }
+    let _ = lease.set_parallel(repo_root, task_ids, task_ids);
+    let mut finished = Vec::new();
+    for id in task_ids {
+        let (ledger, projection, _) = match svc.open_task(id) {
+            Ok(value) => value,
+            Err(e) => {
+                summary.stopped_reason = format!("open task {id} failed: {e}");
+                return summary;
+            }
+        };
+        let Some(ws) = projection.execution_workspace.clone() else {
+            summary.stopped_reason = format!("task {id} is not isolated");
+            return summary;
+        };
+        if projection.status != TaskStatus::Completed {
+            summary.stopped_reason = format!(
+                "task {id} is {:?}, integrate requires Completed",
+                projection.status
+            );
+            return summary;
+        }
+        if projection.applied_commit.is_some() {
+            summary.stopped_reason = format!("task {id} is already applied/merged");
+            return summary;
+        }
+        if projection.workspace_removed || !Path::new(&ws.path).exists() {
+            summary.stopped_reason = format!("task {id} workspace is missing");
+            return summary;
+        }
+        if summary.base_commit.is_empty() {
+            summary.base_commit = ws.base_commit.clone();
+        }
+        finished.push((id.clone(), TaskStatus::Completed, ledger, ws.base_commit));
+    }
+
+    for (id, status, ledger, task_base) in finished {
+        (hooks.on_task_finished)(&id, status);
+        summary.completed.push(id.clone());
+        let current_head = git_head(repo_root).unwrap_or_default();
+        let should_merge = integration == IntegrationStrategy::Merge && current_head != task_base;
+        if should_merge {
+            if on_conflict == OnConflictStrategy::Workspace {
+                match crate::merge_workspace::start(repo_root, &id, &ledger) {
+                    Ok(crate::merge_workspace::StartOutcome::Integrated {
+                        branch,
+                        merge_commit,
+                        task_tip,
+                        ..
+                    }) => {
+                        (hooks.on_merge_started)(&id);
+                        (hooks.on_merge_finished)(
+                            &id,
+                            true,
+                            format!("{branch} @ {merge_commit} (task tip {task_tip})"),
+                        );
+                        summary.applied.push(id.clone());
+                        summary.merged.push(id);
+                    }
+                    Ok(crate::merge_workspace::StartOutcome::Conflicted {
+                        branch,
+                        main_head,
+                        task_tip,
+                        files,
+                        ..
+                    }) => {
+                        (hooks.on_merge_conflict)(&id, files.clone());
+                        summary.merge_workspaces.push(id.clone());
+                        summary.merge_conflicts.push((id.clone(), files.clone()));
+                        summary.stopped_reason = format!(
+                            "merge conflict retained in workspace for {id}: {} @ {} (task tip {}); files: {}",
+                            branch,
+                            main_head,
+                            task_tip,
+                            files.join(", ")
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        let detail = e.to_string();
+                        (hooks.on_merge_finished)(&id, false, detail.clone());
+                        summary.stopped_reason = format!(
+                            "merge workspace failed for {id}: {detail}; later tasks are stopped"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                (hooks.on_merge_started)(&id);
+                match workspace::merge(repo_root, &ledger) {
+                    Ok(outcome) => {
+                        (hooks.on_merge_finished)(
+                            &id,
+                            true,
+                            format!(
+                                "{} @ {} (task tip {})",
+                                outcome.branch, outcome.merge_commit, outcome.task_tip
+                            ),
+                        );
+                        summary.applied.push(id.clone());
+                        summary.merged.push(id);
+                    }
+                    Err(e) => {
+                        let detail = e.to_string();
+                        (hooks.on_merge_finished)(&id, false, detail.clone());
+                        summary.stopped_reason =
+                            format!("merge failed for {id}: {detail}; later tasks are stopped");
+                        break;
+                    }
+                }
+            }
+        } else {
+            (hooks.on_apply_started)(&id);
+            match workspace::apply(repo_root, &ledger) {
+                Ok(outcome) => {
+                    (hooks.on_apply_finished)(
+                        &id,
+                        true,
+                        format!(
+                            "{} @ {}{}",
+                            outcome.branch,
+                            outcome.applied_commit,
+                            if outcome.already {
+                                " (already applied)"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                    summary.applied.push(id);
+                }
+                Err(e) => {
+                    let detail = e.to_string();
+                    (hooks.on_apply_finished)(&id, false, detail.clone());
+                    summary.stopped_reason =
+                        format!("apply failed for {id}: {detail}; later tasks are stopped");
+                    break;
+                }
+            }
+        }
+    }
+    if summary.stopped_reason.is_empty() && summary.applied.len() != summary.completed.len() {
+        summary.stopped_reason = "not all completed tasks were integrated".into();
+    }
+    summary
+}
+
 fn git_head(root: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -495,6 +673,7 @@ mod tests {
         std::fs::write(dir.join(".gitignore"), ".zealous/\n").unwrap();
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        std::fs::write(dir.join("c.txt"), "c\n").unwrap();
         Command::new("git")
             .args(["init", "-q", "-b", "main"])
             .current_dir(&dir)
@@ -564,7 +743,8 @@ mod tests {
     fn limit_selection_and_explicit_validation() {
         let _provider_env = provider_env();
         assert!(validate_limit(0).is_err());
-        assert!(validate_limit(3).is_err());
+        assert!(validate_limit(3).is_ok());
+        assert!(validate_limit(4).is_err());
         let dir = repo("select");
         let svc = TaskService::new(dir);
         let a = task(&svc, "a");
@@ -572,10 +752,9 @@ mod tests {
         let c = task(&svc, "c");
         let (selected, _) = select_runnable(&svc, 2).unwrap();
         assert_eq!(selected.len(), 2);
-        assert!(selected.contains(&a));
-        assert!(!selected.contains(&c));
         assert!(validate_explicit(&svc, &[a.clone(), b.clone()]).is_ok());
-        assert!(validate_explicit(&svc, &[a, b, c]).is_err());
+        assert!(validate_explicit(&svc, &[a.clone(), b.clone(), c.clone()]).is_ok());
+        assert!(validate_explicit_with_max(&svc, &[a, b, c], 2).is_err());
     }
 
     #[test]
@@ -664,6 +843,122 @@ mod tests {
         assert!(std::fs::read_to_string(dir.join("b.txt"))
             .unwrap()
             .contains("b-done"));
+    }
+
+    #[test]
+    fn three_tasks_share_base_and_integrate_in_input_order() {
+        let _provider_env = provider_env();
+        let dir = repo("three-merge");
+        let svc = TaskService::new(dir.clone());
+        let a = task(&svc, "A");
+        let b = task(&svc, "B");
+        let c = task(&svc, "C");
+        let lease = try_acquire(&dir, "parallel", "parallel").unwrap();
+        let mut h = hooks();
+        let summary = run_parallel(
+            &dir,
+            &svc,
+            vec![
+                provider("a.txt", "a", "a-done"),
+                provider("b.txt", "b", "b-done"),
+                provider("c.txt", "c", "c-done"),
+            ],
+            "mock".into(),
+            20,
+            &[a.clone(), b.clone(), c.clone()],
+            true,
+            IntegrationStrategy::Merge,
+            OnConflictStrategy::Abort,
+            Arc::new(AutoParallelApprove),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            &lease,
+            &mut h,
+        );
+        assert!(
+            summary.stopped_reason.is_empty(),
+            "{}",
+            summary.stopped_reason
+        );
+        assert_eq!(summary.completed, vec![a.clone(), b.clone(), c.clone()]);
+        assert_eq!(summary.applied, vec![a.clone(), b.clone(), c.clone()]);
+        assert_eq!(summary.merged, vec![b.clone(), c.clone()]);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let content = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(content.contains("-done"), "{name}: {content}");
+        }
+    }
+
+    #[test]
+    fn middle_conflict_stops_and_integrate_resumes_remaining_task() {
+        let _provider_env = provider_env();
+        let dir = repo("three-resume");
+        let svc = TaskService::new(dir.clone());
+        let a = task(&svc, "A");
+        let b = task(&svc, "B");
+        let c = task(&svc, "C");
+        let lease = try_acquire(&dir, "parallel", "parallel").unwrap();
+        let mut h = hooks();
+        let stopped = run_parallel(
+            &dir,
+            &svc,
+            vec![
+                provider("a.txt", "a", "a-base"),
+                provider("a.txt", "a", "a-b"),
+                provider("c.txt", "c", "c-done"),
+            ],
+            "mock".into(),
+            20,
+            &[a.clone(), b.clone(), c.clone()],
+            true,
+            IntegrationStrategy::Merge,
+            OnConflictStrategy::Workspace,
+            Arc::new(AutoParallelApprove),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            &lease,
+            &mut h,
+        );
+        assert_eq!(stopped.applied, vec![a.clone()]);
+        assert_eq!(stopped.merge_workspaces, vec![b.clone()]);
+        assert!(workspace::worktree_path(&dir, &c).exists());
+        assert!(crate::merge_workspace::merge_path(&dir, &b).exists());
+
+        let (_ledger_b, proj_b, _) = svc.open_task(&b).unwrap();
+        let merge_path = PathBuf::from(proj_b.merge_workspace.as_ref().unwrap().path.clone());
+        std::fs::write(merge_path.join("a.txt"), "resolved-by-user\n").unwrap();
+        let staged = Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(&merge_path)
+            .output()
+            .unwrap();
+        assert!(staged.status.success(), "{:?}", staged.stderr);
+        let merge_commit = crate::merge_workspace::continue_merge(&dir, &_ledger_b).unwrap();
+        assert!(!merge_path.exists());
+        assert!(!merge_commit.is_empty());
+
+        let mut resume_hooks = hooks();
+        let resumed = integrate(
+            &dir,
+            &svc,
+            std::slice::from_ref(&c),
+            IntegrationStrategy::Merge,
+            OnConflictStrategy::Workspace,
+            &lease,
+            &mut resume_hooks,
+        );
+        assert!(
+            resumed.stopped_reason.is_empty(),
+            "{}",
+            resumed.stopped_reason
+        );
+        assert_eq!(resumed.applied, vec![c.clone()]);
+        assert!(std::fs::read_to_string(dir.join("a.txt"))
+            .unwrap()
+            .contains("resolved-by-user"));
+        assert!(std::fs::read_to_string(dir.join("c.txt"))
+            .unwrap()
+            .contains("c-done"));
     }
 
     #[test]

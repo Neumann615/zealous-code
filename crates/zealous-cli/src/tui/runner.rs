@@ -221,7 +221,7 @@ impl ProgressSink for NotifProgressSink2 {
     }
 }
 
-/// spec 157:后台并行 batch(Shift+A 确认后调用);auto-apply=true。
+/// spec 157/161:后台并行 batch(Shift+A 确认后调用);auto integrate。
 pub fn spawn_parallel(
     svc: TaskService,
     task_ids: Vec<TaskId>,
@@ -317,8 +317,8 @@ pub fn spawn_parallel(
             24,
             &task_ids,
             true,
-            zealous_engine::parallel::IntegrationStrategy::FastForwardOnly,
-            zealous_engine::parallel::OnConflictStrategy::Abort,
+            zealous_engine::parallel::IntegrationStrategy::Merge,
+            zealous_engine::parallel::OnConflictStrategy::Workspace,
             Arc::new(approval_sink),
             Some(progress),
             abort,
@@ -336,5 +336,80 @@ pub fn spawn_parallel(
             summary.base_commit,
             summary.stopped_reason
         )));
+    });
+}
+
+/// spec 161:后台恢复集成 Completed isolated tasks(Shift+I)。
+pub fn spawn_parallel_integrate(
+    svc: TaskService,
+    task_ids: Vec<TaskId>,
+    event_tx: mpsc::Sender<TuiEvent>,
+    progress_sink: Arc<dyn ProgressSink>,
+) {
+    std::thread::spawn(move || {
+        let lease =
+            match zealous_engine::lease::try_acquire(svc.repo_root(), "parallel", "parallel") {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = event_tx.send(TuiEvent::Failure(format!("already_running: {e}")));
+                    return;
+                }
+            };
+        let progress = Arc::new(NotifProgressSink2 {
+            tx: event_tx.clone(),
+        });
+        let mut hooks = zealous_engine::parallel::ParallelHooks {
+            on_task_started: Box::new(|_, _, _| {}),
+            on_task_finished: Box::new(|tid, status| {
+                progress_sink
+                    .progress(&format!("integrate task {} 状态: {status:?}", tid.as_str()));
+            }),
+            on_apply_started: Box::new(|tid| {
+                progress_sink.progress(&format!("integrate task {} apply 开始", tid.as_str()));
+            }),
+            on_apply_finished: Box::new(|tid, ok, detail| {
+                let mark = if ok { "成功" } else { "失败" };
+                progress_sink.progress(&format!(
+                    "integrate task {} apply {mark}: {detail}",
+                    tid.as_str()
+                ));
+            }),
+            on_merge_started: Box::new(|tid| {
+                progress_sink.progress(&format!("integrate task {} merge 开始", tid.as_str()));
+            }),
+            on_merge_finished: Box::new(|tid, ok, detail| {
+                let mark = if ok { "成功" } else { "失败" };
+                progress_sink.progress(&format!(
+                    "integrate task {} merge {mark}: {detail}",
+                    tid.as_str()
+                ));
+            }),
+            on_merge_conflict: Box::new(|tid, files| {
+                progress_sink.progress(&format!(
+                    "integrate task {} conflict workspace: {}",
+                    tid.as_str(),
+                    files.join(", ")
+                ));
+            }),
+            confirm_apply: Box::new(|_| true),
+        };
+        let summary = zealous_engine::parallel::integrate(
+            svc.repo_root(),
+            &svc,
+            &task_ids,
+            zealous_engine::parallel::IntegrationStrategy::Merge,
+            zealous_engine::parallel::OnConflictStrategy::Workspace,
+            &lease,
+            &mut hooks,
+        );
+        let _ = event_tx.send(TuiEvent::ParallelFinished(format!(
+            "integration completed={} integrated={} merged={} conflict_workspaces={} stopped={}",
+            summary.completed.len(),
+            summary.applied.len(),
+            summary.merged.len(),
+            summary.merge_workspaces.len(),
+            summary.stopped_reason
+        )));
+        let _ = progress;
     });
 }

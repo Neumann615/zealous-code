@@ -204,6 +204,10 @@ impl Session {
             "run_parallel" => Handled::Response(self.handle_run_parallel(&req)),
             "stop_parallel" => Handled::Response(self.handle_stop_parallel(&req)),
             "get_parallel_status" => Handled::Response(self.handle_get_parallel_status(&req)),
+            "parallel_integrate" => Handled::Response(self.handle_parallel_integrate(&req)),
+            "get_parallel_integrations" => {
+                Handled::Response(self.handle_get_parallel_integrations(&req))
+            }
             "apply_task" => Handled::Response(self.handle_apply_task(&req)),
             "merge_task" => Handled::Response(self.handle_merge_task(&req)),
             "start_merge_workspace" => Handled::Response(self.handle_start_merge_workspace(&req)),
@@ -258,6 +262,7 @@ impl Session {
                             "concurrent_runs": 1,
                             "isolated_worktree": true,
                             "parallel_tasks": parallel_mod::MAX_PARALLEL_TASKS,
+                            "parallel_integrate": true,
                             "merge_task": true,
                             "merge_workspace": true,
                             "merge_resolution": true,
@@ -911,14 +916,11 @@ impl Session {
                 return err_resp(req.id, "no_runnable_tasks", "(no runnable queued tasks)");
             }
         } else if let Some(arr) = req.params.get("task_ids").and_then(|v| v.as_array()) {
-            if arr.len() > parallel_mod::MAX_PARALLEL_TASKS {
+            if arr.len() > max {
                 return err_resp(
                     req.id,
                     "invalid_params",
-                    format!(
-                        "Alpha supports at most {} tasks",
-                        parallel_mod::MAX_PARALLEL_TASKS
-                    ),
+                    format!("task_ids 数量 {} 超过 max {max}", arr.len()),
                 );
             }
             for v in arr {
@@ -931,7 +933,9 @@ impl Session {
             return err_resp(req.id, "invalid_params", "task_ids 或 all 必填");
         }
         if !all {
-            if let Err((i, id, reason)) = parallel_mod::validate_explicit(&self.svc, &task_ids) {
+            if let Err((i, id, reason)) =
+                parallel_mod::validate_explicit_with_max(&self.svc, &task_ids, max)
+            {
                 return err_resp(
                     req.id,
                     "parallel_start_failed",
@@ -1148,6 +1152,259 @@ impl Session {
         Response::ok(
             req.id,
             serde_json::json!({ "parallel_started": true, "total": total, "base_commit": base_commit, "integrate": integrate, "on_conflict": on_conflict }),
+        )
+    }
+
+    fn handle_parallel_integrate(&mut self, req: &Request) -> Response {
+        self.reap_parallel();
+        if let Some(p) = &self.parallel {
+            if !p.finished.load(Ordering::SeqCst) {
+                return err_resp(req.id, "already_running", "已有 parallel batch 在运行");
+            }
+        }
+        let integrate = req
+            .params
+            .get("integrate")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ff-only");
+        let integration = match parallel_mod::IntegrationStrategy::parse(integrate) {
+            Ok(strategy) => strategy,
+            Err(e) => return err_resp(req.id, "invalid_params", e),
+        };
+        let on_conflict = req
+            .params
+            .get("on_conflict")
+            .and_then(|v| v.as_str())
+            .unwrap_or("abort");
+        let on_conflict_strategy = match parallel_mod::OnConflictStrategy::parse(on_conflict) {
+            Ok(strategy) => strategy,
+            Err(e) => return err_resp(req.id, "invalid_params", e),
+        };
+        let Some(arr) = req.params.get("task_ids").and_then(|v| v.as_array()) else {
+            return err_resp(req.id, "invalid_params", "task_ids 必填");
+        };
+        if arr.is_empty() || arr.len() > parallel_mod::MAX_PARALLEL_TASKS {
+            return err_resp(
+                req.id,
+                "invalid_params",
+                format!(
+                    "task_ids 数量必须在 1..={} 之间",
+                    parallel_mod::MAX_PARALLEL_TASKS
+                ),
+            );
+        }
+        let mut task_ids = Vec::new();
+        for value in arr {
+            match value.as_str().map(TaskId::parse) {
+                Some(Ok(id)) => task_ids.push(id),
+                _ => return err_resp(req.id, "invalid_params", "task_ids 含非法任务 ID"),
+            }
+        }
+        let lease =
+            match zealous_engine::lease::try_acquire(&self.repo_root, "parallel", "parallel") {
+                Ok(l) => l,
+                Err(e) => return err_resp(req.id, "already_running", e.to_string()),
+            };
+        let base_commit = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let total = task_ids.len();
+        let response_base_commit = base_commit.clone();
+        let shared = Arc::new(ParallelShared {
+            abort: Arc::new(AtomicBool::new(false)),
+            task_ids: task_ids.clone(),
+            active: Mutex::new(task_ids.iter().map(|id| id.as_str().to_string()).collect()),
+            auto_apply: true,
+            base_commit: base_commit.clone(),
+            completed: Mutex::new(Vec::new()),
+            failed: Mutex::new(Vec::new()),
+            interrupted: Mutex::new(Vec::new()),
+            applied: Mutex::new(Vec::new()),
+            merged: Mutex::new(Vec::new()),
+            merge_workspaces: Mutex::new(Vec::new()),
+            apply_index: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
+            approvals: Arc::new(ParallelApprovals {
+                pending: Mutex::new(HashMap::new()),
+            }),
+        });
+        let notif = self.notif_tx.clone();
+        let svc = self.svc.clone();
+        let repo = self.repo_root.clone();
+        let shared_t = shared.clone();
+        let join = std::thread::spawn(move || {
+            let _lease = lease;
+            let _ = notif.send(Notification::progress(
+                "parallel_integration_started",
+                &format!("{} {}", total, base_commit),
+            ));
+            let mut hooks = parallel_mod::ParallelHooks {
+                on_task_started: Box::new(|_, _, _| {}),
+                on_task_finished: Box::new(|tid, status| {
+                    if status == TaskStatus::Completed {
+                        shared_t
+                            .completed
+                            .lock()
+                            .unwrap()
+                            .push(tid.as_str().to_string());
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_finished",
+                        &format!("{} {:?}", tid.as_str(), status),
+                    ));
+                }),
+                on_apply_started: Box::new(|tid| {
+                    shared_t.apply_index.fetch_add(1, Ordering::SeqCst);
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_apply_started",
+                        tid.as_str(),
+                    ));
+                }),
+                on_apply_finished: Box::new(|tid, ok, detail| {
+                    if ok {
+                        shared_t
+                            .applied
+                            .lock()
+                            .unwrap()
+                            .push(tid.as_str().to_string());
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_integrated",
+                        &format!("{} apply {} {}", tid.as_str(), ok, detail),
+                    ));
+                }),
+                on_merge_started: Box::new(|tid| {
+                    shared_t.apply_index.fetch_add(1, Ordering::SeqCst);
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_merge_started",
+                        tid.as_str(),
+                    ));
+                }),
+                on_merge_finished: Box::new(|tid, ok, detail| {
+                    if ok {
+                        shared_t
+                            .applied
+                            .lock()
+                            .unwrap()
+                            .push(tid.as_str().to_string());
+                        shared_t
+                            .merged
+                            .lock()
+                            .unwrap()
+                            .push(tid.as_str().to_string());
+                    }
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_integrated",
+                        &format!("{} merge {} {}", tid.as_str(), ok, detail),
+                    ));
+                }),
+                on_merge_conflict: Box::new(|tid, files| {
+                    shared_t
+                        .merge_workspaces
+                        .lock()
+                        .unwrap()
+                        .push(tid.as_str().to_string());
+                    let _ = notif.send(Notification::progress(
+                        "parallel_task_conflict_pending",
+                        &format!("{} {}", tid.as_str(), files.join(",")),
+                    ));
+                }),
+                confirm_apply: Box::new(|_| true),
+            };
+            let summary = parallel_mod::integrate(
+                &repo,
+                &svc,
+                &task_ids,
+                integration,
+                on_conflict_strategy,
+                &_lease,
+                &mut hooks,
+            );
+            *shared_t.active.lock().unwrap() = Vec::new();
+            shared_t.finished.store(true, Ordering::SeqCst);
+            if summary.stopped_reason.is_empty() {
+                let _ = notif.send(Notification::progress(
+                    "parallel_integration_finished",
+                    "ok",
+                ));
+            } else {
+                let _ = notif.send(Notification::progress(
+                    "parallel_integration_stopped",
+                    &summary.stopped_reason,
+                ));
+            }
+        });
+        self.parallel = Some(shared);
+        self.parallel_join = Some(join);
+        Response::ok(
+            req.id,
+            serde_json::json!({
+                "parallel_integration_started": true,
+                "total": total,
+                "base_commit": response_base_commit,
+                "integrate": integrate,
+                "on_conflict": on_conflict
+            }),
+        )
+    }
+
+    fn handle_get_parallel_integrations(&self, req: &Request) -> Response {
+        let current_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let mut order = Vec::new();
+        if let Ok((summaries, _)) = self.svc.list_tasks() {
+            for summary in summaries {
+                if summary.status != TaskStatus::Completed {
+                    continue;
+                }
+                if let Ok((_, projection, _)) = self.svc.open_task(&summary.task_id) {
+                    let pending_conflict = projection
+                        .merge_workspace
+                        .as_ref()
+                        .map(|w| w.status == "conflicted" || w.status == "resolved")
+                        .unwrap_or(false);
+                    let eligible = projection.execution_workspace.is_some()
+                        && projection.applied_commit.is_none()
+                        && !projection.workspace_removed
+                        && !pending_conflict;
+                    if eligible {
+                        order.push(summary.task_id.as_str().to_string());
+                    }
+                }
+            }
+        }
+        order.truncate(parallel_mod::MAX_PARALLEL_TASKS);
+        let (conflict, remaining) = match &self.parallel {
+            Some(p) => (
+                p.merge_workspaces.lock().unwrap().first().cloned(),
+                Vec::<String>::new(),
+            ),
+            None => (None, Vec::<String>::new()),
+        };
+        Response::ok(
+            req.id,
+            serde_json::json!({
+                "integration_order": order,
+                "integrated": self
+                    .parallel
+                    .as_ref()
+                    .map(|p| p.applied.lock().unwrap().clone())
+                    .unwrap_or_default(),
+                "conflict_pending": conflict,
+                "remaining": remaining,
+                "current_main_head": current_head
+            }),
         )
     }
 
