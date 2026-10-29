@@ -348,8 +348,11 @@ impl ServeProc {
     }
 }
 
+static SERVE_ISOLATED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn serve_isolated_run_get_workspace_apply() {
+    let _serial_guard = SERVE_ISOLATED_TEST_LOCK.lock().unwrap();
     let repo = base_repo("serve");
     let script = vec![
         r#"{"action":"plan","plan":"edit note.txt","workers":[]}"#.into(),
@@ -893,6 +896,17 @@ fn conflicting_parallel_endpoint() -> String {
             }
         }
         let request = String::from_utf8_lossy(&raw).to_string();
+        if request.contains("WORKING CONFLICT") {
+            let proposal = serde_json::json!({
+                "action":"resolve",
+                "summary":"Resolve the same-line conflict by preserving both intents.",
+                "files":[{"path":"note.txt","mode":"resolved","content":"MODEL-RESOLVED\n","rationale":"combine both requested values"}]
+            }).to_string();
+            let body = chat_body(&proposal);
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            continue;
+        }
         let left = request.contains("conflict left");
         let content = if request.contains("tool `edit_file` result") {
             r#"{"action":"message","text":"done"}"#
@@ -919,4 +933,114 @@ fn conflicting_parallel_endpoint() -> String {
         let _ = stream.shutdown(std::net::Shutdown::Write);
     });
     format!("http://{addr}/v1")
+}
+
+#[test]
+fn cli_ai_resolution_proposal_apply_and_continue() {
+    let repo = base_repo("ai-resolution-cli");
+    let endpoint = conflicting_parallel_endpoint();
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let mut ids = Vec::new();
+    for title in ["conflict left", "conflict right"] {
+        let out = Command::new(zealous)
+            .args(["task", "new", title])
+            .current_dir(&repo)
+            .env("ZEALOUS_BASE_URL", &endpoint)
+            .env("ZEALOUS_API_KEY", "e2e-secret-key")
+            .env("ZEALOUS_MODEL", "mock-model")
+            .output()
+            .unwrap();
+        ids.push(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("task created: "))
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+    }
+    let out = Command::new(zealous)
+        .args([
+            "parallel",
+            "run",
+            ids[0].as_str(),
+            ids[1].as_str(),
+            "--auto-apply",
+            "--yes",
+        ])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+
+    let out = Command::new(zealous)
+        .args(["task", "merge-workspace", ids[1].as_str()])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = Command::new(zealous)
+        .args(["task", "resolve", ids[1].as_str(), "--yes"])
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "mock-model")
+        .output()
+        .unwrap();
+    let resolved = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{resolved}");
+    assert!(resolved.contains("resolution_id:"), "{resolved}");
+    assert!(resolved.contains("MODEL-RESOLVED"), "{resolved}");
+    assert!(
+        resolved.contains("resolved + staged: note.txt"),
+        "{resolved}"
+    );
+    let workspace = repo.join(".zealous/merges").join(&ids[1]);
+    assert!(workspace.exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "MODEL-RESOLVED"
+    );
+    assert_eq!(git(&repo, &["status", "--porcelain"]).trim(), "");
+
+    let out = Command::new(zealous)
+        .args(["task", "merge-continue", ids[1].as_str(), "--yes"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let continued = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{continued}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "MODEL-RESOLVED"
+    );
+    assert!(!workspace.exists());
+    assert!(repo.join(".zealous/worktrees").join(&ids[1]).exists());
+    let ledger = std::fs::read_to_string(
+        repo.join(".zealous/tasks")
+            .join(&ids[1])
+            .join("events.jsonl"),
+    )
+    .unwrap();
+    for needle in [
+        "MergeResolutionStarted",
+        "MergeResolutionProposed",
+        "MergeResolutionDecided",
+        "MergeResolutionApplied",
+    ] {
+        assert!(ledger.contains(needle), "missing {needle}");
+    }
+    assert!(!ledger.contains("e2e-secret-key"), "{ledger}");
 }

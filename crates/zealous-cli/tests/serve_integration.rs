@@ -817,14 +817,38 @@ fn serve_merge_workspace_conflict_continue_flow() {
         "{unresolved}"
     );
 
+    let proposal = request!(
+        "propose_merge_resolution",
+        serde_json::json!({"task_id": tasks[1]})
+    );
+    let resolution_id = proposal["result"]["resolution_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        proposal["result"]["summary"].as_str().is_some(),
+        "{proposal}"
+    );
+    assert_eq!(
+        proposal["result"]["files"][0]["mode"], "resolved",
+        "{proposal}"
+    );
+    let approved = request!(
+        "approve_merge_resolution",
+        serde_json::json!({"task_id": tasks[1], "resolution_id": resolution_id})
+    );
+    assert_eq!(
+        approved["result"]["staged_files"],
+        serde_json::json!(["note.txt"]),
+        "{approved}"
+    );
     let workspace = repo.join(".zealous/merges").join(&tasks[1]);
-    std::fs::write(workspace.join("note.txt"), "SERVE-RESOLVED\n").unwrap();
-    let staged = Command::new("git")
-        .args(["add", "note.txt"])
-        .current_dir(&workspace)
-        .output()
-        .unwrap();
-    assert!(staged.status.success(), "{:?}", staged.stderr);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("note.txt"))
+            .unwrap()
+            .trim_end(),
+        "SERVER-AI-RESOLVED"
+    );
     let continued = request!(
         "continue_merge_workspace",
         serde_json::json!({"task_id": tasks[1]})
@@ -833,12 +857,11 @@ fn serve_merge_workspace_conflict_continue_flow() {
         continued["result"]["merged"].as_bool().unwrap(),
         "{continued}"
     );
-    assert!(!workspace.exists());
     assert_eq!(
         std::fs::read_to_string(repo.join("note.txt"))
             .unwrap()
             .trim_end(),
-        "SERVE-RESOLVED"
+        "SERVER-AI-RESOLVED"
     );
     let task = request!("get_task", serde_json::json!({"task_id": tasks[1]}));
     assert_eq!(
@@ -886,6 +909,17 @@ fn serve_conflict_endpoint() -> String {
             }
         }
         let request = String::from_utf8_lossy(&raw).to_string();
+        if request.contains("WORKING CONFLICT") {
+            let proposal = serde_json::json!({
+                "action":"resolve",
+                "summary":"Resolve by combining both semantic changes.",
+                "files":[{"path":"note.txt","mode":"resolved","content":"SERVER-AI-RESOLVED\n","rationale":"combine both sides"}]
+            }).to_string();
+            let body = chat_body(&proposal);
+            let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            continue;
+        }
         let left = request.contains("serve conflict left");
         let content = if request.contains("tool `edit_file` result") {
             r#"{"action":"message","text":"done"}"#

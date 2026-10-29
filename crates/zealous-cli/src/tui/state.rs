@@ -52,6 +52,8 @@ pub enum ConfirmKind {
     Apply,
     Merge,
     MergeWorkspace,
+    MergeResolutionApprove,
+    MergeResolutionReject,
     MergeContinue,
     MergeAbort,
     WorkspaceRemove,
@@ -79,6 +81,8 @@ pub struct TuiState {
     pub parallel_status_text: Option<String>,
     /// spec 159:merge workspace 状态文本
     pub merge_status_text: Option<String>,
+    /// spec 160:待审批模型解决方案(UI-only;事实状态仍在事件投影)
+    pub merge_resolution_proposal: Option<zealous_engine::merge_resolution::Proposal>,
     pub tasks: Vec<TaskSummary>,
     pub selected: usize,
     pub detail: Option<TaskProjection>,
@@ -119,6 +123,7 @@ impl TuiState {
             parallel_ids: Vec::new(),
             parallel_status_text: None,
             merge_status_text: None,
+            merge_resolution_proposal: None,
             tasks: Vec::new(),
             selected: 0,
             detail: None,
@@ -381,6 +386,15 @@ mod tests {
         s.open_confirm(ConfirmKind::Merge);
         assert_eq!(s.confirm, Some(ConfirmKind::Merge));
         assert_eq!(s.take_confirm(), Some(ConfirmKind::Merge));
+    }
+
+    #[test]
+    fn merge_resolution_confirmation_state() {
+        let mut s = TuiState::new();
+        s.open_confirm(ConfirmKind::MergeResolutionApprove);
+        assert_eq!(s.take_confirm(), Some(ConfirmKind::MergeResolutionApprove));
+        s.open_confirm(ConfirmKind::MergeResolutionReject);
+        assert_eq!(s.take_confirm(), Some(ConfirmKind::MergeResolutionReject));
     }
 
     #[test]

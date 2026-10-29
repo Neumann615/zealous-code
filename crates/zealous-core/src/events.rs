@@ -3,7 +3,7 @@
 //! 所有对外可见的 Agent 行为都必须表达为 `TaskEvent`;`type` 标签用 PascalCase,
 //! 与 spec 20 示例一致。新增事件只能新增枚举值,禁止复用旧类型。
 
-use crate::ids::{AgentRunId, TaskId, ToolCallId};
+use crate::ids::{AgentRunId, ResolutionId, TaskId, ToolCallId};
 use serde::{Deserialize, Serialize};
 
 /// 账本结构版本;载荷结构不兼容变更时递增(spec 20:`v` 字段)。
@@ -221,6 +221,26 @@ pub enum EventPayload {
     ExecutionWorkspaceApplied {
         branch: String,
         applied_commit: String,
+    },
+    /// spec 160:模型辅助冲突解决开始
+    MergeResolutionStarted {
+        resolution_id: ResolutionId,
+        files: Vec<String>,
+    },
+    MergeResolutionProposed {
+        resolution_id: ResolutionId,
+        summary: String,
+        resolved_files: Vec<String>,
+        manual_files: Vec<String>,
+    },
+    MergeResolutionDecided {
+        resolution_id: ResolutionId,
+        decision: ApprovalDecision,
+        reason: Option<String>,
+    },
+    MergeResolutionApplied {
+        resolution_id: ResolutionId,
+        staged_files: Vec<String>,
     },
     /// spec 159:冲突解决工作区已创建并开始合并
     MergeWorkspacePrepared {

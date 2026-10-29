@@ -146,6 +146,7 @@ macro_rules! define_id {
 define_id!(TaskId, "task_{}");
 define_id!(AgentRunId, "run_{}");
 define_id!(ToolCallId, "call_{}");
+define_id!(ResolutionId, "resolution_{}");
 
 #[cfg(test)]
 mod tests {

@@ -69,6 +69,13 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    zealous task merge-abort <task-id>
    ```
 
+   Alpha 也支持模型为 unresolved files 提出完整解决方案;你审批后才会写入
+   merge workspace 并 stage,不会自动 commit:
+
+   ```bash
+   zealous task resolve <task-id>
+   ```
+
    多个 isolated 任务可串行执行并按顺序 fast-forward:
 
    ```bash

@@ -180,6 +180,16 @@ enum TaskCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// 生成模型辅助冲突解决方案(spec 160)
+    Resolve {
+        task_id: String,
+        /// 自动批准全部模型建议
+        #[arg(long)]
+        yes: bool,
+        /// 自动拒绝模型建议
+        #[arg(long)]
+        no: bool,
+    },
     /// 中止冲突解决工作区(spec 159)
     MergeAbort {
         task_id: String,
@@ -367,6 +377,7 @@ fn main() {
             TaskCmd::MergeWorkspace { task_id } => cmd_merge_workspace(&task_id),
             TaskCmd::MergeStatus { task_id } => cmd_merge_status(&task_id),
             TaskCmd::MergeContinue { task_id, yes } => cmd_merge_continue(&task_id, yes),
+            TaskCmd::Resolve { task_id, yes, no } => cmd_resolve(&task_id, yes, no),
             TaskCmd::MergeAbort {
                 task_id,
                 force,
@@ -1478,6 +1489,147 @@ fn cmd_merge_continue(task_id: &str, yes: bool) -> i32 {
         }
         Err(e) => err(format!("merge continue: {e}")),
     }
+}
+
+fn print_resolution_block(label: &str, content: &str) {
+    println!("--- {label} ---");
+    println!("{content}");
+    println!("--- end {label} ---");
+}
+
+fn cmd_resolve(task_id: &str, yes: bool, no: bool) -> i32 {
+    if yes && no {
+        return err("--yes 与 --no 互斥");
+    }
+    let (repo, ledger) = match open_task_for_merge(task_id) {
+        Ok(x) => x,
+        Err(e) => return err(e),
+    };
+    let (_proj_before, merge_ws, contexts) = {
+        let svc = match svc() {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
+        let tid = match zealous_core::TaskId::parse(task_id) {
+            Ok(t) => t,
+            Err(e) => return err(e.to_string()),
+        };
+        let (_, proj, _) = match svc.open_task(&tid) {
+            Ok(x) => x,
+            Err(e) => return err(e.to_string()),
+        };
+        let merge_ws = match &proj.merge_workspace {
+            Some(view) if view.status == "conflicted" => view.clone(),
+            _ => return err("merge workspace 不处于 conflicted 状态"),
+        };
+        let contexts = match zealous_engine::merge_resolution::collect_contexts(
+            std::path::Path::new(&merge_ws.path),
+        ) {
+            Ok(c) => c,
+            Err(e) => return err(format!("collect conflicts: {e}")),
+        };
+        (proj, merge_ws, contexts)
+    };
+    let _ = repo;
+    let config = match ProviderConfig::resolve() {
+        Ok(c) => c,
+        Err(e) => return err(format!("provider 配置无效: {e}")),
+    };
+    let provider = OpenAiCompatProvider::new(config.clone());
+    let proposal = match zealous_engine::merge_resolution::propose(
+        std::path::Path::new(&merge_ws.path),
+        &ledger,
+        &provider,
+        &provider_model(&config),
+    ) {
+        Ok(p) => p,
+        Err(e) => return err(format!("resolve: {e}")),
+    };
+
+    println!("resolution_id: {}", proposal.resolution_id.as_str());
+    println!("summary:       {}", proposal.summary);
+    println!("proposed files: {}", proposal.resolved_files().join(", "));
+    println!("manual files:   {}", proposal.manual_files().join(", "));
+    println!("写入目标仅为 merge workspace;不会自动 commit,不会修改主工作区。");
+    for file in &proposal.files {
+        match file {
+            zealous_engine::merge_resolution::ProposalFile::Resolved {
+                path,
+                content,
+                rationale,
+            } => {
+                let context = contexts
+                    .iter()
+                    .find(|c| c.path == *path)
+                    .expect("validated");
+                println!("\n========== {} ==========", path);
+                println!("mode: resolved");
+                println!("rationale: {rationale}");
+                print_resolution_block("Base", &context.base);
+                print_resolution_block("Ours", &context.ours);
+                print_resolution_block("Theirs", &context.theirs);
+                print_resolution_block("Proposed", content);
+            }
+            zealous_engine::merge_resolution::ProposalFile::Manual { path, reason } => {
+                println!("\n========== {} ==========", path);
+                println!("mode: manual");
+                println!("reason: {reason}");
+            }
+        }
+    }
+
+    let approved = if no {
+        false
+    } else if yes {
+        true
+    } else {
+        print!("\n批准写入以上 resolved files? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            false
+        } else {
+            let answer = line.trim().to_ascii_lowercase();
+            answer == "y" || answer == "yes"
+        }
+    };
+
+    if !approved {
+        match zealous_engine::merge_resolution::reject(
+            &ledger,
+            &proposal.resolution_id,
+            Some("user rejected proposal".into()),
+        ) {
+            Ok(()) => {
+                println!("proposal rejected;未写入任何文件");
+                0
+            }
+            Err(e) => err(format!("reject resolution: {e}")),
+        }
+    } else {
+        match zealous_engine::merge_resolution::apply_proposal(
+            std::path::Path::new(&merge_ws.path),
+            &ledger,
+            &proposal,
+        ) {
+            Ok((staged, manual)) => {
+                println!("resolved + staged: {}", staged.join(", "));
+                if !manual.is_empty() {
+                    println!("manual pending: {}", manual.join(", "));
+                }
+                println!("\nNext:");
+                println!("  zealous task merge-status {task_id}");
+                println!("  zealous task merge-continue {task_id}");
+                0
+            }
+            Err(e) => err(format!("apply resolution: {e}")),
+        }
+    }
+}
+
+fn provider_model(config: &ProviderConfig) -> String {
+    config.model.clone()
 }
 
 fn cmd_merge_abort(task_id: &str, force: bool, yes: bool) -> i32 {

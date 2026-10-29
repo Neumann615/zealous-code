@@ -11,9 +11,10 @@ pub use events::{
     AgentRef, AgentRole, AgentRunStatus, ApprovalDecision, EventPayload, RiskTier, TaskEvent,
     TaskStatus, EVENT_SCHEMA_VERSION, MAX_WORKERS,
 };
-pub use ids::{AgentRunId, TaskId, ToolCallId};
+pub use ids::{AgentRunId, ResolutionId, TaskId, ToolCallId};
 pub use projection::{
-    AppliedStrategy, ExecutionWorkspaceView, FoldError, MergeWorkspaceView, TaskProjection,
+    AppliedStrategy, ExecutionWorkspaceView, FoldError, MergeResolutionView, MergeWorkspaceView,
+    TaskProjection,
 };
 
 // 状态机流转的唯一裁决在 `transition::can_transition`;

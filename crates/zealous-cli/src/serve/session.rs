@@ -153,6 +153,7 @@ impl parallel_mod::ParallelApprovalSink for ParallelApprovalSink {
 }
 
 pub struct Session {
+    pub merge_proposals: Arc<Mutex<HashMap<String, zealous_engine::merge_resolution::Proposal>>>,
     pub svc: TaskService,
     pub repo_root: PathBuf,
     pub initialized: bool,
@@ -168,6 +169,7 @@ pub struct Session {
 impl Session {
     pub fn new(repo_root: PathBuf, notif_tx: mpsc::Sender<Notification>) -> Self {
         Self {
+            merge_proposals: Arc::new(Mutex::new(HashMap::new())),
             svc: TaskService::new(repo_root.clone()),
             repo_root,
             initialized: false,
@@ -210,6 +212,15 @@ impl Session {
                 Handled::Response(self.handle_continue_merge_workspace(&req))
             }
             "abort_merge_workspace" => Handled::Response(self.handle_abort_merge_workspace(&req)),
+            "propose_merge_resolution" => {
+                Handled::Response(self.handle_propose_merge_resolution(&req))
+            }
+            "approve_merge_resolution" => {
+                Handled::Response(self.handle_approve_merge_resolution(&req))
+            }
+            "reject_merge_resolution" => {
+                Handled::Response(self.handle_reject_merge_resolution(&req))
+            }
             "get_workspace" => Handled::Response(self.handle_get_workspace(&req)),
             "remove_workspace" => Handled::Response(self.handle_remove_workspace(&req)),
             "shutdown" => {
@@ -249,6 +260,7 @@ impl Session {
                             "parallel_tasks": parallel_mod::MAX_PARALLEL_TASKS,
                             "merge_task": true,
                             "merge_workspace": true,
+                            "merge_resolution": true,
                         }
                     }),
                 )
@@ -1461,6 +1473,216 @@ impl Session {
                 Response::ok(req.id, serde_json::json!({ "aborted": true }))
             }
             Err(e) => err_resp(req.id, "merge_abort_failed", e.to_string()),
+        }
+    }
+
+    fn proposal_json(proposal: &zealous_engine::merge_resolution::Proposal) -> serde_json::Value {
+        use zealous_engine::merge_resolution::ProposalFile;
+        serde_json::json!({
+            "resolution_id": proposal.resolution_id.as_str(),
+            "summary": proposal.summary,
+            "files": proposal.files.iter().map(|file| match file {
+                ProposalFile::Resolved { path, content, rationale } => serde_json::json!({
+                    "path": path,
+                    "mode": "resolved",
+                    "content": content,
+                    "rationale": rationale
+                }),
+                ProposalFile::Manual { path, reason } => serde_json::json!({
+                    "path": path,
+                    "mode": "manual",
+                    "reason": reason
+                })
+            }).collect::<Vec<_>>()
+        })
+    }
+
+    fn resolution_note(
+        &self,
+        event: &'static str,
+        task_id: &TaskId,
+        proposal: &zealous_engine::merge_resolution::Proposal,
+        files: &[String],
+    ) {
+        let _ = self.notif_tx.send(Notification {
+            event,
+            params: serde_json::json!({
+                "task_id": task_id.as_str(),
+                "resolution_id": proposal.resolution_id.as_str(),
+                "summary": proposal.summary,
+                "resolved_files": proposal.resolved_files(),
+                "manual_files": proposal.manual_files(),
+                "files": files
+            }),
+        });
+    }
+
+    fn handle_propose_merge_resolution(&mut self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let (ledger, projection, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        let Some(merge_ws) = projection
+            .merge_workspace
+            .as_ref()
+            .filter(|w| w.status == "conflicted")
+        else {
+            return err_resp(
+                req.id,
+                "merge_workspace_not_found",
+                "merge workspace 不处于 conflicted 状态",
+            );
+        };
+        let config = match ProviderConfig::resolve() {
+            Ok(c) => c,
+            Err(e) => return err_resp(req.id, "internal", e.to_string()),
+        };
+        let provider = OpenAiCompatProvider::new(config.clone());
+        let _ = self.notif_tx.send(Notification {
+            event: "merge_resolution_started",
+            params: serde_json::json!({
+                "task_id": task_id.as_str(),
+                "merge_branch": merge_ws.branch,
+                "main_head": merge_ws.main_head,
+                "task_tip": merge_ws.task_tip,
+                "files": projection.merge_conflicts
+            }),
+        });
+        match zealous_engine::merge_resolution::propose(
+            std::path::Path::new(&merge_ws.path),
+            &ledger,
+            &provider,
+            &config.model,
+        ) {
+            Ok(proposal) => {
+                self.resolution_note("merge_resolution_proposed", &task_id, &proposal, &[]);
+                self.merge_proposals
+                    .lock()
+                    .unwrap()
+                    .insert(task_id.as_str().to_string(), proposal.clone());
+                Response::ok(req.id, Self::proposal_json(&proposal))
+            }
+            Err(e) => {
+                let _ = self
+                    .notif_tx
+                    .send(Notification::error_occurred(&e.to_string()));
+                err_resp(req.id, "merge_resolution_failed", e.to_string())
+            }
+        }
+    }
+
+    fn handle_approve_merge_resolution(&mut self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let resolution_id = req
+            .params
+            .get("resolution_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let proposal = self
+            .merge_proposals
+            .lock()
+            .unwrap()
+            .get(task_id.as_str())
+            .cloned();
+        let Some(proposal) = proposal else {
+            return err_resp(req.id, "resolution_not_found", "当前没有 proposal");
+        };
+        if proposal.resolution_id.as_str() != resolution_id {
+            return err_resp(req.id, "resolution_id_mismatch", "resolution_id 不匹配");
+        }
+        let (ledger, projection, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        let Some(merge_ws) = projection
+            .merge_workspace
+            .as_ref()
+            .filter(|w| w.status == "conflicted")
+        else {
+            return err_resp(
+                req.id,
+                "merge_workspace_not_found",
+                "merge workspace 不处于 conflicted 状态",
+            );
+        };
+        self.resolution_note(
+            "merge_resolution_approved",
+            &task_id,
+            &proposal,
+            &proposal.resolved_files(),
+        );
+        match zealous_engine::merge_resolution::apply_proposal(
+            std::path::Path::new(&merge_ws.path),
+            &ledger,
+            &proposal,
+        ) {
+            Ok((staged, manual)) => {
+                self.resolution_note("merge_resolution_applied", &task_id, &proposal, &staged);
+                self.merge_proposals
+                    .lock()
+                    .unwrap()
+                    .remove(task_id.as_str());
+                Response::ok(
+                    req.id,
+                    serde_json::json!({
+                        "applied": true,
+                        "staged_files": staged,
+                        "manual_pending": manual
+                    }),
+                )
+            }
+            Err(e) => err_resp(req.id, "merge_resolution_apply_failed", e.to_string()),
+        }
+    }
+
+    fn handle_reject_merge_resolution(&mut self, req: &Request) -> Response {
+        let task_id = match self.parse_task_id(req) {
+            Ok(id) => id,
+            Err(resp) => return resp,
+        };
+        let resolution_id = req
+            .params
+            .get("resolution_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let reason = req
+            .params
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let proposal = self
+            .merge_proposals
+            .lock()
+            .unwrap()
+            .get(task_id.as_str())
+            .cloned();
+        let Some(proposal) = proposal else {
+            return err_resp(req.id, "resolution_not_found", "当前没有 proposal");
+        };
+        if proposal.resolution_id.as_str() != resolution_id {
+            return err_resp(req.id, "resolution_id_mismatch", "resolution_id 不匹配");
+        }
+        let (ledger, _, _) = match self.svc.open_task(&task_id) {
+            Ok(value) => value,
+            Err(e) => return err_resp(req.id, "task_not_found", e.to_string()),
+        };
+        match zealous_engine::merge_resolution::reject(&ledger, &proposal.resolution_id, reason) {
+            Ok(()) => {
+                self.resolution_note("merge_resolution_rejected", &task_id, &proposal, &[]);
+                self.merge_proposals
+                    .lock()
+                    .unwrap()
+                    .remove(task_id.as_str());
+                Response::ok(req.id, serde_json::json!({"rejected": true}))
+            }
+            Err(e) => err_resp(req.id, "merge_resolution_reject_failed", e.to_string()),
         }
     }
 

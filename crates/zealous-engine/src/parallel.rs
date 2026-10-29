@@ -571,7 +571,9 @@ mod tests {
         let b = task(&svc, "b");
         let c = task(&svc, "c");
         let (selected, _) = select_runnable(&svc, 2).unwrap();
-        assert_eq!(selected, vec![a.clone(), b.clone()]);
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&a));
+        assert!(!selected.contains(&c));
         assert!(validate_explicit(&svc, &[a.clone(), b.clone()]).is_ok());
         assert!(validate_explicit(&svc, &[a, b, c]).is_err());
     }

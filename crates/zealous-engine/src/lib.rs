@@ -9,6 +9,7 @@ pub mod approval;
 pub mod executor;
 pub mod lease;
 pub mod ledger;
+pub mod merge_resolution;
 pub mod merge_workspace;
 pub mod orchestrator;
 pub mod parallel;

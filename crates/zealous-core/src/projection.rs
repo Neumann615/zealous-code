@@ -7,6 +7,7 @@ use crate::events::{
     AgentRef, AgentRole, AgentRunStatus, ApprovalDecision, EventPayload, RiskTier, TaskEvent,
     TaskStatus, MAX_WORKERS,
 };
+use crate::ids::ResolutionId;
 use crate::ids::{AgentRunId, TaskId};
 use crate::transition::can_transition;
 use std::collections::HashSet;
@@ -68,6 +69,19 @@ pub struct ExecutionWorkspaceView {
     pub status: String,
 }
 
+/// spec 160:模型辅助冲突解决视图
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MergeResolutionView {
+    pub resolution_id: ResolutionId,
+    /// started / proposed / approved / rejected / applied / manual_pending / failed
+    pub status: String,
+    pub summary: Option<String>,
+    pub resolved_files: Vec<String>,
+    pub manual_files: Vec<String>,
+    pub staged_files: Vec<String>,
+    pub decision_reason: Option<String>,
+}
+
 /// spec 159:冲突解决工作区视图(只来自事件投影)
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MergeWorkspaceView {
@@ -110,6 +124,8 @@ pub struct TaskProjection {
     pub merge_workspace: Option<MergeWorkspaceView>,
     /// spec 159:待处理冲突文件;Resolved/Aborted/Integrated 后清空
     pub merge_conflicts: Vec<String>,
+    /// spec 160:最近一次模型辅助冲突解决
+    pub merge_resolution: Option<MergeResolutionView>,
     /// spec 155:workspace 是否已清理
     pub workspace_removed: bool,
 }
@@ -163,6 +179,7 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
         merge_commit: None,
         merge_workspace: None,
         merge_conflicts: Vec::new(),
+        merge_resolution: None,
         workspace_removed: false,
     };
 
@@ -385,7 +402,91 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
             }
             EventPayload::ErrorOccurred { scope, message } => {
                 proj.last_error = Some((scope.clone(), message.clone()));
+                if scope == "merge_resolution" {
+                    if let Some(view) = &mut proj.merge_resolution {
+                        view.status = "failed".into();
+                    }
+                }
             }
+            EventPayload::MergeResolutionStarted {
+                resolution_id,
+                files,
+            } => {
+                if let Some(existing) = &proj.merge_resolution {
+                    if existing.status == "proposed" {
+                        return Err(FoldError::OrphanReference {
+                            seq: event.seq,
+                            detail: "merge resolution 重复提出且已有 pending proposal".into(),
+                        });
+                    }
+                }
+                proj.merge_resolution = Some(MergeResolutionView {
+                    resolution_id: resolution_id.clone(),
+                    status: "started".into(),
+                    summary: None,
+                    resolved_files: files.clone(),
+                    manual_files: Vec::new(),
+                    staged_files: Vec::new(),
+                    decision_reason: None,
+                });
+            }
+            EventPayload::MergeResolutionProposed {
+                resolution_id,
+                summary,
+                resolved_files,
+                manual_files,
+            } => match &mut proj.merge_resolution {
+                Some(view) if view.resolution_id == *resolution_id && view.status == "started" => {
+                    view.status = "proposed".into();
+                    view.summary = Some(summary.clone());
+                    view.resolved_files = resolved_files.clone();
+                    view.manual_files = manual_files.clone();
+                }
+                _ => {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "resolution proposal 引用未开始或重复".into(),
+                    })
+                }
+            },
+            EventPayload::MergeResolutionDecided {
+                resolution_id,
+                decision,
+                reason,
+            } => match &mut proj.merge_resolution {
+                Some(view) if view.resolution_id == *resolution_id && view.status == "proposed" => {
+                    view.status = match decision {
+                        ApprovalDecision::Approve => "approved".into(),
+                        ApprovalDecision::Reject => "rejected".into(),
+                    };
+                    view.decision_reason = reason.clone();
+                }
+                _ => {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "resolution decision 引用非 pending proposal".into(),
+                    })
+                }
+            },
+            EventPayload::MergeResolutionApplied {
+                resolution_id,
+                staged_files,
+            } => match &mut proj.merge_resolution {
+                Some(view) if view.resolution_id == *resolution_id && view.status == "approved" => {
+                    view.staged_files = staged_files.clone();
+                    view.status = if view.manual_files.is_empty() {
+                        "applied".into()
+                    } else {
+                        "manual_pending".into()
+                    };
+                }
+                _ => {
+                    return Err(FoldError::OrphanReference {
+                        seq: event.seq,
+                        detail: "resolution apply 引用非 approved proposal".into(),
+                    })
+                }
+            },
             EventPayload::MergeWorkspacePrepared {
                 branch,
                 path,
@@ -671,6 +772,62 @@ mod spec155_tests {
         assert_eq!(proj.applied_strategy, Some(AppliedStrategy::ThreeWayMerge));
         assert_eq!(proj.merge_commit.as_deref(), Some("merge"));
         assert_eq!(proj.execution_workspace.as_ref().unwrap().status, "applied");
+    }
+
+    #[test]
+    fn merge_resolution_lifecycle_fold() {
+        let tid = TaskId::generate();
+        let resolution = ResolutionId::generate();
+        let events = vec![
+            ev(
+                &tid,
+                1,
+                EventPayload::TaskCreated {
+                    title: "t".into(),
+                    repo_root: "r".into(),
+                },
+            ),
+            ev(
+                &tid,
+                2,
+                EventPayload::MergeResolutionStarted {
+                    resolution_id: resolution.clone(),
+                    files: vec!["a.md".into()],
+                },
+            ),
+            ev(
+                &tid,
+                3,
+                EventPayload::MergeResolutionProposed {
+                    resolution_id: resolution.clone(),
+                    summary: "s".into(),
+                    resolved_files: vec!["a.md".into()],
+                    manual_files: Vec::new(),
+                },
+            ),
+            ev(
+                &tid,
+                4,
+                EventPayload::MergeResolutionDecided {
+                    resolution_id: resolution.clone(),
+                    decision: ApprovalDecision::Approve,
+                    reason: None,
+                },
+            ),
+            ev(
+                &tid,
+                5,
+                EventPayload::MergeResolutionApplied {
+                    resolution_id: resolution.clone(),
+                    staged_files: vec!["a.md".into()],
+                },
+            ),
+        ];
+        let proj = fold(&tid, &events).unwrap();
+        let view = proj.merge_resolution.unwrap();
+        assert_eq!(view.status, "applied");
+        assert_eq!(view.resolution_id, resolution);
+        assert_eq!(view.staged_files, vec!["a.md".to_string()]);
     }
 
     #[test]

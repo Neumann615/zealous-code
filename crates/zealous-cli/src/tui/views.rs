@@ -321,6 +321,20 @@ fn render_confirm_modal(f: &mut Frame, state: &TuiState) {
                 "冲突会保留在现场,主工作区保持干净。".to_string(),
             ],
         ),
+        super::state::ConfirmKind::MergeResolutionApprove => (
+            "Approve AI Resolution".to_string(),
+            vec![
+                "只写入 merge workspace 中 mode=resolved 的文件并 stage。".to_string(),
+                "不会自动 commit,不会修改主工作区。".to_string(),
+            ],
+        ),
+        super::state::ConfirmKind::MergeResolutionReject => (
+            "Reject AI Resolution".to_string(),
+            vec![
+                "拒绝当前模型解决方案。".to_string(),
+                "不写入任何文件,不执行 git add。".to_string(),
+            ],
+        ),
         super::state::ConfirmKind::MergeContinue => (
             "Merge Continue".to_string(),
             vec![
@@ -604,6 +618,7 @@ pub(crate) mod tests {
             merge_commit: None,
             merge_workspace: None,
             merge_conflicts: Vec::new(),
+            merge_resolution: None,
             workspace_removed: false,
             interrupted_count: 1,
             last_event_seq: 9,

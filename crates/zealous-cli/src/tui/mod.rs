@@ -236,6 +236,34 @@ pub(crate) fn apply_event(
     }
 }
 
+fn format_resolution(proposal: &zealous_engine::merge_resolution::Proposal) -> String {
+    use zealous_engine::merge_resolution::ProposalFile;
+    let mut text = format!(
+        "resolution: {}\nsummary: {}\nproposed: {}\nmanual: {}\n\n",
+        proposal.resolution_id,
+        proposal.summary,
+        proposal.resolved_files().join(", "),
+        proposal.manual_files().join(", ")
+    );
+    for file in &proposal.files {
+        match file {
+            ProposalFile::Resolved {
+                path,
+                content,
+                rationale,
+            } => {
+                text.push_str(&format!(
+                    "FILE {path}\nrationale: {rationale}\nproposed:\n{content}\n\n"
+                ));
+            }
+            ProposalFile::Manual { path, reason } => {
+                text.push_str(&format!("FILE {path}\nmode: manual\nreason: {reason}\n\n",));
+            }
+        }
+    }
+    text
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     state: &mut TuiState,
@@ -324,6 +352,57 @@ fn handle_key(
                                 }
                             }
                             Err(e) => state.push_important(&format!("打开任务失败: {e}")),
+                        }
+                    }
+                }
+                state::ConfirmKind::MergeResolutionApprove => {
+                    let proposal = state.merge_resolution_proposal.clone();
+                    if let (Some(task_id), Some(proposal)) =
+                        (state.selected_task().map(|t| t.task_id.clone()), proposal)
+                    {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, proj, _)) => {
+                                let Some(merge_ws) = proj.merge_workspace.clone() else {
+                                    state.set_error("merge workspace 不存在".into());
+                                    return;
+                                };
+                                match zealous_engine::merge_resolution::apply_proposal(
+                                    std::path::Path::new(&merge_ws.path),
+                                    &ledger,
+                                    &proposal,
+                                ) {
+                                    Ok((staged, manual)) => state.push_important(&format!(
+                                        "resolution staged: {}; manual: {}",
+                                        staged.join(", "),
+                                        manual.join(", ")
+                                    )),
+                                    Err(e) => state.set_error(e.to_string()),
+                                }
+                            }
+                            Err(e) => state.set_error(e.to_string()),
+                        }
+                    }
+                }
+                state::ConfirmKind::MergeResolutionReject => {
+                    let proposal = state.merge_resolution_proposal.clone();
+                    if let (Some(task_id), Some(proposal)) =
+                        (state.selected_task().map(|t| t.task_id.clone()), proposal)
+                    {
+                        match svc.open_task(&task_id) {
+                            Ok((ledger, _, _)) => {
+                                match zealous_engine::merge_resolution::reject(
+                                    &ledger,
+                                    &proposal.resolution_id,
+                                    Some("TUI user rejected".into()),
+                                ) {
+                                    Ok(()) => {
+                                        state.merge_resolution_proposal = None;
+                                        state.push_important("resolution rejected");
+                                    }
+                                    Err(e) => state.set_error(e.to_string()),
+                                }
+                            }
+                            Err(e) => state.set_error(e.to_string()),
                         }
                     }
                 }
@@ -607,7 +686,79 @@ fn handle_key(
             }
             _ => {}
         },
-        Screen::Queue | Screen::Parallel | Screen::MergeStatus => match key.code {
+        Screen::MergeStatus => match key.code {
+            KeyCode::Esc => state.screen = Screen::List,
+            KeyCode::Char('q') => state.request_quit(),
+            KeyCode::Char('R') => {
+                if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                    match svc.open_task(&task_id) {
+                        Ok((ledger, proj, _)) => {
+                            let Some(merge_ws) = proj.merge_workspace.clone() else {
+                                state.set_error("merge workspace 不存在".into());
+                                return;
+                            };
+                            let config = zealous_engine::provider::ProviderConfig::resolve();
+                            match config {
+                                Ok(config) => {
+                                    let provider =
+                                        zealous_engine::provider::OpenAiCompatProvider::new(
+                                            config.clone(),
+                                        );
+                                    match zealous_engine::merge_resolution::propose(
+                                        std::path::Path::new(&merge_ws.path),
+                                        &ledger,
+                                        &provider,
+                                        &config.model,
+                                    ) {
+                                        Ok(proposal) => {
+                                            state.merge_resolution_proposal =
+                                                Some(proposal.clone());
+                                            state.merge_status_text =
+                                                Some(format_resolution(&proposal));
+                                        }
+                                        Err(e) => state.set_error(e.to_string()),
+                                    }
+                                }
+                                Err(e) => state.set_error(e.to_string()),
+                            }
+                        }
+                        Err(e) => state.set_error(e.to_string()),
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(proposal) = &state.merge_resolution_proposal {
+                    state.merge_status_text = Some(format_resolution(proposal));
+                }
+            }
+            KeyCode::Char('A') => {
+                if state.merge_resolution_proposal.is_some() {
+                    state.open_confirm(state::ConfirmKind::MergeResolutionApprove);
+                }
+            }
+            KeyCode::Char('D') => {
+                if state.merge_resolution_proposal.is_some() {
+                    state.open_confirm(state::ConfirmKind::MergeResolutionReject);
+                }
+            }
+            KeyCode::Char('S') => {
+                if let Some(task_id) = state.selected_task().map(|t| t.task_id.clone()) {
+                    if let Ok((ledger, _, _)) = svc.open_task(&task_id) {
+                        if let Ok(status) =
+                            zealous_engine::merge_workspace::status(svc.repo_root(), &ledger)
+                        {
+                            state.merge_status_text = Some(format!(
+                                "status: {}\nunresolved: {}\n",
+                                status.status,
+                                status.unresolved_files.join(", ")
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        Screen::Queue | Screen::Parallel => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => state.screen = Screen::List,
             _ => {}
         },
