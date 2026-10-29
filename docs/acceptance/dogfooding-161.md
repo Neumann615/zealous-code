@@ -130,3 +130,15 @@
 DT1 / DT2 / DT3 / DT4 全部 PASS。无 P0 / P1。
 Failed task 不阻塞 Completed tasks 的顺序集成;
 冲突后后续任务停止并保留,可通过 `parallel integrate` 恢复。
+
+## 阶段末本地 bundle(spec 161)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-threetask161.bundle | 492813 | 6ADFFBB082F8EEF0653F70D9EAD3E700D5595C9466E112B04E540FF87281AF69 |
+
+- `git bundle verify` 通过,包含 main 至 RC record commit
+  `9273df81ec7db3302b6092d63ff69a0b55f53329`;
+- 本提交为 bundle rotation commit,按 spec 150 三段溯源模型不进入 bundle;
+- verify 通过后删除旧 `zealous-code-main-airesolution160.bundle`;
+- archive bundle 保留;OFFLINE RC lock 已刷新;仍不自动推送 remote。
