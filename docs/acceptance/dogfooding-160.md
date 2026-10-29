@@ -125,3 +125,15 @@
 DR1 / DR2 / DR3 / DR4 全部 PASS。无 P0 / P1。
 模型只能提出方案;用户审批前不写入,写入后不自动 commit,
 所有最终集成仍由 `merge-continue` 完成。
+
+## 阶段末本地 bundle(spec 160)
+
+| File | Size | SHA256 |
+| ---- | ---- | ------ |
+| zealous-code-main-airesolution160.bundle | 479451 | 11414BCE4EB258953185A50AE09EE1E043EC22645FDA165FC49236C7CC7A29C8 |
+
+- `git bundle verify` 通过,包含 main 至 RC record commit
+  `7e54f9475102ac75354638011b7446f74fba7589`;
+- 本提交为 bundle rotation commit,按 spec 150 三段溯源模型不进入 bundle;
+- verify 通过后删除旧 `zealous-code-main-mergeworkspace159.bundle`;
+- archive bundle 保留;OFFLINE RC lock 已刷新;仍不自动推送 remote。
