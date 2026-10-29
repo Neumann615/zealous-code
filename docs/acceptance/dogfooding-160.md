@@ -91,6 +91,27 @@
   - ledger 无 `Authorization` / `Bearer`;
   - resolver 无 shell 工具能力,不读取 unresolved 之外的文件。
 
+## LOCAL TRIAL release 回归 —— PASS
+
+- RC zip SHA256:`52A6F9772573428D3954512D6EDC9841684BF07DE5C1F505063F7F54C753F082`
+- 解压二进制:`%TEMP%\zealous-160-localtrial-c177c896\bin\zealous.exe`
+- 仓库:`%TEMP%\zealous-160-localtrial-c177c896`
+- base:`04aef0e6f157c95b979e76350ed5f6715a37c670`
+- 任务:
+  - `task_01M648EYWDYYEPVNTDNBVTM42E`:color red → blue
+  - `task_01M648EYX01RX6VZ5JMZZSFQY1`:size small → large
+- Resolution:
+  - `resolution_01M648FY2MXQ8XM3S66RFQEYFX`
+  - proposed:`color=blue size=large enabled=true`
+- 结果:
+  - release binary 生成 proposal;
+  - 审批后写入 merge workspace 并 stage;
+  - 未自动 commit;
+  - merge commit:`4a3f5a2519482760cb0c069dd923ab4c13d9e6f7`;
+  - merge workspace 清理,原 task worktree 保留;
+  - 主工作区干净;
+  - 最终内容保留双方意图。
+
 ## 账本审计
 
 - 事件 seq 连续;
