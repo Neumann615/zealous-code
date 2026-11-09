@@ -441,6 +441,7 @@ pub fn propose(
     let mut parsed = None;
     for attempt in 0..=MAX_RESOLUTION_REPAIRS {
         let request = ChatRequest {
+            tools: Vec::new(),
             system: Some("You are a strict JSON merge-resolution assistant.".into()),
             messages: messages.clone(),
         };
@@ -706,6 +707,7 @@ mod tests {
         let mut result = None;
         for _ in 0..=MAX_RESOLUTION_REPAIRS {
             let req = ChatRequest {
+                tools: Vec::new(),
                 system: None,
                 messages: messages.clone(),
             };

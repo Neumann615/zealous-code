@@ -636,6 +636,8 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
                     }
                 }
             }
+            // spec 164:usage 只记账不投影(转录/状态不变;UI 经 events 直读)
+            EventPayload::UsageRecorded { .. } => {}
         }
     }
 

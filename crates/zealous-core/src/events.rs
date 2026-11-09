@@ -233,6 +233,14 @@ pub enum EventPayload {
         resolved_files: Vec<String>,
         manual_files: Vec<String>,
     },
+    /// spec 164:单轮模型用量(与转录分离;记 token 不产生转录行)
+    UsageRecorded {
+        run_id: AgentRunId,
+        turn: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
     MergeResolutionDecided {
         resolution_id: ResolutionId,
         decision: ApprovalDecision,

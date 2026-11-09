@@ -148,6 +148,8 @@ pub fn spawn_worker(
             model,
             progress: Some(progress),
             on_delta: None,
+            native_tools: false,
+            tools: Vec::new(),
         };
         let status = match orchestrator.run_task(&ledger, &prompt) {
             Ok(s) => s,

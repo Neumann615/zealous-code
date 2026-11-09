@@ -47,9 +47,11 @@ pub fn spawn_run(
     abort: Arc<AtomicBool>,
     isolate: bool,
     // spec 163:聊天模式自定义 prompt(覆盖 proj.title)
+    // spec 164:聊天路径启用原生 tool-calls
+    native: bool,
     prompt_override: Option<String>,
     // spec 163:流式 delta 回调
-    on_delta: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    on_delta: Option<Arc<dyn Fn(zealous_engine::provider::ProviderStreamEvent) + Send + Sync>>,
 ) {
     std::thread::spawn(move || {
         let config = match ProviderConfig::resolve() {
@@ -118,6 +120,12 @@ pub fn spawn_run(
             model,
             progress: Some(progress_sink),
             on_delta,
+            native_tools: native,
+            tools: if native {
+                zealous_engine::tools::builtin_tool_defs()
+            } else {
+                Vec::new()
+            },
         };
 
         let status = match orchestrator.run_task(&ledger, &prompt) {

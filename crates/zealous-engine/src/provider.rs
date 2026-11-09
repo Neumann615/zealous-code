@@ -10,11 +10,38 @@ use std::sync::Arc;
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
-/// 对话角色:V1 只需要 user/assistant(system 单独字段承载)
+/// 对话角色:user/assistant/tool(system 单独字段承载)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
     User,
     Assistant,
+    /// spec 164:工具结果消息(对应一次 tool_call)
+    Tool,
+}
+
+/// spec 164:一次工具调用(assistant 发起)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallInfo {
+    pub id: String,
+    pub name: String,
+    /// JSON 文本(分片拼装后的完整参数)
+    pub arguments: String,
+}
+
+/// spec 164:单轮模型用量
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// spec 164:工具定义(OpenAI function 形态;parameters 为 JSON Schema 文本)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: String,
 }
 
 /// 一条历史消息(spec 70:多轮上下文原生传递,不再拼接进单个字符串)
@@ -22,6 +49,10 @@ pub enum ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// spec 164:assistant 消息携带的工具调用
+    pub tool_calls: Vec<ToolCallInfo>,
+    /// spec 164:tool 结果消息对应的调用 id
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -29,6 +60,8 @@ impl ChatMessage {
         ChatMessage {
             role: ChatRole::User,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -36,6 +69,28 @@ impl ChatMessage {
         ChatMessage {
             role: ChatRole::Assistant,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// spec 164:携带工具调用的 assistant 消息
+    pub fn assistant_with_calls(calls: Vec<ToolCallInfo>) -> Self {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            tool_calls: calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// spec 164:工具结果消息
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
         }
     }
 }
@@ -45,11 +100,17 @@ impl ChatMessage {
 pub struct ChatRequest {
     pub system: Option<String>,
     pub messages: Vec<ChatMessage>,
+    /// spec 164:可用工具(native tool-calls;空 = 不声明工具)
+    pub tools: Vec<ToolDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponse {
     pub text: String,
+    /// spec 164:模型发起的工具调用(原生 tool-calls)
+    pub tool_calls: Vec<ToolCallInfo>,
+    /// spec 164:本轮用量(流式需 include_usage;缺省 None)
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,17 +276,33 @@ fn dirs_home() -> Option<PathBuf> {
 pub trait Provider: Send + Sync {
     fn complete(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError>;
 
-    /// spec 162: 流式调用;delta 经 on_delta 实时外发,返回累计全文。
-    /// 默认实现忽略 delta 委托 complete(Mock 等替身零改动)。
+    /// spec 164: 流式调用;分型事件实时外发(text/reasoning/tool-args),
+    /// 返回累计结果。默认实现忽略事件委托 complete(Mock 等替身零改动)。
     fn complete_streaming(
         &self,
         model: &str,
         req: &ChatRequest,
-        on_delta: &dyn Fn(&str),
+        on_event: &dyn Fn(ProviderStreamEvent),
     ) -> Result<ChatResponse, ProviderError> {
-        let _ = on_delta;
+        let _ = on_event;
         self.complete(model, req)
     }
+}
+
+/// spec 164:流式事件分型(对齐 dsh-TUI text/reasoning/tool-args 词汇)
+#[derive(Debug, Clone)]
+pub enum ProviderStreamEvent {
+    /// 助手正文增量(打字机)
+    TextDelta(String),
+    /// 思考流增量(reasoning_content;渲染由客户端决定)
+    ReasoningDelta(String),
+    /// 工具调用参数分片(按 index 分桶拼装)
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        args_delta: String,
+    },
 }
 
 /// 重试策略:退避序列由调用方注入,测试可零等待。
@@ -288,30 +365,40 @@ impl OpenAiCompatProvider {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // OpenAI 映射:system 在前,历史 user/assistant 按序透传(spec 70)
-        let mut messages = Vec::new();
-        if let Some(sys) = &req.system {
-            messages.push(serde_json::json!({ "role": "system", "content": sys }));
-        }
-        for m in &req.messages {
-            let role = match m.role {
-                ChatRole::User => "user",
-                ChatRole::Assistant => "assistant",
-            };
-            messages.push(serde_json::json!({ "role": role, "content": m.content }));
-        }
+        let messages = messages_json(req);
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
-        })
-        .to_string();
-
+        });
+        // spec 164:native tool-calls 声明
+        if !req.tools.is_empty() {
+            let tools: Vec<serde_json::Value> = req
+                .tools
+                .iter()
+                .map(|td| {
+                    let params =
+                        serde_json::from_str::<serde_json::Value>(&td.parameters).unwrap_or_else(
+                            |_| serde_json::json!({"type": "object", "properties": {}}),
+                        );
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": td.name,
+                            "description": td.description,
+                            "parameters": params,
+                        },
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(tools);
+        }
         let resp = self
             .agent
             .post(&self.endpoint())
             .set("Authorization", &format!("Bearer {}", self.config.api_key))
             .set("Content-Type", "application/json")
-            .send_string(&body)
+            .send_string(&body.to_string())
             .map_err(classify_ureq)?;
 
         let status = resp.status();
@@ -327,31 +414,22 @@ impl OpenAiCompatProvider {
         parsed.into_response()
     }
 
-    /// spec 162: SSE 流式调用(`stream=true`)。逐行解析 `data:` 帧,
-    /// `[DONE]` 终止;delta 实时回调,返回累计全文。空 data 行/坏行跳过。
+    /// spec 164: SSE 流式调用。逐行解析 `data:` 帧(分型事件:正文/思考/
+    /// 工具分片),`[DONE]` 终止;末块 usage 并入返回值。坏行容错跳过。
     fn once_streaming(
         &self,
         model: &str,
         req: &ChatRequest,
-        on_delta: &dyn Fn(&str),
+        on_event: &dyn Fn(ProviderStreamEvent),
     ) -> Result<ChatResponse, ProviderError> {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut messages = Vec::new();
-        if let Some(sys) = &req.system {
-            messages.push(serde_json::json!({ "role": "system", "content": sys }));
-        }
-        for m in &req.messages {
-            let role = match m.role {
-                ChatRole::User => "user",
-                ChatRole::Assistant => "assistant",
-            };
-            messages.push(serde_json::json!({ "role": role, "content": m.content }));
-        }
+        let messages = messages_json(req);
         let body = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": true,
+            "stream_options": { "include_usage": true },
         })
         .to_string();
         let resp = self
@@ -359,46 +437,67 @@ impl OpenAiCompatProvider {
             .post(&self.endpoint())
             .set("Authorization", &format!("Bearer {}", self.config.api_key))
             .set("Content-Type", "application/json")
-            .send_string(&body)
+            .send_string(&body.to_string())
             .map_err(classify_ureq)?;
-        let mut text = String::new();
+        let mut acc = StreamAccum::default();
         for line in BufReader::new(resp.into_reader()).lines() {
             let line = line.map_err(|e| ProviderError::Transient(format!("stream read: {e}")))?;
-            match sse_line_delta(&line) {
-                SseLine::Delta(piece) => {
-                    text.push_str(&piece);
-                    on_delta(&piece);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                if data == "[DONE]" {
+                    break;
                 }
-                SseLine::Done => break,
-                SseLine::Ignore => {}
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            for ev in apply_stream_chunk(&v, &mut acc) {
+                on_event(ev);
             }
         }
-        if text.is_empty() {
+        if acc.text.is_empty() && acc.calls.is_empty() {
             return Err(ProviderError::Rejected {
                 status: 200,
                 summary: "empty stream".into(),
             });
         }
-        Ok(ChatResponse { text })
+        Ok(ChatResponse {
+            text: acc.text,
+            tool_calls: acc
+                .calls
+                .into_iter()
+                .map(|c| ToolCallInfo {
+                    id: c.id.unwrap_or_default(),
+                    name: c.name.unwrap_or_default(),
+                    arguments: c.args,
+                })
+                .filter(|c| !c.name.is_empty())
+                .collect(),
+            usage: acc.usage,
+        })
     }
 }
 
 impl Provider for OpenAiCompatProvider {
-    /// spec 162: 流式重试语义 —— 首个 delta 到达前失败按既有策略重试;
-    /// 流已开始(delta 已外发)后失败不再重试,避免 delta 重复。
+    /// spec 164: 流式重试语义 —— 首个事件到达前失败按既有策略重试;
+    /// 流已开始(事件已外发)后失败不再重试,避免 delta 重复。
     fn complete_streaming(
         &self,
         model: &str,
         req: &ChatRequest,
-        on_delta: &dyn Fn(&str),
+        on_event: &dyn Fn(ProviderStreamEvent),
     ) -> Result<ChatResponse, ProviderError> {
         let attempts = self.retry.max_retries + 1;
         let mut last_err: Option<String> = None;
         for attempt in 0..attempts {
             let started = std::sync::atomic::AtomicBool::new(false);
-            let cb = |piece: &str| {
+            let cb = |ev: ProviderStreamEvent| {
                 started.store(true, std::sync::atomic::Ordering::Relaxed);
-                on_delta(piece);
+                on_event(ev);
             };
             match self.once_streaming(model, req, &cb) {
                 Ok(resp) => return Ok(resp),
@@ -443,63 +542,187 @@ impl Provider for OpenAiCompatProvider {
     }
 }
 
-/// spec 162: SSE 帧解析。Delta 携带新增片段;Done 为流终止;
-/// Ignore 覆盖空 data 行、`[DONE]` 前注释行与无法解析的坏行(容错跳过)。
-fn sse_line_delta(line: &str) -> SseLine {
-    let Some(data) = line.strip_prefix("data:") else {
-        return SseLine::Ignore;
-    };
-    let data = data.trim();
-    if data.is_empty() {
-        return SseLine::Ignore;
-    }
-    if data == "[DONE]" {
-        return SseLine::Done;
-    }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-        return SseLine::Ignore;
-    };
-    match v["choices"][0]["delta"]["content"].as_str() {
-        Some(s) if !s.is_empty() => SseLine::Delta(s.to_string()),
-        _ => SseLine::Ignore,
-    }
+/// spec 164:流式分片桶(按 tool_calls.index 聚合)
+#[derive(Default)]
+struct StreamCallAccum {
+    index: usize,
+    id: Option<String>,
+    name: Option<String>,
+    args: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SseLine {
-    Delta(String),
-    Done,
-    Ignore,
+/// spec 164:流式累积器(正文 + 工具调用 + 用量)
+#[derive(Default)]
+struct StreamAccum {
+    text: String,
+    calls: Vec<StreamCallAccum>,
+    usage: Option<Usage>,
+}
+
+/// spec 164:解析一个 chunk(纯函数,可测);返回应外发的事件序列。
+/// 与 dsh-TUI 的事件词汇同构:text / reasoning / tool-args 三型。
+fn apply_stream_chunk(
+    v: &serde_json::Value,
+    acc: &mut StreamAccum,
+) -> Vec<ProviderStreamEvent> {
+    let mut events = Vec::new();
+    if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
+        acc.usage = Some(Usage {
+            prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+            total_tokens: u["total_tokens"].as_u64().unwrap_or(0),
+        });
+    }
+    let Some(choices) = v["choices"].as_array() else {
+        return events;
+    };
+    for ch in choices {
+        let delta = &ch["delta"];
+        if let Some(rc) = delta["reasoning_content"].as_str().filter(|s| !s.is_empty()) {
+            events.push(ProviderStreamEvent::ReasoningDelta(rc.to_string()));
+        }
+        if let Some(tc) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+            acc.text.push_str(tc);
+            events.push(ProviderStreamEvent::TextDelta(tc.to_string()));
+        }
+        if let Some(tcs) = delta["tool_calls"].as_array() {
+            for tc in tcs {
+                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                let id = tc["id"].as_str().map(|s| s.to_string());
+                let name = tc["function"]["name"].as_str().map(|s| s.to_string());
+                let args = tc["function"]["arguments"].as_str().unwrap_or("").to_string();
+                let slot = match acc.calls.iter_mut().find(|c| c.index == idx) {
+                    Some(c) => c,
+                    None => {
+                        acc.calls.push(StreamCallAccum {
+                            index: idx,
+                            id: None,
+                            name: None,
+                            args: String::new(),
+                        });
+                        acc.calls.last_mut().unwrap()
+                    }
+                };
+                if id.is_some() {
+                    slot.id = id.clone();
+                }
+                if name.is_some() {
+                    slot.name = name.clone();
+                }
+                slot.args.push_str(&args);
+                events.push(ProviderStreamEvent::ToolCallDelta {
+                    index: idx,
+                    id,
+                    name,
+                    args_delta: args,
+                });
+            }
+        }
+    }
+    events
 }
 
 #[cfg(test)]
 mod sse_tests {
     use super::*;
 
-    #[test]
-    fn sse_multi_chunk_and_done() {
-        let mk = |s: &str| {
-            format!("{{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}")
-        };
-        assert_eq!(sse_line_delta(&format!("data: {}", mk("你"))), SseLine::Delta("你".into()));
-        assert_eq!(sse_line_delta(&format!("data:{}", mk("好"))), SseLine::Delta("好".into()));
-        assert!(matches!(sse_line_delta("data: [DONE]"), SseLine::Done));
+    fn chunk(delta: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "choices": [{ "index": 0, "delta": delta }] })
     }
 
     #[test]
-    fn sse_tolerates_noise() {
-        assert!(matches!(sse_line_delta(""), SseLine::Ignore));
-        assert!(matches!(sse_line_delta(": keep-alive"), SseLine::Ignore));
-        assert!(matches!(sse_line_delta("data: "), SseLine::Ignore));
-        assert!(matches!(sse_line_delta("data: not-json"), SseLine::Ignore));
-        // 空内容片段(如 finish_reason 帧)忽略
-        assert!(
-            matches!(
-                sse_line_delta("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"),
-                SseLine::Ignore
-            )
+    fn stream_text_and_reasoning_split() {
+        let mut acc = StreamAccum::default();
+        let evs = apply_stream_chunk(
+            &chunk(serde_json::json!({"role":"assistant","reasoning_content":"think"})),
+            &mut acc,
+        );
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(&evs[0], ProviderStreamEvent::ReasoningDelta(s) if s == "think"));
+        let evs = apply_stream_chunk(&chunk(serde_json::json!({"content":"你好"})), &mut acc);
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(&evs[0], ProviderStreamEvent::TextDelta(s) if s == "你好"));
+        assert_eq!(acc.text, "你好");
+        // finish_reason 帧无 delta 内容 → 零事件
+        let evs = apply_stream_chunk(
+            &chunk(serde_json::json!({"finish_reason":"stop"})),
+            &mut acc,
+        );
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn stream_tool_call_fragments_bucketed_by_index() {
+        let mut acc = StreamAccum::default();
+        apply_stream_chunk(
+            &chunk(serde_json::json!({"tool_calls":[{"index":0,"id":"call_1","function":{"name":"calc","arguments":"{\"expr\":"}}]})),
+            &mut acc,
+        );
+        apply_stream_chunk(
+            &chunk(serde_json::json!({"tool_calls":[{"index":0,"function":{"arguments":"\"2+3\"}"}}]})),
+            &mut acc,
+        );
+        assert_eq!(acc.calls.len(), 1);
+        assert_eq!(acc.calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(acc.calls[0].name.as_deref(), Some("calc"));
+        assert_eq!(acc.calls[0].args, "{\"expr\":\"2+3\"}");
+    }
+
+    #[test]
+    fn stream_usage_final_chunk() {
+        let mut acc = StreamAccum::default();
+        apply_stream_chunk(
+            &serde_json::json!({ "choices": [], "usage": {"prompt_tokens": 19, "completion_tokens": 50, "total_tokens": 69} }),
+            &mut acc,
+        );
+        assert_eq!(
+            acc.usage,
+            Some(Usage { prompt_tokens: 19, completion_tokens: 50, total_tokens: 69 }),
         );
     }
+}
+
+/// spec 164:ChatRequest → OpenAI messages(含 tool_calls/tool 结果消息)
+fn messages_json(req: &ChatRequest) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    if let Some(sys) = &req.system {
+        messages.push(serde_json::json!({ "role": "system", "content": sys }));
+    }
+    for m in &req.messages {
+        match m.role {
+            ChatRole::User => messages.push(serde_json::json!({
+                "role": "user",
+                "content": m.content,
+            })),
+            ChatRole::Assistant => {
+                let mut msg = serde_json::json!({ "role": "assistant", "content": m.content });
+                if !m.tool_calls.is_empty() {
+                    msg["tool_calls"] = serde_json::Value::Array(
+                        m.tool_calls
+                            .iter()
+                            .map(|tc| {
+                                serde_json::json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.name,
+                                        "arguments": tc.arguments,
+                                    },
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                messages.push(msg);
+            }
+            ChatRole::Tool => messages.push(serde_json::json!({
+                "role": "tool",
+                "content": m.content,
+                "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+            })),
+        }
+    }
+    messages
 }
 
 fn classify_ureq(e: ureq::Error) -> ProviderError {
@@ -543,6 +766,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[derive(Deserialize)]
 struct ChatCompletionsResponse {
     choices: Vec<ChatChoice>,
+    usage: Option<ApiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -552,7 +776,32 @@ struct ChatChoice {
 
 #[derive(Deserialize)]
 struct ApiResponseMessage {
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    tool_calls: Vec<ApiToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ApiToolCall {
+    #[serde(default)]
+    id: String,
+    function: ApiFunction,
+}
+
+#[derive(Deserialize)]
+struct ApiFunction {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    arguments: String,
+}
+
+#[derive(Deserialize)]
+struct ApiUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
 }
 
 impl ChatCompletionsResponse {
@@ -562,6 +811,21 @@ impl ChatCompletionsResponse {
             .next()
             .map(|c| ChatResponse {
                 text: c.message.content,
+                tool_calls: c
+                    .message
+                    .tool_calls
+                    .into_iter()
+                    .map(|tc| ToolCallInfo {
+                        id: tc.id,
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                    })
+                    .collect(),
+                usage: self.usage.map(|u| Usage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    total_tokens: u.total_tokens,
+                }),
             })
             .ok_or_else(|| ProviderError::Rejected {
                 status: 200,
@@ -574,6 +838,8 @@ impl ChatCompletionsResponse {
 pub struct MockProvider {
     /// 每个元素:Ok(text) 或 Err(描述);耗尽后重复最后一项
     pub script: std::sync::Mutex<Vec<Result<String, String>>>,
+    /// spec 164:结构化脚本(scripted_chat 用;None = 纯文本模式)
+    pub script_chat: std::sync::Mutex<Option<Vec<Result<ChatResponse, String>>>>,
     pub calls: std::sync::atomic::AtomicU32,
     /// 收到的请求记录(断言上下文顺序/内容用)
     pub prompts: std::sync::Mutex<Vec<ChatRequest>>,
@@ -583,6 +849,7 @@ impl MockProvider {
     pub fn ok(text: &str) -> Self {
         Self {
             script: std::sync::Mutex::new(vec![Ok(text.to_string())]),
+            script_chat: std::sync::Mutex::new(None),
             calls: Default::default(),
             prompts: std::sync::Mutex::new(Vec::new()),
         }
@@ -591,6 +858,18 @@ impl MockProvider {
     pub fn scripted(script: Vec<Result<String, String>>) -> Self {
         Self {
             script: std::sync::Mutex::new(script),
+            script_chat: std::sync::Mutex::new(None),
+            calls: Default::default(),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// spec 164:结构化脚本(可携带 tool_calls/usage),native 循环测试用;
+    /// 存在时优先于文本脚本消费
+    pub fn scripted_chat(script: Vec<Result<ChatResponse, String>>) -> Self {
+        Self {
+            script: std::sync::Mutex::new(Vec::new()),
+            script_chat: std::sync::Mutex::new(Some(script)),
             calls: Default::default(),
             prompts: std::sync::Mutex::new(Vec::new()),
         }
@@ -602,6 +881,24 @@ impl Provider for MockProvider {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.prompts.lock().unwrap().push(req.clone());
+        // spec 164:结构化脚本优先
+        {
+            let mut chat = self.script_chat.lock().unwrap();
+            if let Some(q) = chat.as_mut() {
+                let item = if q.is_empty() {
+                    return Err(ProviderError::Exhausted {
+                        attempts: 1,
+                        last: "mock script exhausted".into(),
+                    });
+                } else if q.len() == 1 {
+                    q[0].clone()
+                } else {
+                    q.remove(0)
+                };
+                return item
+                    .map_err(|last| ProviderError::Exhausted { attempts: 1, last });
+            }
+        }
         let mut script = self.script.lock().unwrap();
         let item = if script.is_empty() {
             return Err(ProviderError::Exhausted {
@@ -613,7 +910,8 @@ impl Provider for MockProvider {
         } else {
             script.remove(0)
         };
-        item.map(|text| ChatResponse { text })
+        item
+            .map(|text| ChatResponse { text, tool_calls: Vec::new(), usage: None })
             .map_err(|last| ProviderError::Exhausted { attempts: 1, last })
     }
 }
@@ -796,6 +1094,7 @@ mod tests {
         };
         let provider = OpenAiCompatProvider::new(cfg);
         let req = ChatRequest {
+            tools: Vec::new(),
             system: Some("SYS".into()),
             messages: vec![
                 ChatMessage::user("u1"),
@@ -837,6 +1136,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("hi")],
                 },
@@ -864,6 +1164,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("hi")],
                 },
@@ -883,6 +1184,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("u")],
                 },
@@ -893,6 +1195,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("u")]
                 }
@@ -903,6 +1206,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("u")]
                 }
@@ -933,6 +1237,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("hi")],
                 },
@@ -968,6 +1273,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("hi")],
                 },
@@ -1002,6 +1308,7 @@ mod tests {
             .complete(
                 "m",
                 &ChatRequest {
+                    tools: Vec::new(),
                     system: None,
                     messages: vec![ChatMessage::user("hi")],
                 },

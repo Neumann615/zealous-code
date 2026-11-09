@@ -17,7 +17,7 @@ use zealous_core::{ApprovalDecision, TaskStatus};
 use zealous_engine::approval::ApprovalSink;
 use zealous_engine::executor::ToolExecutor;
 use zealous_engine::orchestrator::Orchestrator;
-use zealous_engine::provider::{OpenAiCompatProvider, Provider, ProviderConfig};
+use zealous_engine::provider::{OpenAiCompatProvider, Provider, ProviderConfig, ProviderStreamEvent};
 use zealous_engine::task_service::{CreateOutcome, TaskService};
 use zealous_engine::tools::builtin_registry;
 
@@ -681,6 +681,8 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool, isolate: bool) -> i3
         model,
         progress: Some(Arc::new(CliProgress { quiet })),
             on_delta: None,
+            native_tools: false,
+            tools: Vec::new(),
     };
     let mut title = proj.title.clone();
     if run_root != repo_root().unwrap_or_default() {
@@ -2150,8 +2152,11 @@ fn cmd_chat(initial: Option<&str>) -> i32 {
 
         // ---- 运行(流式) ----
         abort.store(false, Ordering::Relaxed);
-        let on_delta: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|piece: &str| {
-            print!("{piece}");
+        let on_delta: Arc<dyn Fn(ProviderStreamEvent) + Send + Sync> = Arc::new(|ev| {
+            if let ProviderStreamEvent::TextDelta(piece) = ev {
+                print!("{piece}");
+                let _ = std::io::stdout().flush();
+            }
             let _ = std::io::stdout().flush();
         });
         let approval = Arc::new(ChatApproval {
@@ -2167,9 +2172,11 @@ fn cmd_chat(initial: Option<&str>) -> i32 {
             model: config.model.clone(),
             progress: Some(Arc::new(CliProgress { quiet: false })),
             on_delta: Some(on_delta),
+            native_tools: true,
+            tools: zealous_engine::tools::builtin_tool_defs(),
         };
         println!("---");
-        match orch.run_task(&ledger, &task_prompt) {
+        match orch.run_chat_turn(&ledger, &task_prompt) {
             Ok(status) => {
                 println!("\n---");
                 match status {

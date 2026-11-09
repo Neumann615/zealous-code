@@ -335,6 +335,7 @@ fn handle_key(
                                 progress_sink.clone(),
                                 abort.clone(),
                                 true,
+            false,
                                 None,
                                 None,
                             );
@@ -898,9 +899,11 @@ fn handle_key(
                     let prompt = state.chat_history_prompt(&msg);
                     // spec 163:流式 delta 经事件流回传转录区(通知通道)
                     let delta_tx = event_tx.clone();
-                    let on_delta: Arc<dyn Fn(&str) + Send + Sync> =
-                        Arc::new(move |piece: &str| {
-                            let _ = delta_tx.send(TuiEvent::ChatDelta(piece.to_string()));
+                    let on_delta: Arc<dyn Fn(zealous_engine::provider::ProviderStreamEvent) + Send + Sync> =
+                        Arc::new(move |ev| {
+                            if let zealous_engine::provider::ProviderStreamEvent::TextDelta(piece) = ev {
+                                let _ = delta_tx.send(TuiEvent::ChatDelta(piece));
+                            }
                         });
                     runner::spawn_run(
                         TaskService::new(svc.repo_root().to_path_buf()),
@@ -910,6 +913,7 @@ fn handle_key(
                         progress_sink.clone(),
                         abort.clone(),
                         false,
+                        true,
                         Some(prompt),
                         Some(on_delta),
                     );
@@ -1021,6 +1025,7 @@ fn handle_key(
                             progress_sink.clone(),
                             abort.clone(),
                             false,
+            false,
                             None,
                             None,
                         );
@@ -1200,6 +1205,7 @@ mod integration_tests {
             Arc::new(approval_sink),
             Arc::new(progress_sink),
             abort.clone(),
+            false,
             false,
             None,
             None,

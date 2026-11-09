@@ -1005,6 +1005,36 @@ impl Tool for Shell {
 }
 
 /// 内置注册表:name → 工具。新工具接入必须在此登记并归级(spec 30)。
+/// spec 164:工具参数正式 JSON Schema(原生 tool-calls 用;
+/// 与 args_template 示例并存:示例进 manifest 文本,schema 进 API 声明)。
+pub fn tool_parameters_schema(name: &str) -> &'static str {
+    match name {
+        "read_file" => r#"{"type":"object","properties":{"path":{"type":"string","description":"仓库内相对路径"},"offset":{"type":"integer","description":"起始行(1-based)"},"limit":{"type":"integer","description":"行数上限(<=500)"}},"required":["path"]}"#,
+        "list_dir" => r#"{"type":"object","properties":{"path":{"type":"string","description":"仓库内相对目录,缺省为仓库根"}}}"#,
+        "search_text" => r#"{"type":"object","properties":{"query":{"type":"string","description":"搜索子串或正则"},"regex":{"type":"boolean","description":"true=按正则"},"path":{"type":"string","description":"限定文件/目录"},"max_results":{"type":"integer","description":"结果上限"}},"required":["query"]}"#,
+        "git_status" => r#"{"type":"object","properties":{}}"#,
+        "git_log" => r#"{"type":"object","properties":{"limit":{"type":"integer"},"path":{"type":"string"}}}"#,
+        "git_diff" => r#"{"type":"object","properties":{"path":{"type":"string"},"staged":{"type":"boolean"}}}"#,
+        "write_file" => r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#,
+        "edit_file" => r#"{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_text","new_text"]}"#,
+        "git_show" => r#"{"type":"object","properties":{"object":{"type":"string"}},"required":["object"]}"#,
+        "git_branch" => r#"{"type":"object","properties":{"all":{"type":"boolean"},"limit":{"type":"integer"}}}"#,
+        "shell" => r#"{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}"#,
+        _ => r#"{"type":"object","properties":{}}"#,
+    }
+}
+
+/// spec 164:注册表 → 原生 tool-calls 声明(聊天路径用)
+pub fn builtin_tool_defs() -> Vec<crate::provider::ToolDef> {
+    builtin_registry()
+        .iter()
+        .map(|t| crate::provider::ToolDef {
+            name: t.name().to_string(),
+            description: t.description().to_string(),
+            parameters: tool_parameters_schema(t.name()).to_string(),
+        })
+        .collect()
+}
 pub fn builtin_registry() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(ReadFile),

@@ -125,6 +125,8 @@ fn orchestrator(
         model: "mock-model".into(),
         progress: None,
         on_delta: None,
+        native_tools: false,
+        tools: Vec::new(),
     }
 }
 

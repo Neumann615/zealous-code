@@ -217,7 +217,11 @@ pub struct Orchestrator {
     pub progress: Option<crate::progress::SharedSink>,
     /// 流式 delta 回调(spec 162);None = 静默(既有路径零变化)。
     /// delta 只走通知通道,不落账本;账本仍按轮记 MessageCompleted 全文。
-    pub on_delta: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pub on_delta: Option<Arc<dyn Fn(crate::provider::ProviderStreamEvent) + Send + Sync>>,
+    /// spec 164:原生 tool-calls 开关(默认 false;聊天路径开启)
+    pub native_tools: bool,
+    /// spec 164:声明给模型的工具(native_tools=true 时生效)
+    pub tools: Vec<crate::provider::ToolDef>,
 }
 
 /// 单 Agent 循环的上下文(内存中的对话转写;账本保存的是持久事实)。
@@ -261,6 +265,7 @@ impl Orchestrator {
         ctx.transcript
             .push(crate::provider::ChatMessage::user(user));
         let req = crate::provider::ChatRequest {
+            tools: Vec::new(),
             system: Some(system.to_string()),
             messages: ctx.transcript.clone(),
         };
@@ -438,6 +443,216 @@ impl Orchestrator {
         Err(AgentLoopOutcome::TooManyTurns(self.max_turns))
     }
 
+    /// spec 164:原生 tool-calls 单 Agent 循环(聊天路径专用)。
+    /// 与 legacy 循环的差异:模型正文即最终答复(打字机);工具经原生
+    /// tool_calls 发起;usage 每轮落账;无 plan/修复轮;轮次上限与 abort 不变。
+    fn agent_loop_tools(
+        &self,
+        ledger: &Ledger,
+        run_id: &AgentRunId,
+        agent: AgentRef,
+        system: &str,
+        first_prompt: &str,
+    ) -> Result<String, AgentLoopOutcome> {
+        let mut ctx = LoopCtx {
+            transcript: Vec::new(),
+        };
+        let mut usage_prompt = 0u64;
+        let mut usage_completion = 0u64;
+        let mut usage_total = 0u64;
+        let mut pending_user = Some(first_prompt.to_string());
+        for turn_no in 1..=self.max_turns {
+            if self.aborted() {
+                return Err(AgentLoopOutcome::Aborted);
+            }
+            self.append(
+                ledger,
+                agent.clone(),
+                EventPayload::TurnStarted {
+                    run_id: run_id.clone(),
+                    turn: turn_no,
+                },
+            )
+            .map_err(AgentLoopOutcome::Ledger)?;
+            self.emit(false, format!("· [{agent}] turn {turn_no}"));
+            if let Some(p) = pending_user.take() {
+                ctx.transcript.push(crate::provider::ChatMessage::user(p));
+            }
+            let req = crate::provider::ChatRequest {
+                system: Some(system.to_string()),
+                messages: ctx.transcript.clone(),
+                tools: self.tools.clone(),
+            };
+            let resp = match &self.on_delta {
+                Some(cb) => self
+                    .provider
+                    .complete_streaming(&self.model, &req, cb.as_ref())
+                    .map_err(AgentLoopOutcome::ProviderFailed)?,
+                None => self.provider.complete(&self.model, &req)
+                    .map_err(AgentLoopOutcome::ProviderFailed)?,
+            };
+            // spec 164:GLM 流式模板在工具回合可能漏出伪标签文本(loong/invok);
+            // 探测到即对该轮改走非流式重试(端点非流式返回结构化 tool_calls,已探测验证)
+            let looks_like_tool_text = resp.text.contains("<loong")
+                || self.tools.iter().any(|td| {                     resp.text.trim_start().starts_with(&format!("{}(", td.name))                 });
+            let resp = if resp.tool_calls.is_empty() && looks_like_tool_text {
+                self.provider.complete(&self.model, &req).map_err(AgentLoopOutcome::ProviderFailed)?
+            } else {
+                resp
+            };
+            // spec 164:usage 每轮落账(与转录分离)
+            if let Some(u) = resp.usage {
+                usage_prompt += u.prompt_tokens;
+                usage_completion += u.completion_tokens;
+                usage_total += u.total_tokens;
+                self.append(
+                    ledger,
+                    agent.clone(),
+                    EventPayload::UsageRecorded {
+                        run_id: run_id.clone(),
+                        turn: turn_no,
+                        prompt_tokens: u.prompt_tokens,
+                        completion_tokens: u.completion_tokens,
+                        total_tokens: u.total_tokens,
+                    },
+                )
+                .map_err(AgentLoopOutcome::Ledger)?;
+            }
+            if resp.tool_calls.is_empty() {
+                // 正文即最终答复(MessageCompleted;正文 delta 已是打字机)
+                ctx.transcript
+                    .push(crate::provider::ChatMessage::assistant(resp.text.clone()));
+                self.append(
+                    ledger,
+                    agent.clone(),
+                    EventPayload::MessageCompleted {
+                        run_id: run_id.clone(),
+                        turn: turn_no,
+                        text: resp.text.clone(),
+                    },
+                )
+                .map_err(AgentLoopOutcome::Ledger)?;
+                self.append(
+                    ledger,
+                    agent.clone(),
+                    EventPayload::TurnCompleted {
+                        run_id: run_id.clone(),
+                        turn: turn_no,
+                    },
+                )
+                .map_err(AgentLoopOutcome::Ledger)?;
+                self.emit(
+                    true,
+                    format!(
+                        "[usage] prompt={usage_prompt} completion={usage_completion} total={usage_total} tokens"
+                    ),
+                );
+                return Ok(resp.text);
+            }
+            ctx.transcript
+                .push(crate::provider::ChatMessage::assistant_with_calls(
+                    resp.tool_calls.clone(),
+                ));
+            for call in &resp.tool_calls {
+                let outcome = self
+                    .executor
+                    .run_tool(ledger, run_id, agent.clone(), &call.arguments, &call.name)
+                    .map_err(executor_err)?;
+                self.emit(
+                    !outcome.ok,
+                    format!(
+                        "工具 {}({:?}) {}",
+                        call.name,
+                        outcome.risk,
+                        if outcome.ok {
+                            "完成"
+                        } else {
+                            "失败/被拒"
+                        }
+                    ),
+                );
+                ctx.transcript.push(crate::provider::ChatMessage::tool_result(
+                    call.id.clone(),
+                    format!("ok={}\n{}", outcome.ok, truncate(&outcome.text, 2000)),
+                ));
+            }
+            self.append(
+                ledger,
+                agent.clone(),
+                EventPayload::TurnCompleted {
+                    run_id: run_id.clone(),
+                    turn: turn_no,
+                },
+            )
+            .map_err(AgentLoopOutcome::Ledger)?;
+        }
+        Err(AgentLoopOutcome::TooManyTurns(self.max_turns))
+    }
+
+    /// spec 164:聊天回合(对话路径专用;无 plan/workers/apply 编排)。
+    /// 状态簿记与 run_task 相同:崩溃规范化 → resume 落账 → Running → 终态。
+    pub fn run_chat_turn(
+        &self,
+        ledger: &Arc<Ledger>,
+        task_prompt: &str,
+    ) -> Result<TaskStatus, OrchestratorError> {
+        let proj = ledger.fold_now().map_err(OrchestratorError::Ledger)?;
+        let mut from = proj.status;
+        if from == TaskStatus::Running {
+            self.append(
+                ledger,
+                AgentRef::User,
+                EventPayload::TaskInterrupted {
+                    reason: "process_restart".into(),
+                },
+            )?;
+            self.append(
+                ledger,
+                AgentRef::User,
+                EventPayload::TaskStatusChanged {
+                    from: TaskStatus::Running,
+                    to: TaskStatus::Interrupted,
+                    reason: Some("process_restart".into()),
+                },
+            )?;
+            from = TaskStatus::Interrupted;
+        }
+        if from != TaskStatus::Queued {
+            let run_id = AgentRunId::generate();
+            self.append(ledger, AgentRef::User, EventPayload::TaskResumed { run_id })?;
+        }
+        self.append(
+            ledger,
+            AgentRef::User,
+            EventPayload::TaskStatusChanged {
+                from,
+                to: TaskStatus::Running,
+                reason: None,
+            },
+        )?;
+        self.emit(true, format!("任务进入 Running(from {from:?})"));
+        let coord_run = AgentRunId::generate();
+        self.append(
+            ledger,
+            AgentRef::Coordinator,
+            EventPayload::AgentRunStarted {
+                run_id: coord_run.clone(),
+                role: AgentRole::Coordinator,
+            },
+        )?;
+        if self.aborted() {
+            return self.interrupt(ledger, &coord_run, "aborted before start");
+        }
+        let system = "你是 zealous:本地仓库内的编程助手。可以用提供的工具读取/检索仓库文件、查看 git 历史与状态;修改文件(write_file/edit_file)与执行命令(shell)必须经用户审批,提交前完整说明要做什么。先理解仓库现状再动手;回答使用中文,简洁准确;完成后直接给出最终答复文本。".to_string();
+        let outcome = self.agent_loop_tools(
+            ledger,
+            &coord_run,
+            AgentRef::Coordinator,
+            &system,
+            task_prompt,
+        );
+        self.finish_task(ledger, &coord_run, outcome)
+    }
     /// 运行/恢复任务到终态(或 Interrupted)。返回最终 Task 状态。
     /// `ledger` 必须以 Arc 共享:Worker 线程克隆同一实例保证 seq 全局连续。
     pub fn run_task(
@@ -1108,7 +1323,10 @@ fn run_worker(
         abort,
         max_turns: 10,
         model,
-        progress: None,        on_delta: None,
+        progress: None,
+        on_delta: None,
+        native_tools: false,
+        tools: Vec::new(),
     };
     let agent = AgentRef::Worker(worker_no);
     let run_id = AgentRunId::generate();
@@ -1339,6 +1557,8 @@ mod tests {
         assert_eq!(proj.pending_approvals.len(), 1);
 
         let orch = Orchestrator {
+            native_tools: false,
+            tools: Vec::new(),
             provider: Arc::new(crate::provider::MockProvider::scripted(vec![
                 msg("straight answer"),
                 msg("recovered after restart"),
@@ -1479,6 +1699,8 @@ mod resume_ctx_tests {
             "续跑完成",
         )]));
         let orch = Orchestrator {
+            native_tools: false,
+            tools: Vec::new(),
             provider: mock.clone(),
             executor: Arc::new(ToolExecutor::new(
                 &dir,
@@ -1569,6 +1791,8 @@ mod brief_prompt_tests {
 
         let mock = Arc::new(crate::provider::MockProvider::scripted(vec![msg("ok")]));
         let orch = Orchestrator {
+            native_tools: false,
+            tools: Vec::new(),
             provider: mock.clone(),
             executor: Arc::new(ToolExecutor::new(
                 &dir,
@@ -1612,6 +1836,8 @@ mod progress_tests {
         let sink = Arc::new(RecordingSink::default());
         let sink2: SharedSink = sink.clone();
         let orch = Orchestrator {
+            native_tools: false,
+            tools: Vec::new(),
             provider: Arc::new(crate::provider::MockProvider::scripted(vec![msg("done")])),
             executor: Arc::new(ToolExecutor::new(
                 &dir,
@@ -1640,5 +1866,94 @@ mod progress_tests {
             imp.iter().any(|l| l.contains("任务最终状态: Completed")),
             "应有最终状态: {imp:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_tools_tests {
+    use super::*;
+    use crate::approval::AutoApprove;
+    use crate::executor::ToolExecutor;
+    use crate::ledger::{read_events, Ledger};
+    use crate::provider::{ChatResponse, ToolCallInfo, Usage};
+    use crate::tools::builtin_registry;
+    use tests::fixture_dir;
+    use zealous_core::{EventPayload, TaskId};
+
+    #[test]
+    fn native_loop_tool_then_final_answer_records_usage() {
+        let dir = fixture_dir("native");
+        let task_id = TaskId::generate();
+        let ledger = Arc::new(Ledger::create(&dir, &task_id).unwrap());
+        ledger
+            .append(
+                AgentRef::User,
+                EventPayload::TaskCreated {
+                    title: "t".into(),
+                    repo_root: dir.display().to_string(),
+                },
+            )
+            .unwrap();
+
+        let mock = crate::provider::MockProvider::scripted_chat(vec![
+            Ok(ChatResponse {
+                text: String::new(),
+                tool_calls: vec![ToolCallInfo {
+                    id: "call_1".into(),
+                    name: "list_dir".into(),
+                    arguments: "{\"path\":\".\"}".into(),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                }),
+            }),
+            Ok(ChatResponse {
+                text: "目录已列出".into(),
+                tool_calls: vec![],
+                usage: Some(Usage {
+                    prompt_tokens: 20,
+                    completion_tokens: 3,
+                    total_tokens: 23,
+                }),
+            }),
+        ]);
+        let orch = Orchestrator {
+            native_tools: true,
+            tools: crate::tools::builtin_tool_defs(),
+            provider: Arc::new(mock),
+            executor: Arc::new(ToolExecutor::new(
+                &dir,
+                builtin_registry(),
+                Arc::new(AutoApprove),
+            )),
+            abort: Arc::new(AtomicBool::new(false)),
+            max_turns: 8,
+            model: "mock".into(),
+            progress: None,
+            on_delta: None,
+        };
+        let status = orch.run_chat_turn(&ledger, "列出目录").unwrap();
+        assert_eq!(status, TaskStatus::Completed);
+
+        let (events, _) =
+            read_events(&crate::ledger::events_path(ledger.path().parent().unwrap())).unwrap();
+        // usage 每轮落账(2 轮)
+        let usage_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(&e.payload, EventPayload::UsageRecorded { .. }))
+            .collect();
+        assert_eq!(usage_events.len(), 2);
+        // 最终答复
+        assert!(events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::MessageCompleted { text, .. } if text == "目录已列出"
+        )));
+        // 工具执行成功
+        assert!(events.iter().any(|e| matches!(
+            &e.payload,
+            EventPayload::ToolCallCompleted { ok: true, .. }
+        )));
     }
 }
