@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::state::{FormField, Screen, TuiState};
+use super::state::{ChatRole, FormField, Screen, TuiState};
 
 fn status_str(s: zealous_core::TaskStatus) -> &'static str {
     match s {
@@ -35,6 +35,18 @@ fn task_id_short(id: &zealous_core::TaskId) -> String {
 /// 主渲染:左列表 / 右详情 + 底部帮助;弹窗叠加
 pub fn render(f: &mut Frame, state: &mut TuiState) {
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
+    if state.screen == Screen::Chat {
+        // spec 163:聊天屏全屏(转录 + 输入框),不渲染列表/详情
+        render_chat(f, chunks[0], state);
+        render_help(f, chunks[1], state);
+        if state.pending_approval.is_some() {
+            render_approval_modal(f, state);
+        }
+        if state.confirm.is_some() {
+            render_confirm_modal(f, state);
+        }
+        return;
+    }
     let cols = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(chunks[0]);
     render_task_list(f, cols[0], state);
@@ -248,6 +260,80 @@ fn render_detail_full(f: &mut Frame, area: Rect, state: &mut TuiState) {
     );
 }
 
+/// spec 163:聊天屏 —— 转录区(自底部滚动)+ 输入框
+fn render_chat(f: &mut Frame, area: Rect, state: &mut TuiState) {
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(area);
+
+    // 转录行构建:角色前缀 + 系统提示
+    let mut lines: Vec<Line> = Vec::new();
+    if state.chat_task.is_none() && state.chat_entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "输入第一条消息开始会话;Enter 发送,任务与账本自动落档。",
+            Style::default().dark_gray(),
+        )));
+    }
+    for e in &state.chat_entries {
+        match e.role {
+            ChatRole::User => {
+                lines.push(Line::from(Span::styled(
+                    "you> ".to_string(),
+                    Style::default().cyan().add_modifier(Modifier::BOLD),
+                )));
+                for l in e.text.lines() {
+                    lines.push(Line::from(format!("    {l}")));
+                }
+            }
+            ChatRole::Assistant => {
+                lines.push(Line::from(Span::styled(
+                    "zealous> ".to_string(),
+                    Style::default().green().add_modifier(Modifier::BOLD),
+                )));
+                for l in e.text.lines() {
+                    lines.push(Line::from(format!("    {l}")));
+                }
+            }
+            ChatRole::System => {
+                for l in e.text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {l}"),
+                        Style::default().dark_gray(),
+                    )));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    if state.chat_streaming {
+        lines.push(Line::from(Span::styled(
+            "▍ 流式输出中…(Enter 已禁发;Esc 可返回列表,会话继续)",
+            Style::default().yellow(),
+        )));
+    }
+
+    // 自底部滚动:chat_scroll = 底部向上偏移行数;贴底时自动跟随
+    let total = lines.len();
+    let inner_h = chunks[0].height.saturating_sub(2) as usize; // 边框占 2
+    let max_offset = total.saturating_sub(inner_h);
+    let offset = max_offset.saturating_sub(state.chat_scroll);
+    let title = match (&state.chat_task, state.chat_streaming) {
+        (Some(t), true) => format!("对话 · {} · 流式接收中", task_id_short(t)),
+        (Some(t), false) => format!("对话 · {}", task_id_short(t)),
+        (None, _) => "对话 · 新会话".to_string(),
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::new().borders(Borders::ALL).title(title))
+            .scroll((offset as u16, 0)),
+        chunks[0],
+    );
+
+    // 输入框
+    let cursor = if state.running || state.chat_streaming { "…" } else { "▏" };
+    let input = Paragraph::new(format!("> {}{cursor}", state.chat_input))
+        .block(Block::new().borders(Borders::ALL).title("输入(Enter 发送 / Backspace 删除)"));
+    f.render_widget(input, chunks[1]);
+}
+
 fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
     // 错误不遮蔽关键状态:占用帮助行,红色显示;任意键消除
     let line = if let Some(err) = &state.error {
@@ -267,7 +353,7 @@ fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
             ))
         } else {
             Line::from(format!(
-                "[{run_state}] q 退出 · n 新建 · r 刷新 · ↑/↓ 选择 · Enter 详情 · 详情内: R 运行 · I 隔离运行 · P 应用 · W 工作区 · x 中断 · a/d 审批 · e 事件流 · 最终状态: {status}"
+                "[{run_state}] q 退出 · n 新建 · c 对话 · r 刷新 · ↑/↓ 选择 · Enter 详情 · 详情内: R 运行 · I 隔离运行 · P 应用 · W 工作区 · x 中断 · a/d 审批 · e 事件流 · 最终状态: {status}"
             ))
         }
     };

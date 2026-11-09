@@ -33,6 +33,8 @@ pub enum Screen {
     Parallel,
     /// merge workspace 状态视图(spec 159)
     MergeStatus,
+    /// 对话屏(spec 163):聊天式工作台
+    Chat,
 }
 
 /// 新建任务表单草稿
@@ -41,6 +43,21 @@ pub struct NewTaskForm {
     pub title: String,
     pub brief: String,
     pub field: FormField,
+}
+
+/// spec 163:聊天屏角色
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    User,
+    Assistant,
+    System,
+}
+
+/// spec 163:聊天转录条目(UI 派生数据;事实源仍是事件账本)
+#[derive(Debug, Clone)]
+pub struct ChatEntry {
+    pub role: ChatRole,
+    pub text: String,
 }
 
 pub const PROGRESS_RING_CAP: usize = 200;
@@ -102,6 +119,18 @@ pub struct TuiState {
     pub last_status: Option<TaskStatus>,
     pub error: Option<String>,
     pub form: NewTaskForm,
+    /// spec 163:聊天输入框
+    pub chat_input: String,
+    /// spec 163:聊天转录条目
+    pub chat_entries: Vec<ChatEntry>,
+    /// spec 163:转录区自底部起的滚动偏移(0 = 贴底跟随)
+    pub chat_scroll: usize,
+    /// spec 163:会话任务(首条消息创建,后续 resume)
+    pub chat_task: Option<TaskId>,
+    /// spec 163:压缩对话史 (user, assistant)
+    pub chat_history: Vec<(String, String)>,
+    /// spec 163:当前 run 是否在流式输出中
+    pub chat_streaming: bool,
     /// engine 线程是否在运行(R 已发出且未收到 Finished/Failure)
     pub running: bool,
     pub abort_requested: bool,
@@ -141,6 +170,12 @@ impl TuiState {
             last_status: None,
             error: None,
             form: NewTaskForm::default(),
+            chat_input: String::new(),
+            chat_entries: Vec::new(),
+            chat_scroll: 0,
+            chat_task: None,
+            chat_history: Vec::new(),
+            chat_streaming: false,
             running: false,
             abort_requested: false,
             quit: false,
@@ -321,6 +356,93 @@ impl TuiState {
     pub fn request_quit(&mut self) {
         self.quit = true;
         self.request_abort();
+    }
+
+    // ---- 聊天屏(spec 163)----
+
+    pub fn chat_input_char(&mut self, c: char) {
+        self.chat_input.push(c);
+    }
+
+    pub fn chat_input_backspace(&mut self) {
+        self.chat_input.pop();
+    }
+
+    /// 发送用户消息:转录入条目 + 助手流式条目占位;返回要发送的文本
+    pub fn chat_begin_turn(&mut self, msg: &str) {
+        self.chat_entries.push(ChatEntry { role: ChatRole::User, text: msg.to_string() });
+        self.chat_entries.push(ChatEntry { role: ChatRole::Assistant, text: String::new() });
+        self.chat_scroll = 0;
+    }
+
+    /// 流式 delta 追加到最后一个助手条目
+    pub fn chat_append_delta(&mut self, piece: &str) {
+        if let Some(last) = self.chat_entries.last_mut() {
+            if last.role == ChatRole::Assistant {
+                last.text.push_str(piece);
+            }
+        }
+        self.chat_scroll = 0;
+    }
+
+    /// run 结束:用账本最终答复替换流式原文,并写入压缩对话史
+    pub fn chat_finish_reply(&mut self, reply: Option<String>) {
+        let user = self
+            .chat_entries
+            .iter()
+            .rev()
+            .find(|e| e.role == ChatRole::User)
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        if let Some(text) = reply.filter(|s| !s.is_empty()) {
+            if let Some(last) = self.chat_entries.last_mut() {
+                if last.role == ChatRole::Assistant {
+                    last.text = text.clone();
+                }
+            }
+            self.chat_history.push((user, text));
+        } else if let Some(last) = self.chat_entries.last_mut() {
+            if last.role == ChatRole::Assistant && last.text.is_empty() {
+                last.text = "(无最终答复)".into();
+            }
+        }
+    }
+
+    pub fn chat_scroll_up(&mut self, page: usize) {
+        self.chat_scroll = self.chat_scroll.saturating_add(page);
+    }
+
+    pub fn chat_scroll_down(&mut self, page: usize) {
+        self.chat_scroll = self.chat_scroll.saturating_sub(page);
+    }
+
+    /// spec 162 §5:压缩对话史注入(最近 4 对,单条 600 字)
+    pub fn chat_history_prompt(&self, msg: &str) -> String {
+        if self.chat_history.is_empty() {
+            return msg.to_string();
+        }
+        const MAX_PAIRS: usize = 4;
+        const MAX_CHARS: usize = 600;
+        let start = self.chat_history.len().saturating_sub(MAX_PAIRS);
+        let mut hist = String::new();
+        for (u, a) in &self.chat_history[start..] {
+            hist.push_str(&format!(
+                "user: {}\nassistant: {}\n",
+                chat_truncate_str(u, MAX_CHARS),
+                chat_truncate_str(a, MAX_CHARS)
+            ));
+        }
+        format!("用户消息: {}\n\n[历史对话(压缩参考)]:\n{}", msg, hist)
+    }
+
+    /// /new 语义:清空会话(任务与账本不动)
+    pub fn chat_reset(&mut self) {
+        self.chat_input.clear();
+        self.chat_entries.clear();
+        self.chat_scroll = 0;
+        self.chat_task = None;
+        self.chat_history.clear();
+        self.chat_streaming = false;
     }
 
     pub fn task_finished(&mut self, status: TaskStatus) {
@@ -547,5 +669,61 @@ mod scroll_tests {
         assert_eq!(s.events_scroll, 19);
         s.events_scroll_up(5);
         assert_eq!(s.events_scroll, 14);
+    }
+}
+
+fn chat_truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}…")
+    }
+}
+
+#[cfg(test)]
+mod chat_state_tests {
+    use super::*;
+
+    #[test]
+    fn chat_history_prompt_empty_degrades_to_message() {
+        let s = TuiState::new();
+        assert_eq!(s.chat_history_prompt("你好"), "你好");
+    }
+
+    #[test]
+    fn chat_delta_append_and_finish_replaces_stream_text() {
+        let mut s = TuiState::new();
+        s.chat_begin_turn("1+1=?");
+        s.chat_append_delta("{\"action\":\"mess");
+        s.chat_append_delta("age\"...}");
+        assert_eq!(s.chat_entries.len(), 2);
+        assert_eq!(s.chat_entries[0].role, ChatRole::User);
+        s.chat_finish_reply(Some("1+1等于2".into()));
+        // 流式原文被账本最终答复替换(spec 163 §1)
+        assert_eq!(s.chat_entries.last().unwrap().text, "1+1等于2");
+        assert_eq!(s.chat_history.len(), 1);
+        assert_eq!(s.chat_history[0], ("1+1=?".to_string(), "1+1等于2".to_string()));
+    }
+
+    #[test]
+    fn chat_history_prompt_includes_recent_pairs() {
+        let mut s = TuiState::new();
+        s.chat_history.push(("q1".into(), "a1".into()));
+        let p = s.chat_history_prompt("q2");
+        assert!(p.contains("user: q1"));
+        assert!(p.contains("assistant: a1"));
+        assert!(p.contains("用户消息: q2"));
+    }
+
+    #[test]
+    fn chat_reset_clears_session_but_not_tasks() {
+        let mut s = TuiState::new();
+        s.chat_begin_turn("hi");
+        s.chat_input.push_str("x");
+        s.chat_reset();
+        assert!(s.chat_entries.is_empty());
+        assert!(s.chat_input.is_empty());
+        assert!(s.chat_task.is_none());
     }
 }

@@ -29,12 +29,15 @@ pub enum TuiEvent {
     QueueFinished(String),
     /// spec 157:parallel 结束(汇总文本)
     ParallelFinished(String),
+    /// spec 163:聊天流式 delta(通知通道,不落账本)
+    ChatDelta(String),
     /// queue/parallel 将决策通道交回主循环
     ApprovalChannel(std::sync::mpsc::Sender<zealous_core::ApprovalDecision>),
 }
 
 /// 启动一次运行/恢复;立即返回,结果经 event_tx 回传。
 /// 决策经 decision_rx 注入;abort 由 TUI 持有并在中断/退出时置位。
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_run(
     svc: TaskService,
     task_id: TaskId,
@@ -43,6 +46,10 @@ pub fn spawn_run(
     progress_sink: Arc<dyn ProgressSink>,
     abort: Arc<AtomicBool>,
     isolate: bool,
+    // spec 163:聊天模式自定义 prompt(覆盖 proj.title)
+    prompt_override: Option<String>,
+    // spec 163:流式 delta 回调
+    on_delta: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 ) {
     std::thread::spawn(move || {
         let config = match ProviderConfig::resolve() {
@@ -89,7 +96,8 @@ pub fn spawn_run(
                 return;
             }
         };
-        let mut prompt = proj.title.clone();
+        // spec 163:聊天模式注入用户消息(覆盖任务标题)
+        let mut prompt = prompt_override.unwrap_or_else(|| proj.title.clone());
         if run_root != svc.repo_root().to_path_buf() {
             prompt = format!(
                 "[isolated workspace] 本次运行在任务专属 git worktree 中执行;\n主工作区的未提交改动在此不可见,不得尝试访问或修改主工作区。\n\n{prompt}"
@@ -109,7 +117,7 @@ pub fn spawn_run(
             max_turns: 24,
             model,
             progress: Some(progress_sink),
-            on_delta: None,
+            on_delta,
         };
 
         let status = match orchestrator.run_task(&ledger, &prompt) {

@@ -19,7 +19,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use zealous_core::ApprovalDecision;
-use zealous_engine::task_service::TaskService;
+use zealous_engine::task_service::{CreateOutcome, TaskService};
 
 use self::runner::TuiEvent;
 use self::state::{Screen, TuiState};
@@ -203,6 +203,23 @@ pub(crate) fn apply_event(
         TuiEvent::Finished(status) => {
             state.task_finished(status);
             *decision_tx = None;
+            // spec 163:聊天流结束 —— 用账本最终答复替换流式原文并写入对话史
+            if state.chat_streaming {
+                state.chat_streaming = false;
+                let reply = state.chat_task.as_ref().and_then(|t| svc.events(t).ok()).and_then(
+                    |(evs, _)| {
+                        evs.iter().rev().find_map(|e| match &e.payload {
+                            zealous_core::EventPayload::MessageCompleted { text, .. }
+                                if !text.is_empty() =>
+                            {
+                                Some(text.clone())
+                            }
+                            _ => None,
+                        })
+                    },
+                );
+                state.chat_finish_reply(reply);
+            }
             // 运行结束即刷新投影与列表(事实只来自 TaskService)
             let id = state.selected_task().map(|t| t.task_id.clone());
             if let Some(id) = id {
@@ -216,6 +233,7 @@ pub(crate) fn apply_event(
         }
         TuiEvent::Failure(msg) => {
             state.running = false;
+            state.chat_streaming = false;
             state.set_error(msg);
         }
         TuiEvent::ParallelFinished(summary) => {
@@ -223,6 +241,9 @@ pub(crate) fn apply_event(
             *decision_tx = None;
             state.push_important(&format!("parallel: {summary}"));
             refresh_task_list(state, svc);
+        }
+        TuiEvent::ChatDelta(piece) => {
+            state.chat_append_delta(&piece);
         }
         TuiEvent::Progress(msg) => {
             state.push_progress(msg);
@@ -314,6 +335,8 @@ fn handle_key(
                                 progress_sink.clone(),
                                 abort.clone(),
                                 true,
+                                None,
+                                None,
                             );
                         }
                     }
@@ -588,6 +611,8 @@ fn handle_key(
             KeyCode::Up | KeyCode::Char('k') => state.select_prev(),
             KeyCode::Char('r') => state.refresh_tasks(list_tasks(svc)),
             KeyCode::Char('n') => state.open_form(),
+            // spec 163:进入聊天屏
+            KeyCode::Char('c') => state.screen = Screen::Chat,
             KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 // spec 157/161:确认后并行运行最多三个 runnable queued tasks
                 match zealous_engine::parallel::select_runnable(
@@ -811,6 +836,91 @@ fn handle_key(
             KeyCode::Char('q') | KeyCode::Esc => state.screen = Screen::List,
             _ => {}
         },
+            Screen::Chat => match key.code {
+                KeyCode::Esc => state.screen = Screen::List,
+                KeyCode::Up => state.chat_scroll_up(1),
+                KeyCode::Down => state.chat_scroll_down(1),
+                KeyCode::PageUp => state.chat_scroll_up(10),
+                KeyCode::PageDown => state.chat_scroll_down(10),
+                KeyCode::Backspace => state.chat_input_backspace(),
+                KeyCode::Enter => {
+                    // 运行中/流式中禁发;空输入忽略(spec 163 §3)
+                    if state.running || state.chat_streaming {
+                        return;
+                    }
+                    let msg = state.chat_input.trim().to_string();
+                    if msg.is_empty() {
+                        return;
+                    }
+                    state.chat_input.clear();
+                    // 会话任务:首条消息以消息全文为 brief 建任务(direct 模式)
+                    let tid = match state.chat_task.clone() {
+                        Some(t) => t,
+                        None => {
+                            let title: String = msg.chars().take(48).collect();
+                            match svc.create_task_with_brief_text(&title, Some(msg.clone())) {
+                                Ok(CreateOutcome::Ready { task_id, .. }) => {
+                                    state.chat_task = Some(task_id.clone());
+                                    refresh_task_list(state, svc);
+                                    task_id
+                                }
+                                Ok(CreateOutcome::FailedAtCreation { task_id, reason }) => {
+                                    state.chat_task = Some(task_id.clone());
+                                    state
+                                        .set_error(format!(
+                                            "任务创建即失败: {reason}(账本已留档,可 resume)"
+                                        ));
+                                    task_id
+                                }
+                                Err(e) => {
+                                    state.set_error(format!("创建任务失败: {e}"));
+                                    return;
+                                }
+                            }
+                        }
+                    };
+                    state.chat_begin_turn(&msg);
+                    state.running = true;
+                    state.chat_streaming = true;
+                    state.abort_requested = false;
+                    abort.store(false, Ordering::Relaxed);
+                    let (approval_sink, request_rx, decision_tx_ch) =
+                        approval::channel(tid.as_str().to_string(), abort.clone());
+                    let fwd_tx = event_tx.clone();
+                    std::thread::spawn(move || {
+                        for req in request_rx {
+                            if fwd_tx.send(TuiEvent::Approval(req)).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    *decision_tx = Some(decision_tx_ch);
+                    let prompt = state.chat_history_prompt(&msg);
+                    // spec 163:流式 delta 经事件流回传转录区(通知通道)
+                    let delta_tx = event_tx.clone();
+                    let on_delta: Arc<dyn Fn(&str) + Send + Sync> =
+                        Arc::new(move |piece: &str| {
+                            let _ = delta_tx.send(TuiEvent::ChatDelta(piece.to_string()));
+                        });
+                    runner::spawn_run(
+                        TaskService::new(svc.repo_root().to_path_buf()),
+                        tid,
+                        event_tx.clone(),
+                        Arc::new(approval_sink),
+                        progress_sink.clone(),
+                        abort.clone(),
+                        false,
+                        Some(prompt),
+                        Some(on_delta),
+                    );
+                }
+                // Ctrl+N:重置会话(/new 语义;任务与账本不动)
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.chat_reset();
+                }
+                KeyCode::Char(c) => state.chat_input_char(c),
+                _ => {}
+            },
         Screen::Detail => match key.code {
             KeyCode::Char('q') => {
                 state.request_quit();
@@ -911,6 +1021,8 @@ fn handle_key(
                             progress_sink.clone(),
                             abort.clone(),
                             false,
+                            None,
+                            None,
                         );
                     }
                 }
@@ -1089,6 +1201,8 @@ mod integration_tests {
             Arc::new(progress_sink),
             abort.clone(),
             false,
+            None,
+            None,
         );
 
         // ---- 消费事件循环(同 apply_event),审批到达时模拟按键 a ----
