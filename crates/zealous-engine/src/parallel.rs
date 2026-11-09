@@ -289,6 +289,7 @@ pub fn run_parallel(
             max_turns,
             model,
             progress,
+            on_delta: None,
         };
         // The prompt carries the task requirement captured during preparation.
         let prompt = format!(

@@ -94,7 +94,15 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    ```
 
 
-5. 或进入可视化工作台:
+5. 或进入对话模式(spec 162:流式输出,同一任务连续会话):
+
+   ```bash
+   zealous chat                 # 交互输入;也可 zealous chat "首条消息"
+   ```
+
+   会话内命令:`/new` 新会话 `/task` 当前任务 id `/status` 状态 `/exit` 退出。
+
+6. 或进入可视化工作台:
 
    ```bash
    zealous tui

@@ -147,6 +147,7 @@ pub fn spawn_worker(
             max_turns: 24,
             model,
             progress: Some(progress),
+            on_delta: None,
         };
         let status = match orchestrator.run_task(&ledger, &prompt) {
             Ok(s) => s,

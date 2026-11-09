@@ -124,6 +124,7 @@ fn orchestrator(
         max_turns: 12,
         model: "mock-model".into(),
         progress: None,
+        on_delta: None,
     }
 }
 

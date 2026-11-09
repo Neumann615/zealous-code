@@ -39,6 +39,12 @@ enum Cmd {
     Tui,
     /// app-server:stdio JSON 协议(spec 100)
     Serve,
+    /// 对话 REPL(spec 162):流式聊天,同一任务连续会话
+    Chat {
+        /// 可选的首条消息;省略则进入交互输入
+        #[arg(value_name = "MESSAGE")]
+        message: Option<String>,
+    },
     /// 配置检查(Git 仓库 / Provider 配置;不回显密钥)
     Config {
         #[command(subcommand)]
@@ -371,6 +377,7 @@ fn main() {
             Ok(root) => serve::run_command(root),
             Err(e) => err(e),
         },
+        Cmd::Chat { message } => cmd_chat(message.as_deref()),
         Cmd::Task { cmd } => match cmd {
             TaskCmd::New { title, brief_file } => cmd_new(&title, brief_file.as_deref()),
             TaskCmd::List => cmd_list(),
@@ -673,6 +680,7 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool, isolate: bool) -> i3
         max_turns: 24,
         model,
         progress: Some(Arc::new(CliProgress { quiet })),
+            on_delta: None,
     };
     let mut title = proj.title.clone();
     if run_root != repo_root().unwrap_or_default() {
@@ -1910,6 +1918,290 @@ fn err(msg: impl std::fmt::Display) -> i32 {
     1
 }
 
+/// spec 162: 聊天 REPL 的审批 sink。stdin 由 broker 线程独占读取,
+/// REPL 输入与审批 y/N 共用同一条行流,避免争抢;轮询语义与 spec 60 §3
+/// 一致(abort 置位后 100ms 内按拒绝收尾)。
+struct ChatApproval {
+    rx: Arc<Mutex<mpsc::Receiver<String>>>,
+    abort: Arc<AtomicBool>,
+}
+
+impl ApprovalSink for ChatApproval {
+    fn decide(&self, info: &zealous_engine::approval::ApprovalRequestInfo) -> ApprovalDecision {
+        println!(
+            "\n=== 审批请求 {}(工具 {} 风险 {:?})===\n{}\n批准? [y/N]",
+            info.call_id.as_str(),
+            info.tool,
+            info.risk,
+            info.summary
+        );
+        let _ = std::io::stdout().flush();
+        loop {
+            if self.abort.load(Ordering::Relaxed) {
+                println!("[interrupted] 审批按拒绝收尾");
+                return ApprovalDecision::Reject;
+            }
+            let line = {
+                let rx = self.rx.lock().unwrap();
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(l) => l,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return ApprovalDecision::Reject,
+                }
+            };
+            if line == "__eof__" {
+                return ApprovalDecision::Reject;
+            }
+            match StdinApproval::parse_decision(&line) {
+                Some(d) => return d,
+                None => {
+                    print!("请输入 y 或 n: ");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+        }
+    }
+}
+
+fn chat_truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}…")
+    }
+}
+
+/// 压缩对话史:仅保留最近几对,单条截断(spec 162 §5 跨 Run 上下文)
+fn chat_history_block(history: &[(String, String)]) -> String {
+    const MAX_PAIRS: usize = 4;
+    const MAX_CHARS: usize = 600;
+    let start = history.len().saturating_sub(MAX_PAIRS);
+    let mut out = String::new();
+    for (u, a) in &history[start..] {
+        out.push_str(&format!("user: {}\nassistant: {}\n", chat_truncate(u, MAX_CHARS), chat_truncate(a, MAX_CHARS)));
+    }
+    out
+}
+
+/// spec 162: 对话 REPL。首条消息创建任务;后续消息在同一任务上 resume 续跑;
+/// 流式 delta 直写 stdout(通知通道,不落账本);事实源仍是事件账本。
+fn cmd_chat(initial: Option<&str>) -> i32 {
+    let svc = match svc() {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    let config = match ProviderConfig::resolve() {
+        Ok(c) => c,
+        Err(e) => {
+            return err(format!(
+                "provider 配置无效(可用 .env 或 ZEALOUS_* 环境变量): {e}"
+            ))
+        }
+    };
+    println!(
+        "zealous chat - {} model={} (/new 新会话 /task 任务 id /status 状态 /exit 退出)",
+        config.base_url, config.model
+    );
+
+    // stdin broker:唯一读取者,行流分发给 REPL 输入与审批
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match std::io::stdin().read_line(&mut buf) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send("__eof__".into());
+                    return;
+                }
+                Ok(_) => {
+                    if tx.send(buf.trim().to_string()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let rx: Arc<Mutex<mpsc::Receiver<String>>> = Arc::new(Mutex::new(rx));
+    let abort = Arc::new(AtomicBool::new(false));
+    if let Err(e) = ctrlc::set_handler({
+        let abort = abort.clone();
+        move || abort.store(true, Ordering::Relaxed)
+    }) {
+        return err(format!("install ctrl-c handler: {e}"));
+    }
+
+    let mut current_task: Option<zealous_core::TaskId> = None;
+    let mut history: Vec<(String, String)> = Vec::new();
+    let mut first = initial.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    loop {
+        // ---- 取一条用户输入 ----
+        let input = match first.take() {
+            Some(m) => {
+                println!("you> {m}");
+                m
+            }
+            None => {
+                print!("you> ");
+                let _ = std::io::stdout().flush();
+                let line = {
+                    let guard = rx.lock().unwrap();
+                    guard.recv().unwrap_or_else(|_| "__eof__".into())
+                };
+                if line == "__eof__" {
+                    println!();
+                    break;
+                }
+                let t = line.trim().to_string();
+                if t.is_empty() {
+                    continue;
+                }
+                match t.as_str() {
+                    "/exit" | "/quit" => break,
+                    "/new" => {
+                        current_task = None;
+                        history.clear();
+                        println!("[session reset]");
+                        continue;
+                    }
+                    "/task" => {
+                        println!(
+                            "{}",
+                            current_task
+                                .as_ref()
+                                .map(|t| t.as_str().to_string())
+                                .unwrap_or_else(|| "(none)".into())
+                        );
+                        continue;
+                    }
+                    "/status" => {
+                        match current_task.as_ref().map(|t| svc.open_task(t)) {
+                            Some(Ok((_, proj, _))) => println!("status: {:?}", proj.status),
+                            Some(Err(e)) => println!("error: {e}"),
+                            None => println!("(no session task)"),
+                        }
+                        continue;
+                    }
+                    _ => t,
+                }
+            }
+        };
+
+        // ---- 任务准备(首条创建,后续复用) ----
+        let tid = match current_task.clone() {
+            Some(t) => t,
+            None => {
+                let title: String = input.chars().take(48).collect();
+                match svc.create_task_with_brief_text(&title, Some(input.clone())) {
+                    Ok(CreateOutcome::Ready { task_id, .. }) => {
+                        println!("[task {}]", task_id.as_str());
+                        task_id
+                    }
+                    Ok(CreateOutcome::FailedAtCreation { task_id, reason }) => {
+                        println!("[task {task_id} created but failed: {reason}]");
+                        task_id
+                    }
+                    Err(e) => {
+                        println!("[error] 创建任务失败: {e}");
+                        continue;
+                    }
+                }
+            }
+        };
+        let (ledger, _, _) = match svc.open_task(&tid) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("[error] 打开任务失败: {e}");
+                continue;
+            }
+        };
+        let ledger = Arc::new(ledger);
+        let repo = match repo_root() {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        let _lease = match zealous_engine::lease::try_acquire(&repo, tid.as_str(), "direct") {
+            Ok(l) => l,
+            Err(e) => {
+                println!("[error] {e}");
+                continue;
+            }
+        };
+        let run_root =
+            match zealous_engine::workspace::ensure_run_root(&repo, &ledger, &tid, false) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("[error] workspace: {e}");
+                    continue;
+                }
+            };
+        // 后续消息:压缩对话史随 prompt 注入(resume 路径同时注入投影摘要)
+        let task_prompt = if history.is_empty() {
+            input.clone()
+        } else {
+            format!(
+                "用户消息: {}\n\n[历史对话(压缩参考)]:\n{}",
+                input,
+                chat_history_block(&history)
+            )
+        };
+
+        // ---- 运行(流式) ----
+        abort.store(false, Ordering::Relaxed);
+        let on_delta: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|piece: &str| {
+            print!("{piece}");
+            let _ = std::io::stdout().flush();
+        });
+        let approval = Arc::new(ChatApproval {
+            rx: rx.clone(),
+            abort: abort.clone(),
+        });
+        let executor = Arc::new(ToolExecutor::new(run_root, builtin_registry(), approval));
+        let orch = Orchestrator {
+            provider: Arc::new(OpenAiCompatProvider::new(config.clone())),
+            executor,
+            abort: abort.clone(),
+            max_turns: 24,
+            model: config.model.clone(),
+            progress: Some(Arc::new(CliProgress { quiet: false })),
+            on_delta: Some(on_delta),
+        };
+        println!("---");
+        match orch.run_task(&ledger, &task_prompt) {
+            Ok(status) => {
+                println!("\n---");
+                match status {
+                    TaskStatus::Completed | TaskStatus::Interrupted => {
+                        let reply = svc.events(&tid).ok().and_then(|(evs, _)| {
+                            evs.iter().rev().find_map(|e| match &e.payload {
+                                zealous_core::EventPayload::MessageCompleted { text, .. } => {
+                                    Some(text.clone())
+                                }
+                                _ => None,
+                            })
+                        });
+                        if let Some(text) = reply.as_ref().filter(|s| !s.is_empty()) {
+                            println!("[assistant] {text}");
+                        }
+                        history.push((input.clone(), reply.unwrap_or_default()));
+                        current_task = Some(tid);
+                        if matches!(status, TaskStatus::Interrupted) {
+                            println!("[interrupted - 下一条消息将在本任务上恢复]");
+                        }
+                        println!();
+                    }
+                    other => {
+                        println!("[task ended: {other:?}]");
+                    }
+                }
+            }
+            Err(e) => println!("\n[error] {e}"),
+        }
+    }
+    0
+}
 #[cfg(test)]
 impl StdinApproval {
     fn with_rx(rx: mpsc::Receiver<String>, abort: Arc<AtomicBool>) -> Self {

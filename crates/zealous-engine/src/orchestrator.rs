@@ -215,6 +215,9 @@ pub struct Orchestrator {
     pub model: String,
     /// 进度反馈 sink(spec 80 §5);None = 静默
     pub progress: Option<crate::progress::SharedSink>,
+    /// 流式 delta 回调(spec 162);None = 静默(既有路径零变化)。
+    /// delta 只走通知通道,不落账本;账本仍按轮记 MessageCompleted 全文。
+    pub on_delta: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 /// 单 Agent 循环的上下文(内存中的对话转写;账本保存的是持久事实)。
@@ -257,13 +260,14 @@ impl Orchestrator {
     ) -> Result<String, crate::provider::ProviderError> {
         ctx.transcript
             .push(crate::provider::ChatMessage::user(user));
-        let resp = self.provider.complete(
-            &self.model,
-            &crate::provider::ChatRequest {
-                system: Some(system.to_string()),
-                messages: ctx.transcript.clone(),
-            },
-        )?;
+        let req = crate::provider::ChatRequest {
+            system: Some(system.to_string()),
+            messages: ctx.transcript.clone(),
+        };
+        let resp = match &self.on_delta {
+            Some(cb) => self.provider.complete_streaming(&self.model, &req, cb.as_ref())?,
+            None => self.provider.complete(&self.model, &req)?,
+        };
         ctx.transcript
             .push(crate::provider::ChatMessage::assistant(resp.text.clone()));
         Ok(resp.text)
@@ -1104,7 +1108,7 @@ fn run_worker(
         abort,
         max_turns: 10,
         model,
-        progress: None,
+        progress: None,        on_delta: None,
     };
     let agent = AgentRef::Worker(worker_no);
     let run_id = AgentRunId::generate();
@@ -1347,7 +1351,7 @@ mod tests {
             abort: Arc::new(AtomicBool::new(false)),
             max_turns: 8,
             model: "mock".into(),
-            progress: None,
+            progress: None,            on_delta: None,
         };
         let status = orch.run_task(&ledger, "t").unwrap();
         assert_eq!(status, TaskStatus::Completed);
@@ -1484,7 +1488,7 @@ mod resume_ctx_tests {
             abort: Arc::new(AtomicBool::new(false)),
             max_turns: 8,
             model: "mock".into(),
-            progress: None,
+            progress: None,            on_delta: None,
         };
         let status = orch.run_task(&ledger, "t").unwrap();
         assert_eq!(status, TaskStatus::Completed);
@@ -1574,7 +1578,7 @@ mod brief_prompt_tests {
             abort: Arc::new(AtomicBool::new(false)),
             max_turns: 8,
             model: "mock".into(),
-            progress: None,
+            progress: None,            on_delta: None,
         };
         let status = orch.run_task(&ledger, "t").unwrap();
         assert_eq!(status, TaskStatus::Completed);
@@ -1617,7 +1621,7 @@ mod progress_tests {
             abort: Arc::new(AtomicBool::new(false)),
             max_turns: 8,
             model: "mock".into(),
-            progress: Some(sink2),
+            progress: Some(sink2),            on_delta: None,
         };
         let status = orch.run_task(&ledger, "t").unwrap();
         assert_eq!(status, TaskStatus::Completed);

@@ -109,6 +109,7 @@ pub fn spawn_run(
             max_turns: 24,
             model,
             progress: Some(progress_sink),
+            on_delta: None,
         };
 
         let status = match orchestrator.run_task(&ledger, &prompt) {

@@ -152,6 +152,7 @@ pub fn run_serial(
             max_turns,
             model: model.clone(),
             progress: progress.clone(),
+            on_delta: None,
         };
         let ledger = Arc::new(ledger);
         let status = match orchestrator.run_task(&ledger, &prompt) {

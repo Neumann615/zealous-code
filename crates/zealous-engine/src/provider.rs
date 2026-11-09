@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 /// 对话角色:V1 只需要 user/assistant(system 单独字段承载)
@@ -213,6 +214,18 @@ fn dirs_home() -> Option<PathBuf> {
 /// Provider trait:内核只依赖此抽象;测试用 Mock 替换(spec 50)。
 pub trait Provider: Send + Sync {
     fn complete(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError>;
+
+    /// spec 162: 流式调用;delta 经 on_delta 实时外发,返回累计全文。
+    /// 默认实现忽略 delta 委托 complete(Mock 等替身零改动)。
+    fn complete_streaming(
+        &self,
+        model: &str,
+        req: &ChatRequest,
+        on_delta: &dyn Fn(&str),
+    ) -> Result<ChatResponse, ProviderError> {
+        let _ = on_delta;
+        self.complete(model, req)
+    }
 }
 
 /// 重试策略:退避序列由调用方注入,测试可零等待。
@@ -313,9 +326,100 @@ impl OpenAiCompatProvider {
             })?;
         parsed.into_response()
     }
+
+    /// spec 162: SSE 流式调用(`stream=true`)。逐行解析 `data:` 帧,
+    /// `[DONE]` 终止;delta 实时回调,返回累计全文。空 data 行/坏行跳过。
+    fn once_streaming(
+        &self,
+        model: &str,
+        req: &ChatRequest,
+        on_delta: &dyn Fn(&str),
+    ) -> Result<ChatResponse, ProviderError> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut messages = Vec::new();
+        if let Some(sys) = &req.system {
+            messages.push(serde_json::json!({ "role": "system", "content": sys }));
+        }
+        for m in &req.messages {
+            let role = match m.role {
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+            };
+            messages.push(serde_json::json!({ "role": role, "content": m.content }));
+        }
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+        })
+        .to_string();
+        let resp = self
+            .agent
+            .post(&self.endpoint())
+            .set("Authorization", &format!("Bearer {}", self.config.api_key))
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+            .map_err(classify_ureq)?;
+        let mut text = String::new();
+        for line in BufReader::new(resp.into_reader()).lines() {
+            let line = line.map_err(|e| ProviderError::Transient(format!("stream read: {e}")))?;
+            match sse_line_delta(&line) {
+                SseLine::Delta(piece) => {
+                    text.push_str(&piece);
+                    on_delta(&piece);
+                }
+                SseLine::Done => break,
+                SseLine::Ignore => {}
+            }
+        }
+        if text.is_empty() {
+            return Err(ProviderError::Rejected {
+                status: 200,
+                summary: "empty stream".into(),
+            });
+        }
+        Ok(ChatResponse { text })
+    }
 }
 
 impl Provider for OpenAiCompatProvider {
+    /// spec 162: 流式重试语义 —— 首个 delta 到达前失败按既有策略重试;
+    /// 流已开始(delta 已外发)后失败不再重试,避免 delta 重复。
+    fn complete_streaming(
+        &self,
+        model: &str,
+        req: &ChatRequest,
+        on_delta: &dyn Fn(&str),
+    ) -> Result<ChatResponse, ProviderError> {
+        let attempts = self.retry.max_retries + 1;
+        let mut last_err: Option<String> = None;
+        for attempt in 0..attempts {
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let cb = |piece: &str| {
+                started.store(true, std::sync::atomic::Ordering::Relaxed);
+                on_delta(piece);
+            };
+            match self.once_streaming(model, req, &cb) {
+                Ok(resp) => return Ok(resp),
+                Err(e @ ProviderError::Rejected { .. }) => return Err(e),
+                Err(e) => {
+                    if started.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(e);
+                    }
+                    last_err = Some(e.to_string());
+                }
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep((self.retry.backoff)(attempt));
+            }
+        }
+        Err(ProviderError::Exhausted {
+            attempts,
+            last: last_err.unwrap_or_else(|| "unknown".into()),
+        })
+    }
+
     fn complete(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
         let attempts = self.retry.max_retries + 1;
         let mut last_err: Option<String> = None;
@@ -336,6 +440,65 @@ impl Provider for OpenAiCompatProvider {
             attempts,
             last: last_err.unwrap_or_else(|| "unknown".into()),
         })
+    }
+}
+
+/// spec 162: SSE 帧解析。Delta 携带新增片段;Done 为流终止;
+/// Ignore 覆盖空 data 行、`[DONE]` 前注释行与无法解析的坏行(容错跳过)。
+fn sse_line_delta(line: &str) -> SseLine {
+    let Some(data) = line.strip_prefix("data:") else {
+        return SseLine::Ignore;
+    };
+    let data = data.trim();
+    if data.is_empty() {
+        return SseLine::Ignore;
+    }
+    if data == "[DONE]" {
+        return SseLine::Done;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return SseLine::Ignore;
+    };
+    match v["choices"][0]["delta"]["content"].as_str() {
+        Some(s) if !s.is_empty() => SseLine::Delta(s.to_string()),
+        _ => SseLine::Ignore,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SseLine {
+    Delta(String),
+    Done,
+    Ignore,
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+
+    #[test]
+    fn sse_multi_chunk_and_done() {
+        let mk = |s: &str| {
+            format!("{{\"choices\":[{{\"delta\":{{\"content\":\"{s}\"}}}}]}}")
+        };
+        assert_eq!(sse_line_delta(&format!("data: {}", mk("你"))), SseLine::Delta("你".into()));
+        assert_eq!(sse_line_delta(&format!("data:{}", mk("好"))), SseLine::Delta("好".into()));
+        assert!(matches!(sse_line_delta("data: [DONE]"), SseLine::Done));
+    }
+
+    #[test]
+    fn sse_tolerates_noise() {
+        assert!(matches!(sse_line_delta(""), SseLine::Ignore));
+        assert!(matches!(sse_line_delta(": keep-alive"), SseLine::Ignore));
+        assert!(matches!(sse_line_delta("data: "), SseLine::Ignore));
+        assert!(matches!(sse_line_delta("data: not-json"), SseLine::Ignore));
+        // 空内容片段(如 finish_reason 帧)忽略
+        assert!(
+            matches!(
+                sse_line_delta("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}"),
+                SseLine::Ignore
+            )
+        );
     }
 }
 

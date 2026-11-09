@@ -1,4 +1,4 @@
-# agent-assets 参考源码区
+﻿# agent-assets 参考源码区
 
 本目录是本机可更新的**只读参考源码区**,不是产品依赖,也不是构建输入。
 
@@ -8,6 +8,7 @@
 | ---- | ---- | ---- |
 | `zcode/` | https://github.com/zai-org/zcode.git | Agent 运行时、Host/CLI 协议与进程编排范式参考 |
 | `codex/` | https://github.com/openai/codex.git | Agent CLI、工具循环与 TUI 交互范式参考 |
+| `dsh-TUI-main/` | https://github.com/ccch1mneyyy/dsh-TUI(main tarball 快照,MIT) | spec 162 参考:AgentEvent/AgentSession 多后端分层、流式对话与工具卡片范式 |
 
 两个目录均为完整 Git clone(非 submodule),由 `scripts/update-agent-assets.mjs` 统一维护:
 缺失则 clone;已存在则执行 `git fetch --prune origin`,并 detach 到 origin 默认分支最新 commit。
