@@ -237,6 +237,10 @@ enum TaskCmd {
 struct StdinApproval {
     auto: Option<ApprovalDecision>,
     rx: Mutex<mpsc::Receiver<String>>,
+    allowlist: Mutex<std::collections::HashSet<String>>,
+    /// spec 167:本会话始终允许的工具
+    last_reason: Mutex<Option<String>>,
+    /// spec 167:最后一次拒绝理由(回传模型)
     abort: Arc<AtomicBool>,
 }
 
@@ -267,6 +271,8 @@ impl StdinApproval {
             auto,
             rx: Mutex::new(rx),
             abort,
+            allowlist: Mutex::new(std::collections::HashSet::new()),
+            last_reason: Mutex::new(None),
         }
     }
 
@@ -290,8 +296,13 @@ impl ApprovalSink for StdinApproval {
             );
             return d;
         }
+        // spec 167:本会话始终允许的工具直接批准
+        if self.allowlist.lock().unwrap().contains(info.tool.as_str()) {
+            println!("[auto] {} 已在本会话始终允许,自动批准", info.tool);
+            return ApprovalDecision::Approve;
+        }
         println!(
-            "\n=== 审批请求 {call_id}(工具 {} 风险 {:?})===\n{summary}\n批准? [y/N](Ctrl-C 中断任务)",
+            "\n=== 审批请求 {call_id}(工具 {} 风险 {:?})===\n{summary}\n批准? [y=一次 / a=本会话始终 / n=拒绝](Ctrl-C 中断任务)",
             info.tool, info.risk
         );
         let _ = std::io::stdout().flush();
@@ -306,11 +317,29 @@ impl ApprovalSink for StdinApproval {
                     if line.as_str() == "__eof__" {
                         return ApprovalDecision::Reject;
                     }
-                    match Self::parse_decision(&line) {
-                        Some(d) => return d,
-                        // 无效输入:重新提示
-                        None => {
-                            print!("请输入 y 或 n: ");
+                    let t = line.to_ascii_lowercase();
+                    match t.as_str() {
+                        "y" | "yes" => return ApprovalDecision::Approve,
+                        "a" | "always" => {
+                            self.allowlist
+                                .lock()
+                                .unwrap()
+                                .insert(info.tool.to_string());
+                            println!("[{}] 已加入本会话始终允许", info.tool);
+                            return ApprovalDecision::Approve;
+                        }
+                        "n" | "no" => {
+                            eprintln!("[trace] n-branch entered, about to read reason");
+                            print!("拒绝理由(可选,回传模型,直接回车跳过): ");
+                            let _ = std::io::stdout().flush();
+                            let reason = rx.recv().unwrap_or_else(|_| "__eof__".to_string());
+                            if reason != "__eof__" && !reason.is_empty() {
+                                *self.last_reason.lock().unwrap() = Some(reason);
+                            }
+                            return ApprovalDecision::Reject;
+                        }
+                        _ => {
+                            print!("请输入 y / a / n: ");
                             let _ = std::io::stdout().flush();
                         }
                     }
@@ -320,7 +349,12 @@ impl ApprovalSink for StdinApproval {
             }
         }
     }
+    // spec 167:最后一次拒绝理由(回传模型)
+    fn reject_reason(&self) -> Option<String> {
+        self.last_reason.lock().unwrap().clone()
+    }
 }
+
 
 fn repo_root() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
@@ -1926,12 +1960,22 @@ fn err(msg: impl std::fmt::Display) -> i32 {
 struct ChatApproval {
     rx: Arc<Mutex<mpsc::Receiver<String>>>,
     abort: Arc<AtomicBool>,
+    /// spec 167:本会话始终允许的工具
+    allowlist: Mutex<std::collections::HashSet<String>>,
+    /// spec 167:最后一次拒绝理由(回传模型)
+    last_reason: Mutex<Option<String>>,
 }
 
 impl ApprovalSink for ChatApproval {
     fn decide(&self, info: &zealous_engine::approval::ApprovalRequestInfo) -> ApprovalDecision {
+        // spec 167:本会话始终允许的工具直接批准
+        if self.allowlist.lock().unwrap().contains(info.tool.as_str()) {
+            println!("[auto] {} 已在本会话始终允许,自动批准", info.tool);
+            let _ = std::io::stdout().flush();
+            return ApprovalDecision::Approve;
+        }
         println!(
-            "\n=== 审批请求 {}(工具 {} 风险 {:?})===\n{}\n批准? [y/N]",
+            "\n=== 审批请求 {}(工具 {} 风险 {:?})===\n{}\n批准? [y=一次 / a=本会话始终 / n=拒绝]",
             info.call_id.as_str(),
             info.tool,
             info.risk,
@@ -1954,14 +1998,40 @@ impl ApprovalSink for ChatApproval {
             if line == "__eof__" {
                 return ApprovalDecision::Reject;
             }
-            match StdinApproval::parse_decision(&line) {
-                Some(d) => return d,
-                None => {
-                    print!("请输入 y 或 n: ");
+            let t = line.to_ascii_lowercase();
+            match t.as_str() {
+                "y" | "yes" => return ApprovalDecision::Approve,
+                "a" | "always" => {
+                    self.allowlist
+                        .lock()
+                        .unwrap()
+                        .insert(info.tool.clone());
+                    println!("[{}] 已加入本会话始终允许", info.tool);
+                    return ApprovalDecision::Approve;
+                }
+                "n" | "no" => {
+                    print!("拒绝理由(可选,回传模型,直接回车跳过): ");
+                    let _ = std::io::stdout().flush();
+                    let reason = {
+                        let rx = self.rx.lock().unwrap();
+                        rx.recv().unwrap_or_else(|_| "__eof__".to_string())
+                    };
+                    if reason != "__eof__" && !reason.is_empty() {
+                        *self.last_reason.lock().unwrap() = Some(reason);
+                    }
+                    return ApprovalDecision::Reject;
+                }
+                _ => {
+                    print!("请输入 y / a / n: ");
                     let _ = std::io::stdout().flush();
                 }
             }
         }
+    }
+
+    // spec 167:最后一次拒绝理由(回传模型)
+    fn reject_reason(&self) -> Option<String> {
+        self.last_reason.lock().unwrap().clone()
     }
 }
 
@@ -2172,6 +2242,8 @@ fn cmd_chat(initial: Option<&str>) -> i32 {
         });
         let approval = Arc::new(ChatApproval {
             rx: rx.clone(),
+            allowlist: Mutex::new(std::collections::HashSet::new()),
+            last_reason: Mutex::new(None),
             abort: abort.clone(),
         });
         let executor = Arc::new(ToolExecutor::new(run_root, builtin_registry(), approval));
@@ -2227,6 +2299,8 @@ impl StdinApproval {
             auto: None,
             rx: Mutex::new(rx),
             abort,
+            allowlist: Mutex::new(std::collections::HashSet::new()),
+            last_reason: Mutex::new(None),
         }
     }
 }
@@ -2275,6 +2349,31 @@ mod approval_tests {
         let (tx2, rx2) = mpsc::channel();
         let sink2 = StdinApproval::with_rx(rx2, abort.clone());
         tx2.send("n".into()).unwrap();
+        tx2.send("参数写错了".into()).unwrap();
         assert_eq!(sink2.decide(&info), ApprovalDecision::Reject);
+        // spec 167:拒绝理由回传
+        assert_eq!(sink2.reject_reason().as_deref(), Some("参数写错了"));
+    }
+
+    #[test]
+    fn allowlisted_tool_auto_approves_without_prompt() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let sink = StdinApproval::with_rx(rx, abort.clone());
+        // 预置 allowlist
+        *sink.allowlist.lock().unwrap() = {
+            let mut set = std::collections::HashSet::new();
+            set.insert("read_file".to_string());
+            set
+        };
+        let info = zealous_engine::approval::ApprovalRequestInfo {
+            call_id: "c".into(),
+            tool: "read_file".into(),
+            risk: zealous_core::RiskTier::T0,
+            summary: "s".into(),
+        };
+        // 无需任何 stdin 输入即批准
+        assert_eq!(sink.decide(&info), ApprovalDecision::Approve);
+        // stdin 无输入被消费:allowlist 命中即批准
     }
 }

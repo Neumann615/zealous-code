@@ -9,6 +9,8 @@ use zealous_engine::task_service::TaskSummary;
 pub struct ApprovalRequestUi {
     pub task_id: String,
     pub call_id: String,
+    /// spec 167:工具名(会话始终允许判定用)
+    pub tool: String,
     pub summary: String,
 }
 
@@ -131,6 +133,8 @@ pub struct TuiState {
     pub chat_history: Vec<(String, String)>,
     /// spec 163:当前 run 是否在流式输出中
     pub chat_streaming: bool,
+    /// spec 167:会话级始终允许的工具(TUI 存活期)
+    pub tool_allowlist: std::collections::HashSet<String>,
     /// engine 线程是否在运行(R 已发出且未收到 Finished/Failure)
     pub running: bool,
     pub abort_requested: bool,
@@ -176,6 +180,7 @@ impl TuiState {
             chat_task: None,
             chat_history: Vec::new(),
             chat_streaming: false,
+            tool_allowlist: std::collections::HashSet::new(),
             running: false,
             abort_requested: false,
             quit: false,
@@ -605,6 +610,7 @@ mod tests {
         let mut s = TuiState::new();
         assert!(s.pending_approval.is_none());
         s.approval_arrived(ApprovalRequestUi {
+            tool: "shell".into(),
             task_id: "task_1".into(),
             call_id: "call_1".into(),
             summary: "write_file ...".into(),
@@ -669,6 +675,7 @@ mod scroll_tests {
     fn approval_scroll_clamps_and_reports_end() {
         let mut s = TuiState::new();
         s.approval_arrived(ApprovalRequestUi {
+            tool: "shell".into(),
             task_id: "task_c".into(),
             call_id: "c".into(),
             summary: "x".into(),
@@ -691,6 +698,7 @@ mod scroll_tests {
     fn approval_arrived_resets_scroll() {
         let mut s = TuiState::new();
         s.approval_arrived(ApprovalRequestUi {
+            tool: "shell".into(),
             task_id: "task_1".into(),
             call_id: "1".into(),
             summary: "a".into(),
@@ -698,6 +706,7 @@ mod scroll_tests {
         s.set_approval_total(5);
         s.approval_scroll_down(4);
         s.approval_arrived(ApprovalRequestUi {
+            tool: "shell".into(),
             task_id: "task_2".into(),
             call_id: "2".into(),
             summary: "b".into(),

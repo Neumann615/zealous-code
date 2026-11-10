@@ -353,7 +353,7 @@ fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
             ))
         } else {
             Line::from(format!(
-                "[{run_state}] q 退出 · n 新建 · c 对话 · r 刷新 · ↑/↓ 选择 · Enter 详情 · 详情内: R 运行 · I 隔离运行 · P 应用 · W 工作区 · x 中断 · a/d 审批 · e 事件流 · 最终状态: {status}"
+                "[{run_state}] q 退出 · n 新建 · c 对话 · r 刷新 · ↑/↓ 选择 · Enter 详情 · 详情内: R 运行 · I 隔离运行 · P 应用 · W 工作区 · x 中断 · a/w/d 审批 · e 事件流 · 最终状态: {status}"
             ))
         }
     };
@@ -542,7 +542,7 @@ fn render_approval_modal(f: &mut Frame, state: &mut TuiState) {
     ];
     text.extend(window);
     text.push(pos);
-    text.push(Line::from("a 批准 · d 拒绝 · x 中断任务"));
+    text.push(Line::from("a 批准 · w 本会话始终 · d 拒绝 · x 中断任务"));
 
     f.render_widget(
         Paragraph::new(text).block(Block::new().borders(Borders::ALL).title("审批").bold()),
@@ -736,6 +736,7 @@ pub(crate) mod tests {
     fn approval_modal_shows_summary() {
         let mut s = TuiState::new();
         s.approval_arrived(super::super::state::ApprovalRequestUi {
+            tool: "shell".into(),
             task_id: "task_9".into(),
             call_id: "call_9".into(),
             summary: "write_file 新建文件: out.txt\n--- 完整新内容 ---\nbody".into(),

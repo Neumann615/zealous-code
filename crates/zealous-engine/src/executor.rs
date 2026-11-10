@@ -172,10 +172,15 @@ impl ToolExecutor {
             if decision == ApprovalDecision::Reject {
                 // spec 30:Rejected 是 ToolCall 终态,不再追加完成事件;
                 // "以失败结果回给模型"由返回值承载,任务不因此失败
+                // spec 167:用户拒绝理由回传模型(可据此调整方案)
+                let text = match self.sink.reject_reason() {
+                    Some(r) => format!("rejected by user: {r}"),
+                    None => "rejected by user".into(),
+                };
                 return Ok(ToolOutcome {
                     ok: false,
                     risk,
-                    text: "rejected by user".into(),
+                    text,
                 });
             }
         }

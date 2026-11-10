@@ -195,11 +195,25 @@ pub(crate) fn apply_event(
 ) {
     match ev {
         TuiEvent::ApprovalChannel(tx) => *decision_tx = Some(tx),
-        TuiEvent::Approval(req) => state.approval_arrived(state::ApprovalRequestUi {
-            task_id: req.task_id,
-            call_id: req.call_id,
-            summary: req.summary,
-        }),
+        TuiEvent::Approval(req) => {
+            // spec 167:会话始终允许的工具自动批准(不发弹窗)
+            if state.tool_allowlist.contains(req.tool.as_str()) {
+                state.push_important(&format!(
+                    "[auto] {} 已在本会话始终允许,自动批准",
+                    req.tool
+                ));
+                if let Some(tx) = decision_tx {
+                    let _ = tx.send(ApprovalDecision::Approve);
+                }
+            } else {
+                state.approval_arrived(state::ApprovalRequestUi {
+                    task_id: req.task_id,
+                    call_id: req.call_id,
+                    tool: req.tool,
+                    summary: req.summary,
+                });
+            }
+        },
         TuiEvent::Finished(status) => {
             state.task_finished(status);
             *decision_tx = None;
@@ -1066,6 +1080,16 @@ fn handle_key(
                             None,
                             None,
                         );
+                    }
+                }
+            }
+            KeyCode::Char('w') if state.pending_approval.is_some() => {
+                // spec 167:本会话始终允许该工具
+                if let Some(req) = state.take_pending_approval() {
+                    state.tool_allowlist.insert(req.tool.clone());
+                    state.push_important(&format!("[{}] 已加入本会话始终允许", req.tool));
+                    if let Some(tx) = decision_tx {
+                        let _ = tx.send(ApprovalDecision::Approve);
                     }
                 }
             }

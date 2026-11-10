@@ -19,6 +19,10 @@ pub trait ApprovalSink: Send + Sync {
     /// 阻塞直至决策返回;`info` 必须完整展示将执行的动作
     /// (call_id/tool/risk/summary,spec 110 §3)
     fn decide(&self, info: &ApprovalRequestInfo) -> ApprovalDecision;
+    /// spec 167:最后一次 Reject 附带的用户理由(回传模型);默认 None
+    fn reject_reason(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 测试替身:一律批准
