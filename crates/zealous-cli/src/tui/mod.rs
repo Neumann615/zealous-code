@@ -245,7 +245,14 @@ pub(crate) fn apply_event(
         TuiEvent::ChatDelta(piece) => {
             state.chat_append_delta(&piece);
         }
+        TuiEvent::ReasoningDelta(piece) => {
+            state.chat_append_reasoning(&piece);
+        }
         TuiEvent::Progress(msg) => {
+            // spec 166:聊天运行中,工具活动行进转录(简化活动卡)
+            if state.chat_streaming {
+                state.chat_tool_line(&msg);
+            }
             state.push_progress(msg);
         }
         TuiEvent::QueueFinished(summary) => {
@@ -862,6 +869,10 @@ fn handle_key(
                 KeyCode::PageUp => state.chat_scroll_up(10),
                 KeyCode::PageDown => state.chat_scroll_down(10),
                 KeyCode::Backspace => state.chat_input_backspace(),
+                // spec 166:Shift+Enter 多行输入
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    state.chat_input_char('\n');
+                }
                 KeyCode::Enter => {
                     // 运行中/流式中禁发;空输入忽略(spec 163 §3)
                     if state.running || state.chat_streaming {
@@ -919,9 +930,15 @@ fn handle_key(
                     let delta_tx = event_tx.clone();
                     let on_delta: Arc<dyn Fn(zealous_engine::provider::ProviderStreamEvent) + Send + Sync> =
                         Arc::new(move |ev| {
-                            if let zealous_engine::provider::ProviderStreamEvent::TextDelta(piece) = ev {
-                                let _ = delta_tx.send(TuiEvent::ChatDelta(piece));
-                            }
+                            let _ = match ev {
+                                zealous_engine::provider::ProviderStreamEvent::TextDelta(piece) => {
+                                    let _ = delta_tx.send(TuiEvent::ChatDelta(piece));
+                                }
+                                zealous_engine::provider::ProviderStreamEvent::ReasoningDelta(piece) => {
+                                    let _ = delta_tx.send(TuiEvent::ReasoningDelta(piece));
+                                }
+                                _ => (),
+                            };
                         });
                     runner::spawn_run(
                         TaskService::new(svc.repo_root().to_path_buf()),

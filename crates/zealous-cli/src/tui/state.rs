@@ -376,13 +376,57 @@ impl TuiState {
     }
 
     /// 流式 delta 追加到最后一个助手条目
+    /// 流式 delta 追加:尾部是助手条目则累积,否则新建
+    /// (spec 166:新建前收起思考条目)
     pub fn chat_append_delta(&mut self, piece: &str) {
-        if let Some(last) = self.chat_entries.last_mut() {
-            if last.role == ChatRole::Assistant {
+        match self.chat_entries.last_mut() {
+            Some(last) if last.role == ChatRole::Assistant => {
                 last.text.push_str(piece);
+            }
+            _ => {
+                self.chat_collapse_reasoning();
+                self.chat_entries.push(ChatEntry {
+                    role: ChatRole::Assistant,
+                    text: piece.to_string(),
+                });
             }
         }
         self.chat_scroll = 0;
+    }
+
+    /// spec 166:思考流增量(暗色 System 条目累积;正文到达时收起)
+    pub fn chat_append_reasoning(&mut self, piece: &str) {
+        match self.chat_entries.last_mut() {
+            Some(last) if last.role == ChatRole::System && last.text.starts_with("💭 ") => {
+                last.text.push_str(piece);
+            }
+            _ => {
+                self.chat_entries.push(ChatEntry {
+                    role: ChatRole::System,
+                    text: format!("💭 {piece}"),
+                });
+            }
+        }
+        self.chat_scroll = 0;
+    }
+
+    fn chat_collapse_reasoning(&mut self) {
+        if let Some(last) = self.chat_entries.last_mut() {
+            if last.role == ChatRole::System && last.text.starts_with("💭 ") {
+                last.text = "💭 …(思考已收起)".to_string();
+            }
+        }
+    }
+
+    /// spec 166:工具活动行进转录(仅工具类进度;简化版活动卡)
+    pub fn chat_tool_line(&mut self, msg: &str) {
+        if msg.starts_with("工具") {
+            self.chat_entries.push(ChatEntry {
+                role: ChatRole::System,
+                text: format!("⚙ {msg}"),
+            });
+            self.chat_scroll = 0;
+        }
     }
 
     /// run 结束:用账本最终答复替换流式原文,并写入压缩对话史
@@ -725,5 +769,50 @@ mod chat_state_tests {
         assert!(s.chat_entries.is_empty());
         assert!(s.chat_input.is_empty());
         assert!(s.chat_task.is_none());
+    }
+}
+
+#[cfg(test)]
+mod chat_ux_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_accumulates_then_collapses_on_text() {
+        let mut s = TuiState::new();
+        s.chat_begin_turn("q");
+        s.chat_append_reasoning("先想一想");
+        s.chat_append_reasoning("…再验证");
+        // 思考条目是暗色 System,以 💏 前缀累积
+        let last = s.chat_entries.last().unwrap();
+        assert_eq!(last.role, ChatRole::System);
+        assert!(last.text.contains("先想一想"));
+        // 正文到达 → 思考收起 + 新建助手条目
+        s.chat_append_delta("答案");
+        assert_eq!(s.chat_entries.last().unwrap().text, "答案");
+        assert_eq!(s.chat_entries[s.chat_entries.len() - 2].text, "💭 …(思考已收起)");
+    }
+
+    #[test]
+    fn tool_line_only_for_tool_progress() {
+        let mut s = TuiState::new();
+        s.chat_begin_turn("q");
+        s.chat_tool_line("工具 read_file(T0) 完成");
+        s.chat_tool_line("任务进入 Running(from Queued)");
+        let sys: Vec<_> = s
+            .chat_entries
+            .iter()
+            .filter(|e| e.role == ChatRole::System)
+            .collect();
+        assert_eq!(sys.len(), 1);
+        assert!(sys[0].text.contains("⚙"));
+    }
+
+    #[test]
+    fn shift_enter_newline_goes_into_input() {
+        let mut s = TuiState::new();
+        s.chat_input_char('a');
+        s.chat_input_char('\n');
+        s.chat_input_char('b');
+        assert_eq!(s.chat_input, "a\nb");
     }
 }

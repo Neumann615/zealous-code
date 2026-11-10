@@ -31,6 +31,8 @@ pub enum TuiEvent {
     ParallelFinished(String),
     /// spec 163:聊天流式 delta(通知通道,不落账本)
     ChatDelta(String),
+    /// spec 166:思考流增量(reasoning_content)
+    ReasoningDelta(String),
     /// queue/parallel 将决策通道交回主循环
     ApprovalChannel(std::sync::mpsc::Sender<zealous_core::ApprovalDecision>),
 }
