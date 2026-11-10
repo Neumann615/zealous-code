@@ -2036,6 +2036,17 @@ fn cmd_chat(initial: Option<&str>) -> i32 {
 
     let mut current_task: Option<zealous_core::TaskId> = None;
     let mut history: Vec<(String, String)> = Vec::new();
+
+    // spec 165:启动恢复最近聊天会话(事实来自账本)
+    if let Ok(Some(tid)) = svc.latest_chat_task() {
+        if let Ok(hist) = svc.chat_history(&tid) {
+            if !hist.is_empty() {
+                history = hist;
+                current_task = Some(tid.clone());
+                println!("[已恢复会话 {} · {} 轮]", tid.as_str(), history.len());
+            }
+        }
+    }
     let mut first = initial.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     loop {
@@ -2096,7 +2107,7 @@ fn cmd_chat(initial: Option<&str>) -> i32 {
             Some(t) => t,
             None => {
                 let title: String = input.chars().take(48).collect();
-                match svc.create_task_with_brief_text(&title, Some(input.clone())) {
+                match svc.create_chat_task(&title, Some(input.clone())) {
                     Ok(CreateOutcome::Ready { task_id, .. }) => {
                         println!("[task {}]", task_id.as_str());
                         task_id
@@ -2176,7 +2187,7 @@ fn cmd_chat(initial: Option<&str>) -> i32 {
             tools: zealous_engine::tools::builtin_tool_defs(),
         };
         println!("---");
-        match orch.run_chat_turn(&ledger, &task_prompt) {
+        match orch.run_chat_turn(&ledger, &task_prompt, Some(&input)) {
             Ok(status) => {
                 println!("\n---");
                 match status {

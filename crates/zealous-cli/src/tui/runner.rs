@@ -50,6 +50,8 @@ pub fn spawn_run(
     // spec 164:聊天路径启用原生 tool-calls
     native: bool,
     prompt_override: Option<String>,
+    // spec 165:用户原文(聊天路径;ChatUserTurn 落账)
+    user_text: Option<String>,
     // spec 163:流式 delta 回调
     on_delta: Option<Arc<dyn Fn(zealous_engine::provider::ProviderStreamEvent) + Send + Sync>>,
 ) {
@@ -128,7 +130,10 @@ pub fn spawn_run(
             },
         };
 
-        let status = match orchestrator.run_task(&ledger, &prompt) {
+        let status = match match user_text {
+            Some(u) => orchestrator.run_chat_turn(&ledger, &prompt, Some(&u)),
+            None => orchestrator.run_task(&ledger, &prompt),
+        } {
             Ok(s) => s,
             Err(e) => {
                 let _ = event_tx.send(TuiEvent::Failure(format!("编排失败: {e}")));

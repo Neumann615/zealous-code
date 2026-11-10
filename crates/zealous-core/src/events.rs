@@ -233,6 +233,12 @@ pub enum EventPayload {
         resolved_files: Vec<String>,
         manual_files: Vec<String>,
     },
+    /// spec 165:聊天会话标记(创建聊天任务后追加)
+    ChatSessionStarted {},
+    /// spec 165:聊天用户输入原文(每轮落账;助手侧复用 MessageCompleted)
+    ChatUserTurn {
+        text: String,
+    },
     /// spec 164:单轮模型用量(与转录分离;记 token 不产生转录行)
     UsageRecorded {
         run_id: AgentRunId,

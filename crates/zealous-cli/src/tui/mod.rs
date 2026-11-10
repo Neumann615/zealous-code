@@ -338,6 +338,7 @@ fn handle_key(
             false,
                                 None,
                                 None,
+                                None,
                             );
                         }
                     }
@@ -613,7 +614,24 @@ fn handle_key(
             KeyCode::Char('r') => state.refresh_tasks(list_tasks(svc)),
             KeyCode::Char('n') => state.open_form(),
             // spec 163:进入聊天屏
-            KeyCode::Char('c') => state.screen = Screen::Chat,
+            KeyCode::Char('c') => {
+                // spec 165:进入聊天屏时恢复最近会话(事实来自账本)
+                if state.chat_task.is_none() {
+                    if let Ok(Some(tid)) = svc.latest_chat_task() {
+                        if let (Ok(hist), Ok(tr)) = (svc.chat_history(&tid), svc.chat_transcript(&tid)) {
+                            for (is_user, text) in tr {
+                                state.chat_entries.push(state::ChatEntry {
+                                    role: if is_user { state::ChatRole::User } else { state::ChatRole::Assistant },
+                                    text,
+                                });
+                            }
+                            state.chat_history = hist;
+                            state.chat_task = Some(tid);
+                        }
+                    }
+                }
+                state.screen = Screen::Chat;
+            }
             KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 // spec 157/161:确认后并行运行最多三个 runnable queued tasks
                 match zealous_engine::parallel::select_runnable(
@@ -859,7 +877,7 @@ fn handle_key(
                         Some(t) => t,
                         None => {
                             let title: String = msg.chars().take(48).collect();
-                            match svc.create_task_with_brief_text(&title, Some(msg.clone())) {
+                            match svc.create_chat_task(&title, Some(msg.clone())) {
                                 Ok(CreateOutcome::Ready { task_id, .. }) => {
                                     state.chat_task = Some(task_id.clone());
                                     refresh_task_list(state, svc);
@@ -915,6 +933,7 @@ fn handle_key(
                         false,
                         true,
                         Some(prompt),
+                        Some(msg.clone()),
                         Some(on_delta),
                     );
                 }
@@ -1026,6 +1045,7 @@ fn handle_key(
                             abort.clone(),
                             false,
             false,
+                            None,
                             None,
                             None,
                         );
@@ -1207,6 +1227,7 @@ mod integration_tests {
             abort.clone(),
             false,
             false,
+            None,
             None,
             None,
         );

@@ -34,3 +34,6 @@ dist/
 Thumbs.db
 # Windows reserved device name
 NUL
+/b.txt
+/build-out.txt
+/zealous-tui.cmd

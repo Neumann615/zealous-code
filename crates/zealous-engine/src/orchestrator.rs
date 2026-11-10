@@ -595,6 +595,8 @@ impl Orchestrator {
         &self,
         ledger: &Arc<Ledger>,
         task_prompt: &str,
+        // spec 165:用户原文(ChatUserTurn 落账;None = 内部调用不落账)
+        user_text: Option<&str>,
     ) -> Result<TaskStatus, OrchestratorError> {
         let proj = ledger.fold_now().map_err(OrchestratorError::Ledger)?;
         let mut from = proj.status;
@@ -631,6 +633,14 @@ impl Orchestrator {
             },
         )?;
         self.emit(true, format!("任务进入 Running(from {from:?})"));
+        // spec 165:用户输入原文落账(每轮;助手侧复用 MessageCompleted)
+        if let Some(user) = user_text {
+            self.append(
+                ledger,
+                AgentRef::User,
+                EventPayload::ChatUserTurn { text: user.to_string() },
+            )?;
+        }
         let coord_run = AgentRunId::generate();
         self.append(
             ledger,
@@ -1934,7 +1944,7 @@ mod native_tools_tests {
             progress: None,
             on_delta: None,
         };
-        let status = orch.run_chat_turn(&ledger, "列出目录").unwrap();
+        let status = orch.run_chat_turn(&ledger, "列出目录", Some("列出目录")).unwrap();
         assert_eq!(status, TaskStatus::Completed);
 
         let (events, _) =

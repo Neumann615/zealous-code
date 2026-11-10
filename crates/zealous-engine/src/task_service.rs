@@ -313,6 +313,78 @@ impl TaskService {
     }
 }
 
+impl TaskService {
+// ---- 聊天会话(spec 165)----
+
+/// 创建聊天任务:普通创建 + ChatSessionStarted 标记
+pub fn create_chat_task(
+    &self,
+    title: &str,
+    brief: Option<String>,
+) -> Result<CreateOutcome, ServiceError> {
+    let outcome = self.create_task_with_brief_text(title, brief)?;
+    if let CreateOutcome::Ready { task_id, .. } = &outcome {
+        let (ledger, _, _) = self.open_task(task_id)?;
+        ledger.append(AgentRef::User, EventPayload::ChatSessionStarted {})?;
+    }
+    Ok(outcome)
+}
+
+/// 最近一个聊天会话任务(TaskId 倒序扫描;spec 165)
+pub fn latest_chat_task(&self) -> Result<Option<TaskId>, ServiceError> {
+    let (mut items, _) = self.list_tasks()?;
+    items.sort_by(|a, b| b.task_id.as_str().cmp(a.task_id.as_str()));
+    for s in items {
+        if self.is_chat_task(&s.task_id)? {
+            return Ok(Some(s.task_id));
+        }
+    }
+    Ok(None)
+}
+
+fn is_chat_task(&self, task_id: &TaskId) -> Result<bool, ServiceError> {
+    let (evs, _) = self.events(task_id)?;
+    Ok(evs
+        .iter()
+        .any(|e| matches!(&e.payload, EventPayload::ChatSessionStarted {})))
+}
+
+/// spec 165:从账本重建 (user, assistant) 压缩对话史
+pub fn chat_history(&self, task_id: &TaskId) -> Result<Vec<(String, String)>, ServiceError> {
+    let (evs, _) = self.events(task_id)?;
+    let mut pairs = Vec::new();
+    let mut last_user: Option<String> = None;
+    for e in evs {
+        match &e.payload {
+            EventPayload::ChatUserTurn { text } => last_user = Some(text.clone()),
+            EventPayload::MessageCompleted { text, .. } => {
+                if let Some(u) = last_user.take() {
+                    pairs.push((u, text.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(pairs)
+}
+
+/// spec 165:全量聊天转录重建(顺序:true=用户,false=助手)
+pub fn chat_transcript(&self, task_id: &TaskId) -> Result<Vec<(bool, String)>, ServiceError> {
+    let (evs, _) = self.events(task_id)?;
+    let mut out = Vec::new();
+    for e in evs {
+        match &e.payload {
+            EventPayload::ChatUserTurn { text } => out.push((true, text.clone())),
+            EventPayload::MessageCompleted { text, .. } if !text.is_empty() => {
+                out.push((false, text.clone()))
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
