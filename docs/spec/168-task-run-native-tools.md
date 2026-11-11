@@ -30,3 +30,4 @@
 - mock endpoint 的 `chat_body` 增加 native 转换:legacy JSON 动作脚本
   在测试进程内转换为原生 tool_calls 响应 —— 现有 E2E 脚本零改动;
 - parallel 相关测试走 legacy 透传(chat_body native=false)。
+ ## 5. 调试记录(2026-11-11 续)  - cli_e2e BrokenPipe 复现分析:原生 task run 在 mock 下 ~500ms 内完成   (含 edit_file T1 审批,账本 Approve)——盲写 y 的测试在进程退出后写入   即 BrokenPipe;已改为健壮轮询写入(写失败即停),但仍不稳定,   且 T1 在无输入时被批准的路径待查(疑似与 reader 线程/EOF 交互)。 - 下一步:修复 cli_e2e 审批等待逻辑(等"审批请求"标记再写,而非盲写);   排查无输入 Approve 的来源;serve stateful endpoint 原生协议重写。
