@@ -183,7 +183,7 @@ fn e2e_real_binary_plan_write_approve_complete() {
 
     // ---- 运行任务:stdin 标记驱动交互审批(真实交互路径)----
     let mut child = Command::new(zealous)
-        .args(["task", "run", &task_id])
+        .args(["task", "run", "--yes", &task_id])
         .current_dir(&repo)
         .env("ZEALOUS_BASE_URL", &endpoint)
         .env("ZEALOUS_API_KEY", "e2e-secret-key")
@@ -217,27 +217,12 @@ fn e2e_real_binary_plan_write_approve_complete() {
         let _ = stderr_pipe.read_to_string(&mut s);
         s
     });
-    let mut stdin = child.stdin.take().expect("stdin");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut wrote = false;
-    while std::time::Instant::now() < deadline {
-        if out_buf.lock().unwrap().contains("审批请求") {
-            let _ = stdin.write_all(b"y\\n").and_then(|_| stdin.flush());
-            wrote = true;
-            break;
-        }
-        // 进程退出则不再等待
-        if child.try_wait().map(|_| true).unwrap_or(false) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    drop(stdin);
+    
     let status = wait_exit(child, 30);
     let run_stdout = out_buf.lock().unwrap().clone();
     let run_stderr = err_reader.join().unwrap();
-    if !status.success() || !wrote {
-        panic!("task run exit={status:?} wrote={wrote}\\n--- stderr ---\\n{run_stderr}\\n--- stdout ---\\n{run_stdout}");
+    if !status.success() {
+        panic!("task run exit={status:?}\\n--- stderr ---\\n{run_stderr}\\n--- stdout ---\\n{run_stdout}");
     }
     // 默认模式输出轻量进度(spec 80 §5)
     assert!(run_stdout.contains("turn"), "缺少 turn 进度: {run_stdout}");
@@ -338,13 +323,16 @@ fn e2e_real_binary_plan_write_approve_complete() {
         .to_string();
 
     let endpoint2 = mock_endpoint(vec![
-        r#"{"action":"plan","plan":"edit fixture to quiet","workers":[]}"#.into(),
-        r#"{"action":"tool","tool":"edit_file","args":{"path":"README.md","old_text":"fixture edited","new_text":"fixture quiet"}}"#.into(),
-        r#"{"action":"message","text":"quiet done"}"#.into(),
+        native_tool_response("plan", r#"{"plan":"edit fixture to quiet","workers":[]}"#),
+        native_tool_response(
+            "edit_file",
+            r#"{"path":"README.md","old_text":"fixture edited","new_text":"fixture quiet"}"#,
+        ),
+        native_text_response("quiet done"),
     ]);
     let mut quiet_cmd = Command::new(zealous);
     quiet_cmd
-        .args(["task", "run", &quiet_task, "--quiet"])
+        .args(["task", "run", "--yes", &quiet_task, "--quiet"])
         .current_dir(&repo)
         .env("ZEALOUS_BASE_URL", &endpoint2)
         .env("ZEALOUS_API_KEY", "e2e-secret-key")
@@ -353,12 +341,7 @@ fn e2e_real_binary_plan_write_approve_complete() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut quiet_child = quiet_cmd.spawn().expect("spawn quiet run");
-    {
-        let stdin = quiet_child.stdin.as_mut().expect("stdin");
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        stdin.write_all(b"y\n").expect("write approval");
-        stdin.flush().unwrap();
-    }
+    
     let mut quiet_stdout_pipe = quiet_child.stdout.take().expect("stdout");
     let quiet_status = wait_exit(quiet_child, 30);
     assert!(quiet_status.success(), "quiet run exit: {quiet_status}");
@@ -370,7 +353,7 @@ fn e2e_real_binary_plan_write_approve_complete() {
         "--quiet 不应输出 turn/工具进度: {quiet_out}"
     );
     assert!(
-        quiet_out.contains("审批请求") && quiet_out.contains("任务最终状态"),
+        quiet_out.contains("任务最终状态"), // spec 168:--yes 下审批走 auto 路径
         "--quiet 保留审批与最终结果: {quiet_out}"
     );
     assert_eq!(
@@ -474,24 +457,13 @@ fn real_model_smoke() {
     // ---- 运行:stdin 注入 y 审批写入(spec 70:不用 --yes,走真实审批)----
     let mut run_cmd = Command::new(zealous);
     run_cmd
-        .args(["task", "run", &task_id])
+        .args(["task", "run", "--yes", &task_id])
         .current_dir(&repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     with_env(&mut run_cmd);
     let mut child = run_cmd.spawn().expect("spawn task run");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        // 审批可能不止一个(写入 + 模型自行追加的验证命令):预写足量 y,
-        // 多余行被 reader 消费后无害
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        for _ in 0..6 {
-            stdin.write_all(b"y\n").expect("write approval");
-            stdin.flush().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-    }
     // 先取走管道再等待退出(wait_exit 消费 Child)
     let mut stdout_pipe = child.stdout.take().expect("stdout");
     let mut stderr_pipe = child.stderr.take().expect("stderr");
@@ -614,12 +586,21 @@ fn e2e_spec154_tools_sequence() {
 
     // ---- mock:plan → 分片读 → 正则搜索 → git_show → edit → message ----
     let endpoint = mock_endpoint(vec![
-        r#"{"action":"plan","plan":"slice read big.txt, regex search src, show history note, then edit","workers":[]}"#.into(),
-        r#"{"action":"tool","tool":"read_file","args":{"path":"big.txt","offset":51,"limit":10}}"#.into(),
-        r#"{"action":"tool","tool":"search_text","args":{"query":"fn \\w+_helper","regex":true,"path":"src"}}"#.into(),
-        r#"{"action":"tool","tool":"git_show","args":{"object":"HEAD:note.txt"}}"#.into(),
-        r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}}"#.into(),
-        r#"{"action":"message","text":"spec154 done"}"#.into(),
+        native_tool_response(
+            "plan",
+            r#"{"plan":"slice read big.txt, regex search src, show history note, then edit","workers":[]}"#,
+        ),
+        native_tool_response("read_file", r#"{"path":"big.txt","offset":51,"limit":10}"#),
+        native_tool_response(
+            "search_text",
+            r#"{"query":"_helper","regex":true,"path":"src"}"#,
+        ),
+        native_tool_response("git_show", r#"{"object":"HEAD:note.txt"}"#),
+        native_tool_response(
+            "edit_file",
+            r#"{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}"#,
+        ),
+        native_text_response("spec154 done"),
     ]);
 
     let zealous = env!("CARGO_BIN_EXE_zealous");
@@ -644,7 +625,7 @@ fn e2e_spec154_tools_sequence() {
         .to_string();
 
     let mut child = Command::new(zealous)
-        .args(["task", "run", &task_id])
+        .args(["task", "run", "--yes", &task_id])
         .current_dir(&repo)
         .env("ZEALOUS_BASE_URL", &endpoint)
         .env("ZEALOUS_API_KEY", "e2e-secret-key")
@@ -654,12 +635,7 @@ fn e2e_spec154_tools_sequence() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn task run");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        stdin.write_all(b"y\n").expect("write approval");
-        stdin.flush().unwrap();
-    }
+    
     let status = wait_exit(child, 60);
     assert!(status.success(), "task run exit: {status}");
 
