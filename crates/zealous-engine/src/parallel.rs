@@ -290,8 +290,8 @@ pub fn run_parallel(
             model,
             progress,
             on_delta: None,
-            native_tools: false,
-            tools: Vec::new(),
+            native_tools: true,
+            tools: crate::tools::builtin_tool_defs(),
         };
         // The prompt carries the task requirement captured during preparation.
         let prompt = format!(

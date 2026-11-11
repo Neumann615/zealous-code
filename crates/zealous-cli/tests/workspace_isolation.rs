@@ -26,11 +26,23 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn chat_body(content: &str) -> String {
-    // spec 168:native 消费者用预构造响应体(含 choices)直接透传;
-    // legacy 消费者的 JSON 动作按文本包装为 content
+    // spec 169:native 响应体透传;legacy JSON 动作 → 原生响应(消费者已切 native)
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
         if v.get("choices").is_some() {
             return content.to_string();
+        }
+        if v["action"] == "plan" {
+            let args = serde_json::json!({ "plan": v["plan"], "workers": v["workers"] });
+            return tool_call_body("plan", &args.to_string());
+        }
+        if v["action"] == "tool" {
+            return tool_call_body(
+                v["tool"].as_str().unwrap_or_default(),
+                &v["args"].to_string(),
+            );
+        }
+        if v["action"] == "message" {
+            return text_body(v["text"].as_str().unwrap_or_default());
         }
     }
     serde_json::json!({
@@ -120,6 +132,26 @@ fn base_repo(tag: &str) -> std::path::PathBuf {
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-q", "-m", "init"]);
     dir
+}
+
+fn tool_call_body(name: &str, arguments: &str) -> String {
+    serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{ "id": "call_1", "type": "function",
+                    "function": { "name": name, "arguments": arguments } }],
+            },
+        }],
+    })
+    .to_string()
+}
+
+fn text_body(text: &str) -> String {
+    serde_json::json!({ "choices": [{ "message": { "content": text } }] })
+    .to_string()
 }
 
 fn native_tool_response(name: &str, args: &str) -> String {
