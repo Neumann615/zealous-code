@@ -181,7 +181,7 @@ fn e2e_real_binary_plan_write_approve_complete() {
         .to_string();
     assert!(task_id.starts_with("task_"));
 
-    // ---- 运行任务:stdin 自动输入审批 y(真实交互路径)----
+    // ---- 运行任务:stdin 标记驱动交互审批(真实交互路径)----
     let mut child = Command::new(zealous)
         .args(["task", "run", &task_id])
         .current_dir(&repo)
@@ -193,23 +193,52 @@ fn e2e_real_binary_plan_write_approve_complete() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn task run");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        // 稍等审批提示出现再输入;提前写入也成立(行缓冲由 reader 消费)
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        stdin.write_all(b"y\n").expect("write approval");
-        stdin.flush().unwrap();
-    }
-    // 取走管道,读线程读到 EOF(与 wait 并行,避免任何时序丢数据)
+    // spec 168:交互审批改为标记驱动 —— 等"审批请求"出现在 stdout 再写 y
     let mut stdout_pipe = child.stdout.take().expect("stdout");
-    let reader = std::thread::spawn(move || {
+    let mut stderr_pipe = child.stderr.take().expect("stderr");
+    let out_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let ob = out_buf.clone();
+    let out_reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(stdout_pipe);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    ob.lock().unwrap().push_str(&line);
+                }
+            }
+        }
+    });
+    let err_reader = std::thread::spawn(move || {
         let mut s = String::new();
-        let _ = stdout_pipe.read_to_string(&mut s);
+        let _ = stderr_pipe.read_to_string(&mut s);
         s
     });
+    let mut stdin = child.stdin.take().expect("stdin");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut wrote = false;
+    while std::time::Instant::now() < deadline {
+        if out_buf.lock().unwrap().contains("审批请求") {
+            let _ = stdin.write_all(b"y\\n").and_then(|_| stdin.flush());
+            wrote = true;
+            break;
+        }
+        // 进程退出则不再等待
+        if child.try_wait().map(|_| true).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(stdin);
     let status = wait_exit(child, 30);
-    assert!(status.success(), "task run exit: {status}");
-    let run_stdout = reader.join().unwrap();
+    let run_stdout = out_buf.lock().unwrap().clone();
+    let run_stderr = err_reader.join().unwrap();
+    if !status.success() || !wrote {
+        panic!("task run exit={status:?} wrote={wrote}\\n--- stderr ---\\n{run_stderr}\\n--- stdout ---\\n{run_stdout}");
+    }
     // 默认模式输出轻量进度(spec 80 §5)
     assert!(run_stdout.contains("turn"), "缺少 turn 进度: {run_stdout}");
     assert!(
