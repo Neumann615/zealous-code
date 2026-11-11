@@ -149,7 +149,7 @@ pub fn spawn_worker(
             progress: Some(progress),
             on_delta: None,
             native_tools: false,
-            tools: Vec::new(),
+            tools: zealous_engine::tools::builtin_tool_defs(),
         };
         let status = match orchestrator.run_task(&ledger, &prompt) {
             Ok(s) => s,

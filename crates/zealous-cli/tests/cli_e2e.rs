@@ -22,6 +22,13 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn chat_body(content: &str) -> String {
+    // spec 168:native 消费者用预构造响应体(含 choices)直接透传;
+    // legacy 消费者的 JSON 动作按文本包装为 content
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if v.get("choices").is_some() {
+            return content.to_string();
+        }
+    }
     serde_json::json!({
         "choices": [{ "message": { "content": content } }]
     })
@@ -30,6 +37,30 @@ fn chat_body(content: &str) -> String {
 
 /// 按请求顺序返回脚本的 mock endpoint(模型只决定"做什么",
 /// 账本/工具/审批全部走真实代码)
+fn native_tool_response(name: &str, args: &str) -> String {
+    serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                }]
+            }
+        }]
+    })
+    .to_string()
+}
+
+fn native_text_response(text: &str) -> String {
+    serde_json::json!({
+        "choices": [{ "message": { "role": "assistant", "content": text } }]
+    })
+    .to_string()
+}
 fn mock_endpoint(script: Vec<String>) -> String {
     static NEXT: Mutex<()> = Mutex::new(());
     let counter = AtomicU32::new(0);
@@ -116,11 +147,14 @@ fn e2e_real_binary_plan_write_approve_complete() {
 
     // ---- mock endpoint:plan → read → git_diff → edit → message(spec 80)----
     let endpoint = mock_endpoint(vec![
-        r#"{"action":"plan","plan":"read README, diff, then edit it","workers":[]}"#.into(),
-        r#"{"action":"tool","tool":"read_file","args":{"path":"README.md"}}"#.into(),
-        r#"{"action":"tool","tool":"git_diff","args":{}}"#.into(),
-        r#"{"action":"tool","tool":"edit_file","args":{"path":"README.md","old_text":"fixture","new_text":"fixture edited"}}"#.into(),
-        r#"{"action":"message","text":"e2e done"}"#.into(),
+    native_tool_response("plan", r#"{"plan":"read README, diff, then edit it","workers":[]}"#),
+    native_tool_response("read_file", r#"{"path":"README.md"}"#),
+    native_tool_response("git_diff", r#"{}"#),
+    native_tool_response(
+        "edit_file",
+        r#"{"path":"README.md","old_text":"fixture","new_text":"fixture edited"}"#,
+    ),
+    native_text_response("e2e done"),
     ]);
 
     // ---- 通过真实二进制创建任务 ----

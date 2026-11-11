@@ -452,16 +452,16 @@ impl Orchestrator {
         run_id: &AgentRunId,
         agent: AgentRef,
         system: &str,
+        ctx: &mut LoopCtx,
+        start_turn: u64,
+        tools: Vec<crate::provider::ToolDef>,
         first_prompt: &str,
     ) -> Result<String, AgentLoopOutcome> {
-        let mut ctx = LoopCtx {
-            transcript: Vec::new(),
-        };
         let mut usage_prompt = 0u64;
         let mut usage_completion = 0u64;
         let mut usage_total = 0u64;
         let mut pending_user = Some(first_prompt.to_string());
-        for turn_no in 1..=self.max_turns {
+        for turn_no in start_turn..=(start_turn + self.max_turns.saturating_sub(1)) {
             if self.aborted() {
                 return Err(AgentLoopOutcome::Aborted);
             }
@@ -481,7 +481,7 @@ impl Orchestrator {
             let req = crate::provider::ChatRequest {
                 system: Some(system.to_string()),
                 messages: ctx.transcript.clone(),
-                tools: self.tools.clone(),
+                tools: tools.clone(),
             };
             let resp = match &self.on_delta {
                 Some(cb) => self
@@ -654,14 +654,383 @@ impl Orchestrator {
             return self.interrupt(ledger, &coord_run, "aborted before start");
         }
         let system = "你是 zealous:本地仓库内的编程助手。可以用提供的工具读取/检索仓库文件、查看 git 历史与状态;修改文件(write_file/edit_file)与执行命令(shell)必须经用户审批,提交前完整说明要做什么。先理解仓库现状再动手;回答使用中文,简洁准确;完成后直接给出最终答复文本。".to_string();
+        let mut ctx = LoopCtx {
+            transcript: Vec::new(),
+        };
         let outcome = self.agent_loop_tools(
             ledger,
             &coord_run,
             AgentRef::Coordinator,
             &system,
+            &mut ctx,
+            1,
+            self.tools.clone(),
             task_prompt,
         );
         self.finish_task(ledger, &coord_run, outcome)
+    }
+    /// spec 168:native tool-calls 全链路任务执行
+    /// (原生规划[plan 工具] → Worker 只读分析 → apply 续跑)。
+    pub fn run_task_native(
+        &self,
+        ledger: &Arc<Ledger>,
+        task_prompt: &str,
+    ) -> Result<TaskStatus, OrchestratorError> {
+        let proj = ledger.fold_now().map_err(OrchestratorError::Ledger)?;
+        let mut from = proj.status;
+        if from == TaskStatus::Running {
+            self.append(
+                ledger,
+                AgentRef::User,
+                EventPayload::TaskInterrupted {
+                    reason: "process_restart".into(),
+                },
+            )?;
+            self.append(
+                ledger,
+                AgentRef::User,
+                EventPayload::TaskStatusChanged {
+                    from: TaskStatus::Running,
+                    to: TaskStatus::Interrupted,
+                    reason: Some("process_restart".into()),
+                },
+            )?;
+            from = TaskStatus::Interrupted;
+        }
+        if from != TaskStatus::Queued {
+            let run_id = AgentRunId::generate();
+            self.append(ledger, AgentRef::User, EventPayload::TaskResumed { run_id })?;
+        }
+        self.append(
+            ledger,
+            AgentRef::User,
+            EventPayload::TaskStatusChanged {
+                from,
+                to: TaskStatus::Running,
+                reason: None,
+            },
+        )?;
+        self.emit(true, format!("任务进入 Running(from {from:?})"));
+        let coord_run = AgentRunId::generate();
+        self.append(
+            ledger,
+            AgentRef::Coordinator,
+            EventPayload::AgentRunStarted {
+                run_id: coord_run.clone(),
+                role: AgentRole::Coordinator,
+            },
+        )?;
+        if self.aborted() {
+            return self.interrupt(ledger, &coord_run, "aborted before start");
+        }
+
+        let brief_section = proj
+            .brief
+            .as_ref()
+            .map(|b| format!("\nBRIEF(任务简报,权威需求来源):\n{}\n", truncate(b, 4000)))
+            .unwrap_or_default();
+        let resume_section = if from != TaskStatus::Queued {
+            format!("\n{}\n", resume_brief(&proj))
+        } else {
+            String::new()
+        };
+        let coord_system = format!(
+            "你是 Coordinator:拆解任务、调度只读 Worker、串行应用结果、验证并汇报。\n每轮调用一个工具或直接给出最终答复文本。修改文件用 write_file/edit_file,验证用 shell。\n{}",
+            crate::tools::tool_manifest(Some(zealous_core::RiskTier::T2))
+        );
+        // 规划工具集 = 注册表 + plan 工具
+        let mut planning_tools = self.tools.clone();
+        planning_tools.push(plan_tool_def());
+
+        let mut ctx = LoopCtx {
+            transcript: Vec::new(),
+        };
+        let mut planning_turns = 0u64;
+        let mut plan = String::new();
+        let mut worker_tasks: Vec<String> = Vec::new();
+        let mut plan_logged = false;
+        let mut direct_first_result: Option<String> = None;
+        let mut user_pending = Some(format!(
+            "TASK: {task_prompt}{brief_section}{resume_section}\n优先调用 plan 工具提交拆解;任务简单可直接调用其它工具执行;无需工具则以文本给出答复。"
+        ));
+
+        // ---- 原生规划循环 ----
+        'planning: for turn_no in 1..=self.max_turns {
+            if self.aborted() {
+                return self.interrupt(ledger, &coord_run, "aborted during planning");
+            }
+            self.append(
+                ledger,
+                AgentRef::Coordinator,
+                EventPayload::TurnStarted {
+                    run_id: coord_run.clone(),
+                    turn: turn_no,
+                },
+            )?;
+            self.emit(false, format!("· [coordinator] turn {turn_no}"));
+            if let Some(p) = user_pending.take() {
+                ctx.transcript.push(crate::provider::ChatMessage::user(p));
+            }
+            let req = crate::provider::ChatRequest {
+                system: Some(coord_system.clone()),
+                messages: ctx.transcript.clone(),
+                tools: planning_tools.clone(),
+            };
+            let resp = match &self.on_delta {
+                Some(cb) => match self.provider.complete_streaming(&self.model, &req, cb.as_ref()) {
+                    Ok(r) => r,
+                    Err(e) => return self.provider_failed(ledger, &coord_run, e),
+                },
+                None => match self.provider.complete(&self.model, &req) {
+                    Ok(r) => r,
+                    Err(e) => return self.provider_failed(ledger, &coord_run, e),
+                },
+            };
+            if let Some(u) = resp.usage {
+                self.append(
+                    ledger,
+                    AgentRef::Coordinator,
+                    EventPayload::UsageRecorded {
+                        run_id: coord_run.clone(),
+                        turn: turn_no,
+                        prompt_tokens: u.prompt_tokens,
+                        completion_tokens: u.completion_tokens,
+                        total_tokens: u.total_tokens,
+                    },
+                )?;
+            }
+            let plan_call = resp
+                .tool_calls
+                .iter()
+                .find(|c| c.name == "plan")
+                .cloned();
+            let reg_calls: Vec<crate::provider::ToolCallInfo> = resp
+                .tool_calls
+                .iter()
+                .filter(|c| c.name != "plan")
+                .cloned()
+                .collect();
+            if resp.tool_calls.is_empty() {
+                // 纯文本 → 单 Agent 任务(文本即计划)
+                ctx.transcript
+                    .push(crate::provider::ChatMessage::assistant(resp.text.clone()));
+                self.append(
+                    ledger,
+                    AgentRef::Coordinator,
+                    EventPayload::TurnCompleted {
+                        run_id: coord_run.clone(),
+                        turn: turn_no,
+                    },
+                )?;
+                planning_turns = turn_no;
+                plan = resp.text.clone();
+                break 'planning;
+            }
+            ctx.transcript
+                .push(crate::provider::ChatMessage::assistant_with_calls(
+                    resp.tool_calls.clone(),
+                ));
+            if let Some(pc) = plan_call {
+                let parsed = serde_json::from_str::<serde_json::Value>(&pc.arguments).ok();
+                plan = parsed
+                    .as_ref()
+                    .and_then(|v| v["plan"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                worker_tasks = parsed
+                    .as_ref()
+                    .and_then(|v| v["workers"].as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ctx.transcript.push(crate::provider::ChatMessage::tool_result(
+                    pc.id.clone(),
+                    "plan recorded".to_string(),
+                ));
+                self.append(
+                    ledger,
+                    AgentRef::Coordinator,
+                    EventPayload::TurnCompleted {
+                        run_id: coord_run.clone(),
+                        turn: turn_no,
+                    },
+                )?;
+                planning_turns = turn_no;
+                break 'planning;
+            }
+            if !reg_calls.is_empty() {
+                // Direct Execution Mode(spec 110):隐式 plan
+                let implicit = format!("Direct execution: {task_prompt}");
+                self.append(
+                    ledger,
+                    AgentRef::Coordinator,
+                    EventPayload::TaskPlanUpdated {
+                        plan: implicit.clone(),
+                    },
+                )?;
+                plan_logged = true;
+                let mut last_result = String::new();
+                for call in &reg_calls {
+                    let outcome = self
+                        .executor
+                        .run_tool(
+                            ledger,
+                            &coord_run,
+                            AgentRef::Coordinator,
+                            &call.arguments,
+                            &call.name,
+                        )
+                        .map_err(|e| match e {
+                            crate::executor::ExecutorError::LedgerIo(le) => le,
+                            crate::executor::ExecutorError::Ledger(fe, _) => {
+                                crate::ledger::LedgerError::Fold(fe)
+                            }
+                        })
+                        .map_err(OrchestratorError::Ledger)?;
+                    self.emit(
+                        !outcome.ok,
+                        format!(
+                            "工具 {}({:?}) {}",
+                            call.name,
+                            outcome.risk,
+                            if outcome.ok { "完成" } else { "失败/被拒" }
+                        ),
+                    );
+                    ctx.transcript
+                        .push(crate::provider::ChatMessage::tool_result(
+                            call.id.clone(),
+                            format!("ok={}\n{}", outcome.ok, truncate(&outcome.text, 2000)),
+                        ));
+                    last_result = format!(
+                        "tool `{}` result (ok={}):\n{}\n\n继续:调用下一个工具或直接给出最终答复。",
+                        call.name,
+                        outcome.ok,
+                        truncate(&outcome.text, 2000)
+                    );
+                }
+                self.append(
+                    ledger,
+                    AgentRef::Coordinator,
+                    EventPayload::TurnCompleted {
+                        run_id: coord_run.clone(),
+                        turn: turn_no,
+                    },
+                )?;
+                planning_turns = turn_no;
+                plan = implicit;
+                worker_tasks = Vec::new();
+                direct_first_result = Some(last_result);
+                break 'planning;
+            }
+            // 全部为空内容轮:提示续跑
+            user_pending = Some("请调用 plan 工具提交拆解,或直接给出最终答复。".into());
+            self.append(
+                ledger,
+                AgentRef::Coordinator,
+                EventPayload::TurnCompleted {
+                    run_id: coord_run.clone(),
+                    turn: turn_no,
+                },
+            )?;
+        }
+        if planning_turns == 0 {
+            return self.fail_task(
+                ledger,
+                &coord_run,
+                format!("agent loop exceeded max turns ({})", self.max_turns),
+            );
+        }
+        if !plan_logged {
+            self.append(
+                ledger,
+                AgentRef::Coordinator,
+                EventPayload::TaskPlanUpdated { plan: plan.clone() },
+            )?;
+        }
+        if self.aborted() {
+            return self.interrupt(ledger, &coord_run, "aborted after planning");
+        }
+
+        // ---- Worker 只读分析(原生循环;与 legacy 相同的线程/提案收集)----
+        let task_dir = ledger
+            .path()
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| OrchestratorError::Corrupt("ledger has no parent dir".into()))?;
+        let shared_ledger: Arc<Ledger> = ledger.clone();
+        let mut worker_handles = Vec::new();
+        for (i, subtask) in worker_tasks.iter().enumerate() {
+            let worker_no = (i + 1) as u8;
+            let provider = self.provider.clone();
+            let executor = self.executor.clone();
+            let abort = self.abort.clone();
+            let model = self.model.clone();
+            let worker_ledger = shared_ledger.clone();
+            let ledger_snapshot_task_dir = task_dir.clone();
+            let subtask = subtask.clone();
+            let plan = plan.clone();
+            let worker_tools = self.tools.clone();
+            self.emit(
+                false,
+                format!("worker-{worker_no} 启动: {}", truncate(&subtask, 80)),
+            );
+            worker_handles.push(std::thread::spawn(move || {
+                run_worker(
+                    provider,
+                    executor,
+                    abort,
+                    model,
+                    worker_ledger,
+                    ledger_snapshot_task_dir,
+                    worker_no,
+                    subtask,
+                    plan,
+                    true,
+                    worker_tools,
+                )
+            }));
+        }
+        let mut proposals = Vec::new();
+        for (i, h) in worker_handles.into_iter().enumerate() {
+            let worker_no = i + 1;
+            match h.join() {
+                Ok(Ok(text)) => {
+                    proposals.push(format!("[worker-{} proposal]\n{}", worker_no, text))
+                }
+                Ok(Err(e)) => proposals.push(format!("[worker-{worker_no} failed] {e}")),
+                Err(_) => proposals.push(format!("[worker-{worker_no} panicked]")),
+            }
+        }
+
+        // ---- Apply 阶段:续用规划转写,原生措辞 ----
+        let apply_prompt = if proposals.is_empty() {
+            format!(
+                "TASK: {task_prompt}\nPLAN: {plan}\n\n没有 Worker 提案。请直接完成:需要修改文件调用 write_file/edit_file 工具,验证调用 shell 工具,完成后直接以文本汇报。"
+            )
+        } else {
+            format!(
+                "TASK: {task_prompt}\nPLAN: {plan}\nWorker 提案如下(按顺序串行应用):\n{}\n\n逐个用 write_file/edit_file 工具应用到主工作区,再用 shell 工具验证,完成后直接以文本汇报。",
+                proposals.join("\n\n")
+            )
+        };
+        let continue_prompt = match &direct_first_result {
+            Some(p) => p.clone(),
+            None => apply_prompt,
+        };
+        let run = self.agent_loop_tools(
+            ledger,
+            &coord_run,
+            AgentRef::Coordinator,
+            &coord_system,
+            &mut ctx,
+            planning_turns + 1,
+            self.tools.clone(),
+            &continue_prompt,
+        );
+        self.finish_task(ledger, &coord_run, run)
     }
     /// 运行/恢复任务到终态(或 Interrupted)。返回最终 Task 状态。
     /// `ledger` 必须以 Arc 共享:Worker 线程克隆同一实例保证 seq 全局连续。
@@ -670,6 +1039,10 @@ impl Orchestrator {
         ledger: &Arc<Ledger>,
         task_prompt: &str,
     ) -> Result<TaskStatus, OrchestratorError> {
+        // spec 168:native_tools=true 走原生 tool-calls 全链路
+        if self.native_tools {
+            return self.run_task_native(ledger, task_prompt);
+        }
         let proj = ledger.fold_now().map_err(OrchestratorError::Ledger)?;
         let mut from = proj.status;
 
@@ -965,6 +1338,8 @@ impl Orchestrator {
                     worker_no,
                     subtask,
                     plan,
+                    false,
+                    Vec::new(),
                 )
             }));
         }
@@ -1326,6 +1701,8 @@ fn run_worker(
     worker_no: u8,
     subtask: String,
     plan: String,
+    native: bool,
+    tools: Vec<crate::provider::ToolDef>,
 ) -> Result<String, String> {
     let orchestrator = Orchestrator {
         provider,
@@ -1335,8 +1712,8 @@ fn run_worker(
         model,
         progress: None,
         on_delta: None,
-        native_tools: false,
-        tools: Vec::new(),
+        native_tools: native,
+        tools: tools.clone(),
     };
     let agent = AgentRef::Worker(worker_no);
     let run_id = AgentRunId::generate();
@@ -1366,14 +1743,21 @@ fn run_worker(
         return Err("aborted".into());
     }
 
-    let system = format!(
-        "你是 worker-{worker_no},只做只读分析,禁止修改任何文件。\n\
-         完成分析后返回 {{\"action\":\"message\",\"text\":\"<提案>\"}}。\n\
-         {}",
-        crate::tools::tool_manifest(Some(zealous_core::RiskTier::T0))
-    );
+    let system = if native {
+        format!("你是 worker-{worker_no},只做只读分析,禁止修改任何文件。\\n用提供的只读工具完成分析,完成后直接以文本给出完整提案(不调用工具)。\\n{}", crate::tools::tool_manifest(Some(zealous_core::RiskTier::T0)))
+    } else {
+        format!("你是 worker-{worker_no},只做只读分析,禁止修改任何文件。\\n完成分析后返回 {{\"action\":\"message\",\"text\":\"<提案>\"}}。\\n{}", crate::tools::tool_manifest(Some(zealous_core::RiskTier::T0)))
+    };
     let prompt = format!("OVERALL PLAN: {plan}\nYOUR SUBTASK: {subtask}");
-    match orchestrator.agent_loop(&ledger, &run_id, agent.clone(), &system, &prompt) {
+        let outcome = if native {
+            let mut ctx = LoopCtx {
+                transcript: Vec::new(),
+            };
+            orchestrator.agent_loop_tools(&ledger, &run_id, agent.clone(), &system, &mut ctx, 1, tools.clone(), &prompt)
+        } else {
+            orchestrator.agent_loop(&ledger, &run_id, agent.clone(), &system, &prompt)
+        };
+        match outcome {
         Ok(proposal) => {
             // 提案写任务隔离目录:框架行为,不经工具层(spec 30)
             let dir = task_dir.join("workers").join(format!("worker-{worker_no}"));
@@ -1965,5 +2349,14 @@ mod native_tools_tests {
             &e.payload,
             EventPayload::ToolCallCompleted { ok: true, .. }
         )));
+    }
+}
+
+/// spec 168:原生规划工具(plan/workers)
+fn plan_tool_def() -> crate::provider::ToolDef {
+    crate::provider::ToolDef {
+        name: "plan".into(),
+        description: "提交任务拆解计划:plan=执行步骤,workers=只读分析子任务列表(可为空)".into(),
+        parameters: r#"{"type":"object","properties":{"plan":{"type":"string"},"workers":{"type":"array","items":{"type":"string"}}},"required":["plan","workers"]}"#.into(),
     }
 }

@@ -356,7 +356,7 @@ fn handle_key(
                                 progress_sink.clone(),
                                 abort.clone(),
                                 true,
-            false,
+                                true,
                                 None,
                                 None,
                                 None,

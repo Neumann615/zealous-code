@@ -715,8 +715,8 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool, isolate: bool) -> i3
         model,
         progress: Some(Arc::new(CliProgress { quiet })),
             on_delta: None,
-            native_tools: false,
-            tools: Vec::new(),
+            native_tools: true,
+            tools: zealous_engine::tools::builtin_tool_defs(),
     };
     let mut title = proj.title.clone();
     if run_root != repo_root().unwrap_or_default() {

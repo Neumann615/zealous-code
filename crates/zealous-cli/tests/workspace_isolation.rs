@@ -26,6 +26,13 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn chat_body(content: &str) -> String {
+    // spec 168:native 消费者用预构造响应体(含 choices)直接透传;
+    // legacy 消费者的 JSON 动作按文本包装为 content
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if v.get("choices").is_some() {
+            return content.to_string();
+        }
+    }
     serde_json::json!({
         "choices": [{ "message": { "content": content } }]
     })
@@ -115,6 +122,30 @@ fn base_repo(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+fn native_tool_response(name: &str, args: &str) -> String {
+    serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": name, "arguments": args }
+                }]
+            }
+        }]
+    })
+    .to_string()
+}
+
+fn native_text_response(text: &str) -> String {
+    serde_json::json!({
+        "choices": [{ "message": { "role": "assistant", "content": text } }]
+    })
+    .to_string()
+}
 fn find_ledger(repo: &std::path::Path) -> Option<std::path::PathBuf> {
     let tasks = repo.join(".zealous").join("tasks");
     if let Ok(entries) = std::fs::read_dir(&tasks) {
@@ -160,9 +191,12 @@ fn run_task(repo: &std::path::Path, task_id: &str, endpoint: &str, isolate: bool
 fn cli_isolated_run_and_apply() {
     let repo = base_repo("cli");
     let script = vec![
-        r#"{"action":"plan","plan":"edit note.txt in worktree","workers":[]}"#.into(),
-        r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}}"#.into(),
-        r#"{"action":"message","text":"done"}"#.into(),
+    native_tool_response("plan", r#"{"plan":"edit note.txt in worktree","workers":[]}"#),
+    native_tool_response(
+        "edit_file",
+        r#"{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}"#,
+    ),
+    native_text_response("done"),
     ];
     let endpoint = mock_endpoint(script);
 
