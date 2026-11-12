@@ -222,6 +222,8 @@ pub struct Orchestrator {
     pub native_tools: bool,
     /// spec 164:声明给模型的工具(native_tools=true 时生效)
     pub tools: Vec<crate::provider::ToolDef>,
+    /// spec 171:steer 插话通道(运行中用户补上下文);None = 无
+    pub steer_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 /// 单 Agent 循环的上下文(内存中的对话转写;账本保存的是持久事实)。
@@ -475,6 +477,16 @@ impl Orchestrator {
             )
             .map_err(AgentLoopOutcome::Ledger)?;
             self.emit(false, format!("· [{agent}] turn {turn_no}"));
+                        if let Some(rx) = &self.steer_rx {
+                            loop {
+                                match rx.lock().unwrap().try_recv() {
+                                    Ok(msg) if !msg.is_empty() => {
+                                        ctx.transcript.push(crate::provider::ChatMessage::user(format!("用户插话: {msg}")));
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
             if let Some(p) = pending_user.take() {
                 ctx.transcript.push(crate::provider::ChatMessage::user(p));
             }
@@ -1952,6 +1964,8 @@ mod tests {
 
         let orch = Orchestrator {
             native_tools: false,
+            steer_rx: None,
+            steer_rx: None,
             tools: Vec::new(),
             provider: Arc::new(crate::provider::MockProvider::scripted(vec![
                 msg("straight answer"),
@@ -2094,6 +2108,7 @@ mod resume_ctx_tests {
         )]));
         let orch = Orchestrator {
             native_tools: false,
+            steer_rx: None,
             tools: Vec::new(),
             provider: mock.clone(),
             executor: Arc::new(ToolExecutor::new(
@@ -2186,6 +2201,7 @@ mod brief_prompt_tests {
         let mock = Arc::new(crate::provider::MockProvider::scripted(vec![msg("ok")]));
         let orch = Orchestrator {
             native_tools: false,
+            steer_rx: None,
             tools: Vec::new(),
             provider: mock.clone(),
             executor: Arc::new(ToolExecutor::new(
@@ -2231,6 +2247,7 @@ mod progress_tests {
         let sink2: SharedSink = sink.clone();
         let orch = Orchestrator {
             native_tools: false,
+            steer_rx: None,
             tools: Vec::new(),
             provider: Arc::new(crate::provider::MockProvider::scripted(vec![msg("done")])),
             executor: Arc::new(ToolExecutor::new(
@@ -2315,6 +2332,7 @@ mod native_tools_tests {
         ]);
         let orch = Orchestrator {
             native_tools: true,
+            steer_rx: None,
             tools: crate::tools::builtin_tool_defs(),
             provider: Arc::new(mock),
             executor: Arc::new(ToolExecutor::new(

@@ -154,6 +154,7 @@ pub fn run_serial(
             progress: progress.clone(),
             on_delta: None,
             native_tools: true,
+            steer_rx: None,
             tools: crate::tools::builtin_tool_defs(),
         };
         let ledger = Arc::new(ledger);

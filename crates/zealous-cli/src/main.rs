@@ -719,6 +719,7 @@ fn cmd_run(task_id: &str, yes: bool, no: bool, quiet: bool, isolate: bool) -> i3
         progress: Some(Arc::new(CliProgress { quiet })),
             on_delta: None,
             native_tools: true,
+            steer_rx: Some(rx.clone()),
             tools: zealous_engine::tools::builtin_tool_defs(),
     };
     let mut title = proj.title.clone();
@@ -2266,6 +2267,7 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
             progress: Some(Arc::new(CliProgress { quiet: false })),
             on_delta: Some(on_delta),
             native_tools: true,
+            steer_rx: None,
             tools: zealous_engine::tools::builtin_tool_defs(),
         };
         println!("---");

@@ -291,6 +291,7 @@ pub fn run_parallel(
             progress,
             on_delta: None,
             native_tools: true,
+            steer_rx: None,
             tools: crate::tools::builtin_tool_defs(),
         };
         // The prompt carries the task requirement captured during preparation.

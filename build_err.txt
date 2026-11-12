@@ -1,9 +1,0 @@
-﻿   Compiling zealous-cli v0.1.0 (D:\work\zealous-code\crates\zealous-cli)
-error: expected one of `.`, `;`, `?`, `}`, or an operator, found `=>`
-    --> crates\zealous-cli\src\main.rs:2241:60
-     |
-2241 |                 ProviderStreamEvent::ReasoningDelta(piece) => {
-     |                                                            ^^ expected one of `.`, `;`, `?`, `}`, or an operator
-
-error: could not compile `zealous-cli` (bin "zealous") due to 1 previous error
-
