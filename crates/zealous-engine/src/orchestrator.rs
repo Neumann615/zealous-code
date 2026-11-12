@@ -1966,7 +1966,6 @@ mod tests {
         let orch = Orchestrator {
             native_tools: false,
             steer_rx: None,
-            steer_rx: None,
             tools: Vec::new(),
             provider: Arc::new(crate::provider::MockProvider::scripted(vec![
                 msg("straight answer"),

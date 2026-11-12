@@ -127,7 +127,6 @@ fn orchestrator(
         on_delta: None,
         native_tools: false,
         steer_rx: None,
-        steer_rx: None,
         tools: Vec::new(),
     }
 }

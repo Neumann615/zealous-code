@@ -2148,6 +2148,7 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
                 match t.as_str() {
                     "/help" => {
                         println!("[commands] /help /new /task /status /usage /clear /exit");
+                        continue;
                     }
                     "/usage" => {
                         if let Some(tid) = &current_task {
@@ -2160,9 +2161,11 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
                                 println!("[usage] prompt={p} completion={c} total={tot} tokens");
                             }
                         } else { println!("(no session task)"); }
+                        continue;
                     }
                     "/clear" => {
                         // 清屏(不清账本)
+                        continue;
                     }
                     "/exit" | "/quit" => break,
                     "/new" => {
