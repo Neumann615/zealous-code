@@ -44,6 +44,9 @@ enum Cmd {
         /// 可选的首条消息;省略则进入交互输入
         #[arg(value_name = "MESSAGE")]
         message: Option<String>,
+        /// spec 170:显示思考流(灰色缩进;默认隐藏)
+        #[arg(long)]
+        show_thinking: bool,
     },
     /// 配置检查(Git 仓库 / Provider 配置;不回显密钥)
     Config {
@@ -411,7 +414,7 @@ fn main() {
             Ok(root) => serve::run_command(root),
             Err(e) => err(e),
         },
-        Cmd::Chat { message } => cmd_chat(message.as_deref()),
+        Cmd::Chat { message, show_thinking } => cmd_chat(message.as_deref(), show_thinking),
         Cmd::Task { cmd } => match cmd {
             TaskCmd::New { title, brief_file } => cmd_new(&title, brief_file.as_deref()),
             TaskCmd::List => cmd_list(),
@@ -2058,7 +2061,7 @@ fn chat_history_block(history: &[(String, String)]) -> String {
 
 /// spec 162: 对话 REPL。首条消息创建任务;后续消息在同一任务上 resume 续跑;
 /// 流式 delta 直写 stdout(通知通道,不落账本);事实源仍是事件账本。
-fn cmd_chat(initial: Option<&str>) -> i32 {
+fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
     let svc = match svc() {
         Ok(s) => s,
         Err(e) => return err(e),
@@ -2234,11 +2237,14 @@ fn cmd_chat(initial: Option<&str>) -> i32 {
         // ---- 运行(流式) ----
         abort.store(false, Ordering::Relaxed);
         let on_delta: Arc<dyn Fn(ProviderStreamEvent) + Send + Sync> = Arc::new(|ev| {
-            if let ProviderStreamEvent::TextDelta(piece) = ev {
-                print!("{piece}");
-                let _ = std::io::stdout().flush();
+        let on_delta: Arc<dyn Fn(ProviderStreamEvent) + Send + Sync> = Arc::new(move |ev| {
+            match ev {
+                ProviderStreamEvent::TextDelta(piece) => {
+                    print!("{piece}");
+                    let _ = std::io::stdout().flush();
+                }
+                _ => {}
             }
-            let _ = std::io::stdout().flush();
         });
         let approval = Arc::new(ChatApproval {
             rx: rx.clone(),
