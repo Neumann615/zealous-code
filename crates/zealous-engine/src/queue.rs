@@ -153,8 +153,8 @@ pub fn run_serial(
             model: model.clone(),
             progress: progress.clone(),
             on_delta: None,
-            native_tools: false,
-            tools: Vec::new(),
+            native_tools: true,
+            tools: crate::tools::builtin_tool_defs(),
         };
         let ledger = Arc::new(ledger);
         let status = match orchestrator.run_task(&ledger, &prompt) {

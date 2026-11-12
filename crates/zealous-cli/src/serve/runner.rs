@@ -148,7 +148,7 @@ pub fn spawn_worker(
             model,
             progress: Some(progress),
             on_delta: None,
-            native_tools: false,
+            native_tools: true,
             tools: zealous_engine::tools::builtin_tool_defs(),
         };
         let status = match orchestrator.run_task(&ledger, &prompt) {

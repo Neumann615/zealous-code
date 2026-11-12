@@ -32,6 +32,19 @@ fn chat_body(content: &str) -> String {
         if v.get("choices").is_some() {
             return content.to_string();
         }
+        if v["action"] == "plan" {
+            let args = serde_json::json!({ "plan": v["plan"], "workers": v["workers"] });
+            return tool_call_body("plan", &args.to_string());
+        }
+        if v["action"] == "tool" {
+            return tool_call_body(
+                v["tool"].as_str().unwrap_or_default(),
+                &v["args"].to_string(),
+            );
+        }
+        if v["action"] == "message" {
+            return text_body(v["text"].as_str().unwrap_or_default());
+        }
     }
     serde_json::json!({
         "choices": [{ "message": { "content": content } }]
@@ -120,6 +133,26 @@ fn base_repo(tag: &str) -> std::path::PathBuf {
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-q", "-m", "init"]);
     dir
+}
+
+fn tool_call_body(name: &str, arguments: &str) -> String {
+    serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{ "id": "call_1", "type": "function",
+                    "function": { "name": name, "arguments": arguments } }],
+            },
+        }],
+    })
+    .to_string()
+}
+
+fn text_body(text: &str) -> String {
+    serde_json::json!({ "choices": [{ "message": { "content": text } }] })
+    .to_string()
 }
 
 fn native_tool_response(name: &str, args: &str) -> String {

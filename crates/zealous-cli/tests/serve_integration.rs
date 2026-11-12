@@ -26,9 +26,45 @@ fn unique_dir(tag: &str) -> std::path::PathBuf {
 }
 
 fn chat_body(content: &str) -> String {
+    // spec 169:native 响应体透传;legacy JSON 动作 → 原生响应
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if v.get("choices").is_some() {
+            return content.to_string();
+        }
+        if v["action"] == "plan" {
+            let args = serde_json::json!({ "plan": v["plan"], "workers": v["workers"] });
+            return tool_call_body("plan", &args.to_string());
+        }
+        if v["action"] == "tool" {
+            return tool_call_body(
+                v["tool"].as_str().unwrap_or_default(),
+                &v["args"].to_string(),
+            );
+        }
+        if v["action"] == "message" {
+            return text_body(v["text"].as_str().unwrap_or_default());
+        }
+    }
+    text_body(content)
+}
+
+fn tool_call_body(name: &str, arguments: &str) -> String {
     serde_json::json!({
-        "choices": [{ "message": { "content": content } }]
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{ "id": "call_1", "type": "function",
+                    "function": { "name": name, "arguments": arguments } }],
+            },
+        }],
     })
+    .to_string()
+}
+
+fn text_body(text: &str) -> String {
+    serde_json::json!({ "choices": [{ "message": { "content": text } }] })
     .to_string()
 }
 
@@ -648,7 +684,7 @@ fn parallel_stage_endpoint() -> String {
         }
         let request = String::from_utf8_lossy(&raw).to_string();
         let one = request.contains("parallel one");
-        let content = if request.contains("tool `edit_file` result") {
+        let content = if request.contains("ok=") || request.contains("tool `edit_file` result") {
             r#"{"action":"message","text":"done"}"#
         } else if request.contains("edit target") {
             if one {
@@ -921,7 +957,7 @@ fn serve_conflict_endpoint() -> String {
             continue;
         }
         let left = request.contains("serve conflict left");
-        let content = if request.contains("tool `edit_file` result") {
+        let content = if request.contains("ok=") || request.contains("tool `edit_file` result") {
             r#"{"action":"message","text":"done"}"#
         } else if request.contains("edit conflict") {
             if left {
