@@ -125,6 +125,7 @@ pub fn spawn_run(
             progress: Some(progress_sink),
             on_delta,
             native_tools: native,
+            steer_rx: None,
             tools: if native {
                 zealous_engine::tools::builtin_tool_defs()
             } else {

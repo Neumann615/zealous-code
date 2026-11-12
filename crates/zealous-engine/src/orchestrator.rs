@@ -479,7 +479,7 @@ impl Orchestrator {
             self.emit(false, format!("· [{agent}] turn {turn_no}"));
                         if let Some(rx) = &self.steer_rx {
                             loop {
-                                match rx.lock().unwrap().try_recv() {
+                                match rx.try_recv() {
                                     Ok(msg) if !msg.is_empty() => {
                                         ctx.transcript.push(crate::provider::ChatMessage::user(format!("用户插话: {msg}")));
                                     }
@@ -1726,6 +1726,7 @@ fn run_worker(
         on_delta: None,
         native_tools: native,
         tools: tools.clone(),
+        steer_rx: None,
     };
     let agent = AgentRef::Worker(worker_no);
     let run_id = AgentRunId::generate();
