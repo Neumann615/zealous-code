@@ -896,6 +896,69 @@ fn handle_key(
                     if msg.is_empty() {
                         return;
                     }
+                    // spec 172:/ 命令拦截(不发给模型)
+                    if msg.starts_with("/") {
+                        state.chat_input.clear();
+                        match msg.as_str() {
+                            "/help" => {
+                                state.chat_entries.push(state::ChatEntry {
+                                    role: state::ChatRole::System,
+                                    text: "命令: /new 新会话 /task 任务id /status 状态 /usage 用量 /clear 清转录 /exit 退出".into(),
+                                });
+                            }
+                            "/new" => {
+                                state.chat_reset();
+                                state.chat_entries.push(state::ChatEntry {
+                                    role: state::ChatRole::System,
+                                    text: "会话已重置".into(),
+                                });
+                            }
+                            "/task" => {
+                                let text = state.chat_task.as_ref()
+                                    .map(|t| format!("当前任务: {}", t.as_str()))
+                                    .unwrap_or_else(|| "(无会话任务)".into());
+                                state.chat_entries.push(state::ChatEntry {
+                                    role: state::ChatRole::System,
+                                    text,
+                                });
+                            }
+                            "/status" => {
+                                match state.chat_task.as_ref().map(|t| svc.open_task(t)) {
+                                    Some(Ok((_, proj, _))) => state.chat_entries.push(state::ChatEntry {
+                                        role: state::ChatRole::System,
+                                        text: format!("状态: {:?}", proj.status),
+                                    }),
+                                    Some(Err(e)) => state.chat_entries.push(state::ChatEntry {
+                                        role: state::ChatRole::System,
+                                        text: format!("error: {e}"),
+                                    }),
+                                    None => state.chat_entries.push(state::ChatEntry {
+                                        role: state::ChatRole::System,
+                                        text: "(无会话任务)".into(),
+                                    }),
+                                }
+                            }
+                            "/usage" => {
+                                let usage_text = state.chat_task.as_ref()
+                                    .and_then(|t| svc.events(t).ok())
+                                    .map(|(evs, _)| {
+                                        let (p, c, tot): (u64, u64, u64) = evs.iter().filter_map(|e| match &e.payload {
+                                            zealous_core::EventPayload::UsageRecorded { prompt_tokens, completion_tokens, total_tokens, .. }
+                                                => Some((*prompt_tokens, *completion_tokens, *total_tokens)),
+                                            _ => None,
+                                        }).fold((0, 0, 0), |(a, b, c), (x, y, z)| (a + x, b + y, c + z));
+                                        format!("用量: prompt={p} completion={c} total={tot} tokens")
+                                    })
+                                    .unwrap_or_else(|| "(无会话任务)".into());
+                                state.chat_entries.push(state::ChatEntry {
+                                    role: state::ChatRole::System,
+                                    text: usage_text,
+                                });
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
                     state.chat_input.clear();
                     // 会话任务:首条消息以消息全文为 brief 建任务(direct 模式)
                     let tid = match state.chat_task.clone() {
