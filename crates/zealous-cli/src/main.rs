@@ -2236,12 +2236,16 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
 
         // ---- 运行(流式) ----
         abort.store(false, Ordering::Relaxed);
-        let on_delta: Arc<dyn Fn(ProviderStreamEvent) + Send + Sync> = Arc::new(|ev| {
         let on_delta: Arc<dyn Fn(ProviderStreamEvent) + Send + Sync> = Arc::new(move |ev| {
             match ev {
                 ProviderStreamEvent::TextDelta(piece) => {
                     print!("{piece}");
                     let _ = std::io::stdout().flush();
+                }
+                ProviderStreamEvent::ReasoningDelta(piece) => {
+                    if show_thinking {
+                        eprintln!("\x1b[2m  … {piece}\x1b[0m");
+                    }
                 }
                 _ => {}
             }
