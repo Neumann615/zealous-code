@@ -2146,6 +2146,24 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
                     continue;
                 }
                 match t.as_str() {
+                    "/help" => {
+                        println!("[commands] /help /new /task /status /usage /clear /exit");
+                    }
+                    "/usage" => {
+                        if let Some(tid) = &current_task {
+                            if let Ok((evs, _)) = svc.events(tid) {
+                                let (p, c, tot): (u64, u64, u64) = evs.iter().filter_map(|e| match &e.payload {
+                                    zealous_core::EventPayload::UsageRecorded { prompt_tokens, completion_tokens, total_tokens, .. }
+                                        => Some((*prompt_tokens, *completion_tokens, *total_tokens)),
+                                    _ => None,
+                                }).fold((0, 0, 0), |(a, b, c), (x, y, z)| (a + x, b + y, c + z));
+                                println!("[usage] prompt={p} completion={c} total={tot} tokens");
+                            }
+                        } else { println!("(no session task)"); }
+                    }
+                    "/clear" => {
+                        // 清屏(不清账本)
+                    }
                     "/exit" | "/quit" => break,
                     "/new" => {
                         current_task = None;

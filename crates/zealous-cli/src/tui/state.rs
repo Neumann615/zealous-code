@@ -150,7 +150,7 @@ impl Default for TuiState {
 impl TuiState {
     pub fn new() -> Self {
         Self {
-            screen: Screen::List,
+            screen: Screen::Chat,
             confirm: None,
             workspace_visible: false,
             queue_ids: Vec::new(),
