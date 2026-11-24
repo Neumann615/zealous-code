@@ -268,7 +268,7 @@ fn render_chat(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let mut lines: Vec<Line> = Vec::new();
     if state.chat_task.is_none() && state.chat_entries.is_empty() {
         lines.push(Line::from(Span::styled(
-            "输入第一条消息开始会话;Enter 发送,任务与账本自动落档。",
+            "输入消息开始会话 · Enter 发送 · /help 查看命令",
             Style::default().dark_gray(),
         )));
     }
@@ -347,7 +347,11 @@ fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
             .map(|s| format!("{s:?}"))
             .unwrap_or_else(|| "-".into());
         let run_state = if state.running { "运行中" } else { "空闲" };
-        if state.abort_requested {
+        if state.screen == Screen::Chat && !state.abort_requested {
+            Line::from(format!(
+                "[{run_state}] Enter 发送 · Esc 任务列表 · Ctrl+N 新会话 · ↑/↓ 滚动 · /help 命令"
+            ))
+        } else if state.abort_requested {
             Line::from(format!(
                 "[{run_state}] 已请求中断,等待引擎落账… 最终状态: {status}"
             ))
@@ -656,6 +660,7 @@ pub(crate) mod tests {
     #[test]
     fn empty_task_list_renders_placeholder() {
         let mut s = TuiState::new();
+        s.screen = Screen::List;
         s.refresh_tasks(vec![]);
         let text = render_to_string(&mut s);
         assert!(text.contains("(无任务)"), "{text}");
@@ -664,6 +669,7 @@ pub(crate) mod tests {
     #[test]
     fn task_list_renders_entries_and_selection() {
         let mut s = TuiState::new();
+        s.screen = Screen::List;
         s.refresh_tasks(vec![
             summary("task_aaa", zealous_core::TaskStatus::Queued, "first"),
             summary("task_bbb", zealous_core::TaskStatus::Running, "second"),
@@ -753,6 +759,7 @@ pub(crate) mod tests {
     #[test]
     fn error_does_not_hide_key_state() {
         let mut s = TuiState::new();
+        s.screen = Screen::List;
         s.refresh_tasks(vec![summary(
             "task_aaa",
             zealous_core::TaskStatus::Completed,

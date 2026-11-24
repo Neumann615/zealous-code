@@ -739,6 +739,11 @@ mod chat_state_tests {
     use super::*;
 
     #[test]
+    fn default_screen_is_chat() {
+        assert_eq!(TuiState::new().screen, Screen::Chat);
+    }
+
+    #[test]
     fn chat_history_prompt_empty_degrades_to_message() {
         let s = TuiState::new();
         assert_eq!(s.chat_history_prompt("你好"), "你好");

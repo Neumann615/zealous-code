@@ -73,6 +73,8 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
 
     let mut state = TuiState::new();
     refresh_task_list(&mut state, &svc);
+    // spec 165:启动即进聊天屏,先恢复最近会话(事实来自账本)
+    restore_chat_session(&mut state, &svc);
     // 启动校验(spec 90 收口):Provider 配置错误进错误弹窗,
     // 不阻塞浏览既有任务;运行 R 时会再次解析并失败
     if let Err(e) = zealous_engine::provider::ProviderConfig::resolve() {
@@ -276,6 +278,39 @@ pub(crate) fn apply_event(
             refresh_task_list(state, svc);
         }
     }
+}
+
+/// spec 165:恢复最近一次聊天会话(转录 + 压缩史 + 任务绑定;事实来自账本)。
+/// 已绑定会话或没有可恢复的转录时不动。
+fn restore_chat_session(state: &mut TuiState, svc: &TaskService) {
+    if state.chat_task.is_some() {
+        return;
+    }
+    let Ok(Some(tid)) = svc.latest_chat_task() else {
+        return;
+    };
+    let Ok(hist) = svc.chat_history(&tid) else {
+        return;
+    };
+    let Ok(tr) = svc.chat_transcript(&tid) else {
+        return;
+    };
+    if tr.is_empty() {
+        return;
+    }
+    for (is_user, text) in tr {
+        state.chat_entries.push(state::ChatEntry {
+            role: if is_user {
+                state::ChatRole::User
+            } else {
+                state::ChatRole::Assistant
+            },
+            text,
+        });
+    }
+    state.chat_history = hist;
+    state.chat_task = Some(tid);
+    state.chat_scroll = 0;
 }
 
 fn format_resolution(proposal: &zealous_engine::merge_resolution::Proposal) -> String {
@@ -637,20 +672,7 @@ fn handle_key(
             // spec 163:进入聊天屏
             KeyCode::Char('c') => {
                 // spec 165:进入聊天屏时恢复最近会话(事实来自账本)
-                if state.chat_task.is_none() {
-                    if let Ok(Some(tid)) = svc.latest_chat_task() {
-                        if let (Ok(hist), Ok(tr)) = (svc.chat_history(&tid), svc.chat_transcript(&tid)) {
-                            for (is_user, text) in tr {
-                                state.chat_entries.push(state::ChatEntry {
-                                    role: if is_user { state::ChatRole::User } else { state::ChatRole::Assistant },
-                                    text,
-                                });
-                            }
-                            state.chat_history = hist;
-                            state.chat_task = Some(tid);
-                        }
-                    }
-                }
+                restore_chat_session(state, svc);
                 state.screen = Screen::Chat;
             }
             KeyCode::Char('A') if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -903,7 +925,7 @@ fn handle_key(
                             "/help" => {
                                 state.chat_entries.push(state::ChatEntry {
                                     role: state::ChatRole::System,
-                                    text: "命令: /new 新会话 /task 任务id /status 状态 /usage 用量 /clear 清转录 /exit 退出".into(),
+                                    text: "命令: /new 新会话 /task 任务id /status 状态 /usage 用量 /clear 清转录 /exit 任务列表".into(),
                                 });
                             }
                             "/new" => {
@@ -955,7 +977,25 @@ fn handle_key(
                                     text: usage_text,
                                 });
                             }
-                            _ => {}
+                            "/clear" => {
+                                // 只清转录显示;会话任务、对话史与账本都保留
+                                state.chat_entries.clear();
+                                state.chat_scroll = 0;
+                                state.chat_entries.push(state::ChatEntry {
+                                    role: state::ChatRole::System,
+                                    text: "转录区已清空(会话与账本保留)".into(),
+                                });
+                            }
+                            "/exit" | "/quit" => {
+                                // 退出聊天屏回到任务列表;退出整个 TUI 用 q
+                                state.screen = Screen::List;
+                            }
+                            other => {
+                                state.chat_entries.push(state::ChatEntry {
+                                    role: state::ChatRole::System,
+                                    text: format!("未知命令: {other}(输入 /help 查看可用命令)"),
+                                });
+                            }
                         }
                         return;
                     }
