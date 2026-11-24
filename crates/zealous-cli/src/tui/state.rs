@@ -162,8 +162,16 @@ pub struct TuiState {
     pub chat_scroll: usize,
     /// spec 163:会话任务(首条消息创建,后续 resume)
     pub chat_task: Option<TaskId>,
-    /// spec 163:压缩对话史 (user, assistant)
+    /// spec 163:压缩对话史 (user, assistant);/compact 之后只含摘要之后的轮次
     pub chat_history: Vec<(String, String)>,
+    /// spec 173:最近一次 /compact 生成的对话摘要(账本事实;注入后续 prompt)
+    pub chat_summary: Option<String>,
+    /// spec 173:/model <name> 设置的会话级模型覆盖(只影响后续运行,不写配置)
+    pub chat_model_override: Option<String>,
+    /// spec 173:/compact 进行中(等待模型返回摘要)
+    pub chat_compacting: bool,
+    /// spec 173:/ 补全菜单里高亮的候选下标(渲染时按候选数取模)
+    pub chat_menu_selected: usize,
     /// spec 163:当前 run 是否在流式输出中
     pub chat_streaming: bool,
     /// spec 173:call_id → chat_entries 下标(账本事件归并用)
@@ -222,6 +230,10 @@ impl TuiState {
             chat_scroll: 0,
             chat_task: None,
             chat_history: Vec::new(),
+            chat_summary: None,
+            chat_model_override: None,
+            chat_compacting: false,
+            chat_menu_selected: 0,
             chat_streaming: false,
             chat_tool_index: std::collections::HashMap::new(),
             chat_event_cursor: 0,
@@ -415,10 +427,27 @@ impl TuiState {
 
     pub fn chat_input_char(&mut self, c: char) {
         self.chat_input.push(c);
+        self.chat_menu_selected = 0;
     }
 
     pub fn chat_input_backspace(&mut self) {
         self.chat_input.pop();
+        self.chat_menu_selected = 0;
+    }
+
+    /// spec 173:/ 补全菜单里移动高亮(down = 向下)。
+    /// 返回 false 表示菜单没有多个候选(调用方按普通滚动处理)。
+    pub fn chat_menu_move(&mut self, down: bool) -> bool {
+        let n = self.chat_completions().len();
+        if n <= 1 {
+            return false;
+        }
+        self.chat_menu_selected = match (down, self.chat_menu_selected) {
+            (true, i) => (i + 1) % n,
+            (false, 0) => n - 1,
+            (false, i) => i - 1,
+        };
+        true
     }
 
     /// 发送用户消息:转录入条目 + 助手流式条目占位;返回要发送的文本
@@ -532,23 +561,46 @@ impl TuiState {
         self.chat_scroll = self.chat_scroll.saturating_sub(page);
     }
 
-    /// spec 162 §5:压缩对话史注入(最近 4 对,单条 600 字)
+    /// spec 162 §5 / 173:对话上下文注入 prompt。
+    /// = 用户消息 + [/compact 摘要] + 最近 4 对原文(单条 600 字)
     pub fn chat_history_prompt(&self, msg: &str) -> String {
-        if self.chat_history.is_empty() {
+        let summary = self
+            .chat_summary
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| chat_truncate_str(s, CHAT_SUMMARY_MAX_CHARS));
+        // 没有任何上下文时原样发送,不改写用户消息
+        if summary.is_none() && self.chat_history.is_empty() {
             return msg.to_string();
         }
-        const MAX_PAIRS: usize = 4;
-        const MAX_CHARS: usize = 600;
-        let start = self.chat_history.len().saturating_sub(MAX_PAIRS);
-        let mut hist = String::new();
-        for (u, a) in &self.chat_history[start..] {
-            hist.push_str(&format!(
-                "user: {}\nassistant: {}\n",
-                chat_truncate_str(u, MAX_CHARS),
-                chat_truncate_str(a, MAX_CHARS)
-            ));
+        let mut out = format!("用户消息: {msg}");
+        if let Some(summary) = summary {
+            out.push_str("\n\n[此前对话摘要(/compact)]:\n");
+            out.push_str(&summary);
         }
-        format!("用户消息: {}\n\n[历史对话(压缩参考)]:\n{}", msg, hist)
+        if !self.chat_history.is_empty() {
+            out.push_str("\n\n[历史对话(压缩参考)]:\n");
+            out.push_str(&chat_history_block(&self.chat_history));
+        }
+        out
+    }
+
+    /// spec 173:当前 / 补全候选(输入以 / 开头且未输入参数时)
+    pub fn chat_completions(&self) -> Vec<String> {
+        crate::commands::complete(&self.chat_input)
+    }
+
+    /// spec 173:补全菜单里实际高亮的候选
+    pub fn chat_menu_choice(&self) -> Option<usize> {
+        let n = self.chat_completions().len();
+        (n > 0).then(|| self.chat_menu_selected % n)
+    }
+
+    /// spec 173:用候选替换输入(Tab 补全)
+    pub fn chat_apply_completion(&mut self, candidate: &str) {
+        self.chat_input = candidate.to_string();
+        self.chat_menu_selected = 0;
+        self.chat_scroll = 0;
     }
 
     /// /new 语义:清空会话(任务与账本不动)
@@ -561,6 +613,10 @@ impl TuiState {
         self.chat_last_sync = None;
         self.chat_task = None;
         self.chat_history.clear();
+        self.chat_summary = None;
+        self.chat_compacting = false;
+        self.chat_menu_selected = 0;
+        // chat_model_override 跨会话保留:/model 切换的是"后续运行"的模型
         self.chat_streaming = false;
     }
 
@@ -795,6 +851,25 @@ mod scroll_tests {
     }
 }
 
+/// spec 173:注入 prompt 的摘要上限(字符)
+const CHAT_SUMMARY_MAX_CHARS: usize = 3000;
+
+/// spec 162 §5:最近几对原文,单条截断
+fn chat_history_block(history: &[(String, String)]) -> String {
+    const MAX_PAIRS: usize = 4;
+    const MAX_CHARS: usize = 600;
+    let start = history.len().saturating_sub(MAX_PAIRS);
+    let mut hist = String::new();
+    for (u, a) in &history[start..] {
+        hist.push_str(&format!(
+            "user: {}\nassistant: {}\n",
+            chat_truncate_str(u, MAX_CHARS),
+            chat_truncate_str(a, MAX_CHARS)
+        ));
+    }
+    hist
+}
+
 fn chat_truncate_str(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -842,6 +917,45 @@ mod chat_state_tests {
         assert!(p.contains("user: q1"));
         assert!(p.contains("assistant: a1"));
         assert!(p.contains("用户消息: q2"));
+    }
+
+    #[test]
+    fn summary_is_injected_before_recent_pairs() {
+        let mut s = TuiState::new();
+        assert_eq!(s.chat_history_prompt("你好"), "你好", "没有任何上下文时原样发送");
+        s.chat_history.push(("q1".into(), "a1".into()));
+        s.chat_summary = Some("之前做过的事".into());
+        let p = s.chat_history_prompt("q2");
+        let summary_at = p.find("[此前对话摘要(/compact)]:\n之前做过的事").expect("摘要块");
+        let history_at = p.find("[历史对话(压缩参考)]:").expect("历史块");
+        assert!(summary_at < history_at, "摘要应排在最近对话之前: {p}");
+        assert!(p.contains("user: q1") && p.contains("assistant: a1"));
+        assert!(p.ends_with("assistant: a1\n"), "{p}");
+    }
+
+    #[test]
+    fn completion_menu_wraps_selection_and_tab_fills_input() {
+        let mut s = TuiState::new();
+        s.chat_input = "/c".into();
+        let cands = s.chat_completions();
+        assert_eq!(cands, vec!["/context", "/compact", "/clear"]);
+        s.chat_menu_selected = 5; // 5 % 3 = 2
+        assert_eq!(s.chat_menu_choice(), Some(2));
+        s.chat_apply_completion(&cands[2]);
+        assert_eq!(s.chat_input, "/clear");
+        assert_eq!(s.chat_menu_selected, 0);
+        assert!(s.chat_completions().is_empty(), "已完整输入不再有候选");
+        assert_eq!(s.chat_menu_choice(), None);
+    }
+
+    #[test]
+    fn model_override_survives_new_session() {
+        let mut s = TuiState::new();
+        s.chat_model_override = Some("glm-5.3".into());
+        s.chat_summary = Some("x".into());
+        s.chat_reset();
+        assert_eq!(s.chat_model_override.as_deref(), Some("glm-5.3"));
+        assert_eq!(s.chat_summary, None);
     }
 
     #[test]

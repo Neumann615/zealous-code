@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+mod commands;
 mod serve;
 mod tui;
 use zealous_core::{ApprovalDecision, TaskStatus};
@@ -2048,6 +2049,14 @@ fn chat_truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// 当前会话任务的账本事件(/usage /context 等查询类命令用)
+fn chat_session_events(
+    svc: &TaskService,
+    task: Option<&zealous_core::TaskId>,
+) -> Option<Vec<zealous_core::TaskEvent>> {
+    task.and_then(|t| svc.events(t).ok()).map(|(evs, _)| evs)
+}
+
 /// 压缩对话史:仅保留最近几对,单条截断(spec 162 §5 跨 Run 上下文)
 fn chat_history_block(history: &[(String, String)]) -> String {
     const MAX_PAIRS: usize = 4;
@@ -2067,7 +2076,7 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
         Ok(s) => s,
         Err(e) => return err(e),
     };
-    let config = match ProviderConfig::resolve() {
+    let mut config = match ProviderConfig::resolve() {
         Ok(c) => c,
         Err(e) => {
             return err(format!(
@@ -2076,7 +2085,7 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
         }
     };
     println!(
-        "zealous chat - {} model={} (/new 新会话 /task 任务 id /status 状态 /exit 退出)",
+        "zealous chat - {} model={} (/help 查看命令)",
         config.base_url, config.model
     );
 
@@ -2110,15 +2119,19 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
 
     let mut current_task: Option<zealous_core::TaskId> = None;
     let mut history: Vec<(String, String)> = Vec::new();
+    // spec 173:/compact 生成的摘要(随会话恢复)
+    let mut summary: Option<String> = None;
 
-    // spec 165:启动恢复最近聊天会话(事实来自账本)
+    // spec 165/173:启动恢复最近聊天会话(对话史 + 摘要;事实来自账本)
     if let Ok(Some(tid)) = svc.latest_chat_task() {
-        if let Ok(hist) = svc.chat_history(&tid) {
-            if !hist.is_empty() {
-                history = hist;
-                current_task = Some(tid.clone());
-                println!("[已恢复会话 {} · {} 轮]", tid.as_str(), history.len());
-            }
+        let hist = svc.chat_history(&tid).unwrap_or_default();
+        let sm = svc.chat_summary(&tid).ok().flatten();
+        if !hist.is_empty() || sm.is_some() {
+            let turns = hist.len();
+            history = hist;
+            summary = sm;
+            current_task = Some(tid.clone());
+            println!("[已恢复会话 {} · {} 轮]", tid.as_str(), turns);
         }
     }
     let mut first = initial.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -2145,55 +2158,150 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
                 if t.is_empty() {
                     continue;
                 }
-                match t.as_str() {
-                    "/help" => {
-                        println!("[commands] /help /new /task /status /usage /clear /exit");
-                        continue;
-                    }
-                    "/usage" => {
-                        if let Some(tid) = &current_task {
-                            if let Ok((evs, _)) = svc.events(tid) {
-                                let (p, c, tot): (u64, u64, u64) = evs.iter().filter_map(|e| match &e.payload {
-                                    zealous_core::EventPayload::UsageRecorded { prompt_tokens, completion_tokens, total_tokens, .. }
-                                        => Some((*prompt_tokens, *completion_tokens, *total_tokens)),
-                                    _ => None,
-                                }).fold((0, 0, 0), |(a, b, c), (x, y, z)| (a + x, b + y, c + z));
-                                println!("[usage] prompt={p} completion={c} total={tot} tokens");
+                // spec 172/173:聊天命令(与 TUI 共用 commands.rs 的命令表与解析)
+                if let Some(parsed) = commands::parse(&t) {
+                    use commands::Command;
+                    match parsed {
+                        Err(msg) => println!("[{msg}]"),
+                        Ok((cmd, arg)) => match cmd {
+                            Command::Help => println!("{}", commands::help_text()),
+                            Command::New => {
+                                current_task = None;
+                                history.clear();
+                                summary = None;
+                                println!("[session reset]");
                             }
-                        } else { println!("(no session task)"); }
-                        continue;
+                            Command::Task => println!(
+                                "{}",
+                                current_task
+                                    .as_ref()
+                                    .map(|t| t.as_str().to_string())
+                                    .unwrap_or_else(|| "(none)".into())
+                            ),
+                            Command::Status => match current_task.as_ref().map(|t| svc.open_task(t)) {
+                                Some(Ok((_, proj, _))) => println!("status: {:?}", proj.status),
+                                Some(Err(e)) => println!("error: {e}"),
+                                None => println!("(no session task)"),
+                            },
+                            Command::Usage => println!(
+                                "{}",
+                                chat_session_events(&svc, current_task.as_ref())
+                                    .map(|evs| commands::usage_text(&evs))
+                                    .unwrap_or_else(|| "(no session task)".into())
+                            ),
+                            Command::Context => println!(
+                                "{}",
+                                chat_session_events(&svc, current_task.as_ref())
+                                    .map(|evs| commands::context_text(&evs, history.len()))
+                                    .unwrap_or_else(|| "(no session task)".into())
+                            ),
+                            Command::Model => {
+                                if arg.is_empty() {
+                                    println!("model: {} (endpoint: {})", config.model, config.base_url);
+                                } else {
+                                    config.model = arg.clone();
+                                    println!("[model] 后续运行使用 {arg}(仅本次 REPL 生效,不改配置)");
+                                }
+                            }
+                            Command::Clear => {
+                                // 清屏(不清账本与对话史)
+                                print!("\x1b[2J\x1b[H");
+                                let _ = std::io::stdout().flush();
+                            }
+                            Command::Exit => break,
+                            Command::Resume => {
+                                let sessions = match svc.chat_sessions() {
+                                    Ok(list) => list,
+                                    Err(e) => {
+                                        println!("[error] 读取会话列表失败: {e}");
+                                        continue;
+                                    }
+                                };
+                                if arg.is_empty() {
+                                    println!("{}", commands::resume_text(&sessions, current_task.as_ref()));
+                                    continue;
+                                }
+                                match commands::pick_session(&sessions, &arg) {
+                                    Err(msg) => println!("[{msg}]"),
+                                    Ok(target) => {
+                                        let tid = target.task_id.clone();
+                                        let loaded = svc
+                                            .chat_history(&tid)
+                                            .and_then(|h| svc.chat_summary(&tid).map(|sm| (h, sm)))
+                                            .and_then(|x| svc.chat_transcript(&tid).map(|tr| (x, tr)));
+                                        let ((hist, sm), tr) = match loaded {
+                                            Ok(x) => x,
+                                            Err(e) => {
+                                                println!("[error] 读取会话失败: {e}");
+                                                continue;
+                                            }
+                                        };
+                                        current_task = Some(tid.clone());
+                                        history = hist;
+                                        summary = sm;
+                                        println!(
+                                            "[已切换到会话 {} · {} 轮]",
+                                            commands::short_task_id(tid.as_str()),
+                                            target.turns
+                                        );
+                                        if let Some(sm) = summary.as_deref().filter(|x| !x.is_empty()) {
+                                            println!("[此前摘要] {}", chat_truncate(sm, 300));
+                                        }
+                                        // 转录回放:最近 6 条
+                                        for (is_user, text) in tr.iter().rev().take(6).rev() {
+                                            println!(
+                                                "{} {}",
+                                                if *is_user { "user:" } else { "assistant:" },
+                                                chat_truncate(text, 300)
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Command::Compact => {
+                                if history.is_empty() {
+                                    println!("[compact] 没有新的对话可压缩");
+                                    continue;
+                                }
+                                let Some(tid) = current_task.clone() else {
+                                    println!("[error] 没有会话任务");
+                                    continue;
+                                };
+                                println!("[compact] 正在压缩 {} 轮对话…", history.len());
+                                let provider = OpenAiCompatProvider::new(config.clone());
+                                match zealous_engine::task_service::summarize_history(
+                                    &provider,
+                                    &config.model,
+                                    &history,
+                                    summary.as_deref(),
+                                ) {
+                                    Ok(new_summary) => {
+                                        match svc.append_chat_compacted(
+                                            &tid,
+                                            &new_summary,
+                                            history.len() as u64,
+                                        ) {
+                                            Ok(()) => {
+                                                println!(
+                                                    "[compact] 已压缩 {} 轮对话:\n{new_summary}",
+                                                    history.len()
+                                                );
+                                                history.clear();
+                                                summary = Some(new_summary);
+                                            }
+                                            Err(e) => {
+                                                println!("[error] 摘要落账失败: {e}(对话史未变)")
+                                            }
+                                        }
+                                    }
+                                    Err(e) => println!("[error] 压缩失败: {e}(对话史未变)"),
+                                }
+                            }
+                        },
                     }
-                    "/clear" => {
-                        // 清屏(不清账本)
-                        continue;
-                    }
-                    "/exit" | "/quit" => break,
-                    "/new" => {
-                        current_task = None;
-                        history.clear();
-                        println!("[session reset]");
-                        continue;
-                    }
-                    "/task" => {
-                        println!(
-                            "{}",
-                            current_task
-                                .as_ref()
-                                .map(|t| t.as_str().to_string())
-                                .unwrap_or_else(|| "(none)".into())
-                        );
-                        continue;
-                    }
-                    "/status" => {
-                        match current_task.as_ref().map(|t| svc.open_task(t)) {
-                            Some(Ok((_, proj, _))) => println!("status: {:?}", proj.status),
-                            Some(Err(e)) => println!("error: {e}"),
-                            None => println!("(no session task)"),
-                        }
-                        continue;
-                    }
-                    _ => t,
+                    continue;
                 }
+                t
             }
         };
 
@@ -2246,14 +2354,21 @@ fn cmd_chat(initial: Option<&str>, show_thinking: bool) -> i32 {
                 }
             };
         // 后续消息:压缩对话史随 prompt 注入(resume 路径同时注入投影摘要)
-        let task_prompt = if history.is_empty() {
+        // spec 173:摘要(/compact)+ 最近几对原文一起注入
+        let task_prompt = if history.is_empty() && summary.is_none() {
             input.clone()
         } else {
-            format!(
-                "用户消息: {}\n\n[历史对话(压缩参考)]:\n{}",
-                input,
-                chat_history_block(&history)
-            )
+            let mut prompt = format!("用户消息: {input}");
+            if let Some(sm) = summary.as_deref().filter(|x| !x.is_empty()) {
+                prompt.push_str(&format!("\n\n[此前对话摘要(/compact)]:\n{sm}"));
+            }
+            if !history.is_empty() {
+                prompt.push_str(&format!(
+                    "\n\n[历史对话(压缩参考)]:\n{}",
+                    chat_history_block(&history)
+                ));
+            }
+            prompt
         };
 
         // ---- 运行(流式) ----

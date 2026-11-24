@@ -702,3 +702,202 @@ fn e2e_spec154_tools_sequence() {
         "search_text 结果应含 helper.rs 正则匹配"
     );
 }
+
+/// 同时支持流式(请求体带 "stream":true → SSE)与非流式(JSON)请求的 mock。
+/// REPL 的对话轮次走流式,/compact 的摘要调用走非流式,同一个端点按请求顺序出队。
+fn sse_json_endpoint(script: Vec<String>) -> String {
+    let counter = AtomicU32::new(0);
+    let script: Mutex<Vec<String>> = Mutex::new(script);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let Ok((mut stream, _)) = listener.accept() else {
+            break;
+        };
+        // 读完整个请求(头部 + Content-Length 体)
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            raw.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&raw);
+            if let Some(h) = text.find("\r\n\r\n") {
+                let len = text
+                    .split("\r\n")
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= h + 4 + len {
+                    break;
+                }
+            }
+        }
+        let body_text = String::from_utf8_lossy(&raw);
+        let streaming = body_text.contains("\"stream\":true");
+        let idx = counter.fetch_add(1, Ordering::Relaxed) as usize;
+        let content = {
+            let script = script.lock().unwrap();
+            if idx < script.len() {
+                script[idx].clone()
+            } else {
+                "guard".into()
+            }
+        };
+        let (ctype, body) = if streaming {
+            let frame = serde_json::json!({
+                "choices": [{ "index": 0, "delta": { "content": content } }]
+            });
+            let frame2 = serde_json::json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18 }
+            });
+            (
+                "text/event-stream",
+                format!("data: {frame}\n\ndata: {frame2}\n\ndata: [DONE]\n\n"),
+            )
+        } else {
+            (
+                "application/json",
+                serde_json::json!({ "choices": [{ "message": { "role": "assistant", "content": content } }] })
+                    .to_string(),
+            )
+        };
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        );
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut sink = [0u8; 4096];
+        while let Ok(n) = stream.read(&mut sink) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+/// spec 172/173:REPL(zealous chat)与 TUI 共用同一套 / 命令表。
+/// 跑一轮真实对话(流式 mock),再逐条验证查询、切换、压缩、出错提示。
+#[test]
+fn e2e_chat_repl_slash_commands() {
+    let repo = unique_dir("chat-repl");
+    let out = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .output()
+        .expect("git init");
+    assert!(out.status.success(), "git init: {:?}", out.stderr);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+
+    // 第 1 条:对话应答(流式);第 2 条:/compact 的摘要(非流式)
+    let endpoint = sse_json_endpoint(vec!["第一答".into(), "摘要: 用户打了招呼".into()]);
+    let zealous = env!("CARGO_BIN_EXE_zealous");
+    let mut child = Command::new(zealous)
+        .arg("chat")
+        .current_dir(&repo)
+        .env("ZEALOUS_BASE_URL", &endpoint)
+        .env("ZEALOUS_API_KEY", "e2e-secret-key")
+        .env("ZEALOUS_MODEL", "repl-model")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn chat");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(
+            b"/help\n\
+              /nope\n\
+              /context\n\
+              \xe4\xbd\xa0\xe5\xa5\xbd\n\
+              /context\n\
+              /usage\n\
+              /task\n\
+              /status\n\
+              /resume\n\
+              /model\n\
+              /model foo\n\
+              /compact\n\
+              /compact\n\
+              /new\n\
+              /task\n\
+              /resume 1\n\
+              /resume 7\n\
+              /exit\n",
+        )
+        .expect("write stdin");
+    drop(stdin);
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout");
+    let reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut s = String::new();
+        let _ = stdout_pipe.read_to_string(&mut s);
+        s
+    });
+    let mut stderr_pipe = child.stderr.take().expect("stderr");
+    let err_reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+    let status = wait_exit(child, 60);
+    let stdout = reader.join().unwrap();
+    let stderr = err_reader.join().unwrap();
+    assert!(status.success(), "exit {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // stdin 是管道时没有键入回显,命令输出紧跟在 "you> " 提示后面:取行时去掉提示前缀
+    let line = |needle: &str| -> String {
+        stdout
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("输出缺少 {needle:?}:\n{stdout}"))
+            .strip_prefix("you> ")
+            .unwrap_or_else(|| stdout.lines().find(|l| l.contains(needle)).unwrap())
+            .to_string()
+    };
+    // 没有会话时的查询提示
+    assert!(line("(no session task)").contains("(no session task)"));
+    // 未知命令:提示且不发给模型
+    assert!(line("未知命令: /nope").contains("输入 /help 查看可用命令"));
+    // 一轮真实对话
+    assert!(line("[assistant] 第一答").contains("第一答"));
+    // 查询类命令读账本:1 轮、累计用量
+    let ctx = line("上下文:");
+    assert!(ctx.contains("上下文: 1 轮 · 对话史 1 条 · 累计 18 tokens(prompt 11 / completion 7)"), "{ctx}");
+    // 第二行是另起一行输出
+    assert!(stdout.contains("最近一次 prompt: 11 tokens · 模型调用 1 次"), "{stdout}");
+    assert_eq!(line("用量:").trim(), "用量: prompt=11 completion=7 total=18 tokens");
+    assert!(line("status:").contains("Completed"));
+    assert!(line("task_").contains("task_"));
+    // /resume:列表;越界序号有明确提示
+    let list = line("1. ");
+    assert!(list.contains("你好") && list.contains("1 轮") && list.contains("当前"), "{list}");
+    assert!(line("没有第 7 个会话").contains("共 1 个"));
+    // /model:查看与切换
+    assert!(line("model: ").contains("repl-model"));
+    assert!(line("[model] 后续运行使用 foo").contains("foo"));
+    // /compact:生成摘要并落账;再次压缩提示没有新对话
+    assert!(line("[compact] 已压缩 1 轮对话:").contains("已压缩 1 轮对话"));
+    assert!(line("摘要: 用户打了招呼").contains("摘要: 用户打了招呼"));
+    assert!(line("没有新的对话可压缩").contains("没有新的对话可压缩"));
+    // /new 清空会话;/resume 1 切回,摘要与转录从账本恢复
+    assert!(stdout.contains("[session reset]"));
+    assert!(line("(none)").contains("(none)"));
+    assert!(line("[此前摘要]").contains("摘要: 用户打了招呼"));
+    assert!(line("assistant: 第一答").contains("第一答"));
+    let _ = std::fs::remove_dir_all(repo);
+}

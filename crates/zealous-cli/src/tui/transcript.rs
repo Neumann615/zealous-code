@@ -144,6 +144,18 @@ pub(crate) fn replay(state: &mut TuiState, events: &[TaskEvent], include_text: b
                     card.output = output_summary.clone();
                 }
             }
+            // spec 173:/compact 的摘要取代此前的对话史;转录里留一条可回放的记录
+            EventPayload::ChatCompacted { summary, turns } => {
+                state.chat_history.clear();
+                state.chat_summary = Some(summary.clone());
+                let mut text = format!("✂ 已压缩 {turns} 轮对话为摘要:");
+                for l in summary.lines() {
+                    text.push_str("\n      ");
+                    text.push_str(l);
+                }
+                state.chat_entries.push(ChatEntry::system(text));
+                state.chat_scroll = 0;
+            }
             EventPayload::TaskInterrupted { reason } => {
                 let note = format!("已中断: {reason}");
                 finalize_unfinished(state, &note);
@@ -307,6 +319,32 @@ mod tests {
         assert_eq!(cards[0].state, ChatToolState::Ok);
         assert_eq!(cards[1].state, ChatToolState::Failed);
         assert!(cards[1].output.contains("user abort"), "{}", cards[1].output);
+    }
+
+    #[test]
+    fn compaction_replaces_history_with_summary_and_is_replayed() {
+        let mut s = TuiState::new();
+        s.chat_history.push(("q1".into(), "a1".into()));
+        let c = ToolCallId::generate();
+        let events = vec![
+            requested(&c, "read_file", "{}", RiskTier::T0),
+            completed(&c, true, "ok"),
+            ev(EventPayload::ChatCompacted { summary: "摘要\n第二行".into(), turns: 1 }),
+        ];
+        // 运行中同步(不回放文本):对话史清空,摘要到位,转录多一条压缩记录
+        replay(&mut s, &events, false);
+        assert!(s.chat_history.is_empty());
+        assert_eq!(s.chat_summary.as_deref(), Some("摘要\n第二行"));
+        let last = s.chat_entries.last().unwrap();
+        assert_eq!(last.role, ChatRole::System);
+        assert_eq!(last.text, "✂ 已压缩 1 轮对话为摘要:\n      摘要\n      第二行");
+        // 工具卡片不受影响
+        assert_eq!(s.chat_entries.len(), 2);
+        // 重启恢复(回放文本)得到同一条记录
+        let mut fresh = TuiState::new();
+        replay(&mut fresh, &events, true);
+        assert_eq!(fresh.chat_entries.last().unwrap().text, last.text);
+        assert_eq!(fresh.chat_summary.as_deref(), Some("摘要\n第二行"));
     }
 
     #[test]

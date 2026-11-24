@@ -239,6 +239,13 @@ pub enum EventPayload {
     ChatUserTurn {
         text: String,
     },
+    /// spec 173:/compact 的产物。对话史被模型压缩成摘要并作为账本事实持久化;
+    /// 其后的 ChatUserTurn / MessageCompleted 从头累计,摘要取代此前全部轮次
+    ChatCompacted {
+        summary: String,
+        /// 被摘要覆盖的轮数
+        turns: u64,
+    },
     /// spec 164:单轮模型用量(与转录分离;记 token 不产生转录行)
     UsageRecorded {
         run_id: AgentRunId,

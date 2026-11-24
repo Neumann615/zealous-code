@@ -313,6 +313,18 @@ impl TaskService {
     }
 }
 
+/// spec 173:聊天会话列表项(/resume 用)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSession {
+    pub task_id: TaskId,
+    /// 首条用户输入(截断)作为标题;没有对话时退回任务标题
+    pub title: String,
+    /// 用户轮数(ChatUserTurn 条数)
+    pub turns: u64,
+    /// 最近一条账本事件的时间(RFC3339)
+    pub last_ts: String,
+}
+
 impl TaskService {
 // ---- 聊天会话(spec 165)----
 
@@ -330,32 +342,65 @@ pub fn create_chat_task(
     Ok(outcome)
 }
 
-/// 最近一个聊天会话任务(TaskId 倒序扫描;spec 165)
-pub fn latest_chat_task(&self) -> Result<Option<TaskId>, ServiceError> {
-    let (mut items, _) = self.list_tasks()?;
-    items.sort_by(|a, b| b.task_id.as_str().cmp(a.task_id.as_str()));
+/// 聊天会话列表,按最近活动倒序。单个账本损坏的会话跳过。
+pub fn chat_sessions(&self) -> Result<Vec<ChatSession>, ServiceError> {
+    let (items, _) = self.list_tasks()?;
+    let mut out = Vec::new();
     for s in items {
-        if self.is_chat_task(&s.task_id)? {
-            return Ok(Some(s.task_id));
+        let Ok((evs, _)) = self.events(&s.task_id) else {
+            continue;
+        };
+        if !evs
+            .iter()
+            .any(|e| matches!(&e.payload, EventPayload::ChatSessionStarted {}))
+        {
+            continue;
         }
+        let title = evs
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::ChatUserTurn { text } => Some(text.clone()),
+                _ => None,
+            })
+            .map(|t| t.chars().take(48).collect::<String>())
+            .unwrap_or_else(|| s.title.clone());
+        let turns = evs
+            .iter()
+            .filter(|e| matches!(&e.payload, EventPayload::ChatUserTurn { .. }))
+            .count() as u64;
+        let last_ts = evs.last().map(|e| e.ts.clone()).unwrap_or_default();
+        out.push(ChatSession {
+            task_id: s.task_id,
+            title,
+            turns,
+            last_ts,
+        });
     }
-    Ok(None)
+    out.sort_by(|a, b| {
+        b.last_ts
+            .cmp(&a.last_ts)
+            .then_with(|| b.task_id.as_str().cmp(a.task_id.as_str()))
+    });
+    Ok(out)
 }
 
-fn is_chat_task(&self, task_id: &TaskId) -> Result<bool, ServiceError> {
-    let (evs, _) = self.events(task_id)?;
-    Ok(evs
-        .iter()
-        .any(|e| matches!(&e.payload, EventPayload::ChatSessionStarted {})))
+/// 最近活动的聊天会话(spec 165;启动恢复用)
+pub fn latest_chat_task(&self) -> Result<Option<TaskId>, ServiceError> {
+    Ok(self.chat_sessions()?.into_iter().next().map(|s| s.task_id))
 }
 
-/// spec 165:从账本重建 (user, assistant) 压缩对话史
+/// 压缩对话史 (user, assistant)。只含最近一次 ChatCompacted 之后的轮次
+/// (摘要取代此前全部轮次;摘要另见 chat_summary)。
 pub fn chat_history(&self, task_id: &TaskId) -> Result<Vec<(String, String)>, ServiceError> {
     let (evs, _) = self.events(task_id)?;
     let mut pairs = Vec::new();
     let mut last_user: Option<String> = None;
     for e in evs {
         match &e.payload {
+            EventPayload::ChatCompacted { .. } => {
+                pairs.clear();
+                last_user = None;
+            }
             EventPayload::ChatUserTurn { text } => last_user = Some(text.clone()),
             EventPayload::MessageCompleted { text, .. } => {
                 if let Some(u) = last_user.take() {
@@ -368,7 +413,16 @@ pub fn chat_history(&self, task_id: &TaskId) -> Result<Vec<(String, String)>, Se
     Ok(pairs)
 }
 
-/// spec 165:全量聊天转录重建(顺序:true=用户,false=助手)
+/// 最近一次 /compact 生成的对话摘要(没有压缩过返回 None)
+pub fn chat_summary(&self, task_id: &TaskId) -> Result<Option<String>, ServiceError> {
+    let (evs, _) = self.events(task_id)?;
+    Ok(evs.iter().rev().find_map(|e| match &e.payload {
+        EventPayload::ChatCompacted { summary, .. } => Some(summary.clone()),
+        _ => None,
+    }))
+}
+
+/// 全量聊天转录重建,顺序:true=用户,false=助手(压缩不清空转录显示)
 pub fn chat_transcript(&self, task_id: &TaskId) -> Result<Vec<(bool, String)>, ServiceError> {
     let (evs, _) = self.events(task_id)?;
     let mut out = Vec::new();
@@ -383,6 +437,86 @@ pub fn chat_transcript(&self, task_id: &TaskId) -> Result<Vec<(bool, String)>, S
     }
     Ok(out)
 }
+
+/// 把压缩摘要作为账本事实落账(spec 173)。可追加在任意状态之后
+/// (投影不变,只影响对话史的重建)。
+pub fn append_chat_compacted(
+    &self,
+    task_id: &TaskId,
+    summary: &str,
+    turns: u64,
+) -> Result<(), ServiceError> {
+    let (ledger, _, _) = self.open_task(task_id)?;
+    ledger
+        .append(
+            AgentRef::User,
+            EventPayload::ChatCompacted {
+                summary: summary.trim().to_string(),
+                turns,
+            },
+        )
+        .map(|_| ())
+        .map_err(ServiceError::Ledger)
+}
+
+}
+
+/// spec 173:/compact 的模型调用:把对话史(可并入上一次的摘要)压缩成新的摘要。
+/// 非流式单轮;摘要为空视为失败(不落账,避免丢上下文)。
+pub fn summarize_history(
+    provider: &dyn crate::provider::Provider,
+    model: &str,
+    history: &[(String, String)],
+    // 上一次压缩留下的摘要:再次压缩时并入,避免丢失更早的上下文
+    prior_summary: Option<&str>,
+) -> Result<String, crate::provider::ProviderError> {
+    const MAX_PAIRS: usize = 60;
+    const MAX_CHARS: usize = 4000;
+    let start = history.len().saturating_sub(MAX_PAIRS);
+    let mut transcript = String::new();
+    if let Some(prior) = prior_summary.map(str::trim).filter(|p| !p.is_empty()) {
+        transcript.push_str(&format!("[此前摘要] {}\n", clip(prior, MAX_CHARS)));
+    }
+    for (i, (u, a)) in history[start..].iter().enumerate() {
+        transcript.push_str(&format!(
+            "[{}] 用户: {}\n[{}] 助手: {}\n",
+            i + 1,
+            clip(u, MAX_CHARS),
+            i + 1,
+            clip(a, MAX_CHARS)
+        ));
+    }
+    let req = crate::provider::ChatRequest {
+        system: Some(
+            "你是对话压缩器。把下面的编程助手对话历史压缩成给后续助手看的摘要,必须保留:\n\
+             1) 用户的目标与约束;2) 已完成的工作与结论(含关键文件路径、命令、数字);\n\
+             3) 做过的关键决定及原因;4) 未完成的事项与已知问题。\n\
+             直接输出摘要正文(不要前言、不要 Markdown 标题),用中文,控制在 600 字以内。"
+                .to_string(),
+        ),
+        messages: vec![crate::provider::ChatMessage::user(format!(
+            "对话历史:\n{transcript}"
+        ))],
+        tools: Vec::new(),
+    };
+    let resp = provider.complete(model, &req)?;
+    let summary = resp.text.trim();
+    if summary.is_empty() {
+        return Err(crate::provider::ProviderError::Rejected {
+            status: 200,
+            summary: "empty summary".into(),
+        });
+    }
+    Ok(summary.to_string())
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
 }
 
 #[cfg(test)]
@@ -533,5 +667,199 @@ mod brief_tests {
             std::env::remove_var(k);
         }
         let _ = std::fs::remove_dir_all(repo);
+    }
+}
+
+#[cfg(test)]
+mod chat_session_tests {
+    use super::*;
+    use crate::provider::{ChatRequest, ChatResponse, Provider, ProviderError};
+    use zealous_core::{AgentRole, AgentRunId};
+
+    /// 建任务要校验 provider 配置:显式设置合法环境变量并串行执行
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::test_support::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZEALOUS_BASE_URL", "http://127.0.0.1:9/v1");
+        std::env::set_var("ZEALOUS_API_KEY", "k");
+        std::env::set_var("ZEALOUS_MODEL", "m");
+        guard
+    }
+
+    fn clear_env() {
+        for k in ["ZEALOUS_BASE_URL", "ZEALOUS_API_KEY", "ZEALOUS_MODEL"] {
+            std::env::remove_var(k);
+        }
+    }
+
+    fn repo(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zealous-chat-sessions-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        dir
+    }
+
+    /// 追加一轮有助手答复的对话(ChatUserTurn → Run → MessageCompleted)
+    fn push_turn(svc: &TaskService, tid: &TaskId, user: &str, assistant: &str) {
+        let (ledger, _, _) = svc.open_task(tid).unwrap();
+        let run = AgentRunId::generate();
+        let a = |p| ledger.append(AgentRef::User, p).unwrap();
+        a(EventPayload::ChatUserTurn { text: user.into() });
+        a(EventPayload::AgentRunStarted {
+            run_id: run.clone(),
+            role: AgentRole::Coordinator,
+        });
+        a(EventPayload::MessageCompleted {
+            run_id: run.clone(),
+            turn: 1,
+            text: assistant.into(),
+        });
+        a(EventPayload::AgentRunEnded {
+            run_id: run,
+            status: zealous_core::AgentRunStatus::Completed,
+            reason: None,
+        });
+    }
+
+    fn chat_task(svc: &TaskService, title: &str) -> TaskId {
+        match svc.create_chat_task(title, Some("brief".into())).unwrap() {
+            CreateOutcome::Ready { task_id, .. } => task_id,
+            other => panic!("expected Ready: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sessions_list_chat_tasks_only_with_title_and_turns() {
+        let _env = env_lock();
+        let root = repo("list");
+        let svc = TaskService::new(&root);
+        let a = chat_task(&svc, "t-a");
+        let b = chat_task(&svc, "t-b");
+        // 普通任务不是聊天会话
+        let plain = match svc.create_task("plain").unwrap() {
+            CreateOutcome::Ready { task_id, .. } => task_id,
+            other => panic!("expected Ready: {other:?}"),
+        };
+        push_turn(&svc, &a, "第一问", "第一答");
+        push_turn(&svc, &a, "第二问", "第二答");
+
+        let sessions = svc.chat_sessions().unwrap();
+        let ids: Vec<_> = sessions.iter().map(|s| s.task_id.as_str()).collect();
+        assert!(!ids.contains(&plain.as_str()), "普通任务不应出现在会话列表");
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        // 最近活动(a)排最前;标题取首条用户输入,轮数按用户输入计
+        assert_eq!(sessions[0].task_id, a);
+        assert_eq!(sessions[0].title, "第一问");
+        assert_eq!(sessions[0].turns, 2);
+        assert_eq!(sessions[1].task_id, b);
+        assert_eq!(sessions[1].turns, 0);
+        // 启动恢复取最近活动的会话
+        assert_eq!(svc.latest_chat_task().unwrap(), Some(a));
+        clear_env();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_resets_after_compaction_and_summary_is_kept() {
+        let _env = env_lock();
+        let root = repo("compact");
+        let svc = TaskService::new(&root);
+        let tid = chat_task(&svc, "t");
+        push_turn(&svc, &tid, "q1", "a1");
+        push_turn(&svc, &tid, "q2", "a2");
+        assert_eq!(svc.chat_history(&tid).unwrap().len(), 2);
+        assert_eq!(svc.chat_summary(&tid).unwrap(), None);
+
+        svc.append_chat_compacted(&tid, "  前两轮的摘要  ", 2).unwrap();
+        // 摘要落账(去首尾空白);此前的对话史被摘要取代
+        assert_eq!(svc.chat_summary(&tid).unwrap().as_deref(), Some("前两轮的摘要"));
+        assert!(svc.chat_history(&tid).unwrap().is_empty());
+        // 账本仍可正常投影(压缩不改变任务状态)
+        assert_eq!(svc.refresh(&tid).unwrap().status, TaskStatus::Queued);
+
+        // 压缩之后的新轮次重新累计;再次压缩只保留最新摘要
+        push_turn(&svc, &tid, "q3", "a3");
+        assert_eq!(svc.chat_history(&tid).unwrap(), vec![("q3".to_string(), "a3".to_string())]);
+        svc.append_chat_compacted(&tid, "新摘要", 1).unwrap();
+        assert_eq!(svc.chat_summary(&tid).unwrap().as_deref(), Some("新摘要"));
+        assert!(svc.chat_history(&tid).unwrap().is_empty());
+        clear_env();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    struct MockProvider {
+        reply: &'static str,
+    }
+
+    impl Provider for MockProvider {
+        fn complete(&self, _model: &str, _req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+            Ok(ChatResponse {
+                text: self.reply.into(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[test]
+    fn summarize_history_wraps_transcript_and_trims_reply() {
+        let provider = MockProvider { reply: "  摘要正文\n" };
+        let out = summarize_history(
+            &provider,
+            "m",
+            &[("问".to_string(), "答".to_string())],
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "摘要正文");
+        // 空摘要视为失败(调用方不落账,避免丢上下文)
+        assert!(summarize_history(&MockProvider { reply: "  " }, "m", &[], None).is_err());
+    }
+
+    #[test]
+    fn summarize_history_sends_history_in_prompt() {
+        use std::sync::Mutex;
+        struct Capture {
+            reqs: Mutex<Vec<ChatRequest>>,
+        }
+        impl Provider for Capture {
+            fn complete(&self, _model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
+                self.reqs.lock().unwrap().push(ChatRequest {
+                    system: req.system.clone(),
+                    messages: req.messages.clone(),
+                    tools: Vec::new(),
+                });
+                Ok(ChatResponse {
+                    text: "s".into(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                })
+            }
+        }
+        let provider = Capture { reqs: Mutex::new(Vec::new()) };
+        summarize_history(
+            &provider,
+            "m",
+            &[
+                ("第一问".to_string(), "第一答".to_string()),
+                ("第二问".to_string(), "第二答".to_string()),
+            ],
+            Some("更早的摘要"),
+        )
+        .unwrap();
+        let reqs = provider.reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let system = reqs[0].system.clone().unwrap();
+        assert!(system.contains("压缩"), "{system}");
+        let body = reqs[0].messages[0].content.clone();
+        // 上一次的摘要排在最前,再次压缩不丢更早的上下文
+        assert!(body.contains("[此前摘要] 更早的摘要"), "{body}");
+        assert!(body.contains("[1] 用户: 第一问") && body.contains("[1] 助手: 第一答"), "{body}");
+        assert!(body.contains("[2] 用户: 第二问") && body.contains("[2] 助手: 第二答"), "{body}");
     }
 }

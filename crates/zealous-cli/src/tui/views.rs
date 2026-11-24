@@ -2,9 +2,11 @@
 //! TestBackend 可直接断言缓冲内容。
 
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+use crate::commands;
 use ratatui::Frame;
 
 use super::state::{ChatRole, ChatToolCard, ChatToolState, FormField, Screen, TuiState};
@@ -277,11 +279,16 @@ fn render_chat(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .line_count(inner_w);
     let max_offset = total.saturating_sub(inner_h);
     let offset = max_offset.saturating_sub(state.chat_scroll).min(u16::MAX as usize) as u16;
-    let title = match (&state.chat_task, state.chat_streaming) {
+    let mut title = match (&state.chat_task, state.chat_streaming) {
         (Some(t), true) => format!("对话 · {} · 流式接收中", task_id_short(t)),
         (Some(t), false) => format!("对话 · {}", task_id_short(t)),
         (None, _) => "对话 · 新会话".to_string(),
     };
+    // spec 173:/compact 进行中(等待模型返回摘要)
+    if state.chat_compacting {
+        title.push_str(" · 压缩中");
+    }
+    let title = title;
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -296,6 +303,66 @@ fn render_chat(f: &mut Frame, area: Rect, state: &mut TuiState) {
         .wrap(Wrap { trim: false })
         .block(Block::new().borders(Borders::ALL).title("输入(Enter 发送 / Backspace 删除)"));
     f.render_widget(input, chunks[1]);
+
+    // spec 173:/ 补全菜单:贴在输入框上方,高亮项即 Tab 会补全的候选
+    render_completion_menu(f, chunks[0], state);
+}
+
+/// spec 173:/ 命令补全菜单。候选来自 commands::complete;最多显示 8 行,
+/// 高亮项超出可视范围时窗口跟随。
+fn completion_menu_lines(state: &TuiState) -> (Vec<Line<'static>>, usize) {
+    let cands = state.chat_completions();
+    let (lines, top) = match state.chat_menu_choice() {
+        Some(sel) if !cands.is_empty() => {
+            let top = sel.saturating_add(1).saturating_sub(COMPLETION_MENU_ROWS.min(cands.len()));
+            let lines = cands
+                .iter()
+                .enumerate()
+                .skip(top)
+                .take(COMPLETION_MENU_ROWS)
+                .map(|(i, c)| {
+                    let name = c.trim_end();
+                    let about = commands::COMMANDS
+                        .iter()
+                        .find(|s| s.name == name)
+                        .map(|s| s.about)
+                        .unwrap_or("");
+                    let style = if i == sel {
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{:>10}  ", c), style),
+                        Span::styled(about.to_string(), style),
+                    ])
+                })
+                .collect();
+            (lines, top)
+        }
+        _ => (Vec::new(), 0),
+    };
+    (lines, top)
+}
+
+const COMPLETION_MENU_ROWS: usize = 8;
+
+fn render_completion_menu(f: &mut Frame, transcript: Rect, state: &TuiState) {
+    let (lines, _) = completion_menu_lines(state);
+    if lines.is_empty() {
+        return;
+    }
+    let h = lines.len() as u16;
+    let area = Rect {
+        x: transcript.x + 1,
+        y: transcript.y + transcript.height.saturating_sub(h + 1),
+        width: transcript.width.saturating_sub(2),
+        height: h,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// spec 173:工具卡片收起时可见的结果行数
@@ -430,7 +497,7 @@ fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
         let run_state = if state.running { "运行中" } else { "空闲" };
         if state.screen == Screen::Chat && !state.abort_requested {
             Line::from(format!(
-                "[{run_state}] Enter 发送 · Esc 任务列表 · Ctrl+N 新会话 · ↑/↓ 滚动 · Ctrl+O 工具详情 · /help 命令"
+                "[{run_state}] Enter 发送 · Esc 任务列表 · Ctrl+N 新会话 · ↑/↓ 滚动 · Ctrl+O 工具详情 · / 命令(Tab 补全)"
             ))
         } else if state.abort_requested {
             Line::from(format!(
@@ -918,6 +985,32 @@ pub(crate) mod tests {
         let text = render_to_string(&mut s);
         assert!(text.contains("第0段"), "{text}");
         assert!(!text.contains("第5段"), "{text}");
+    }
+
+    #[test]
+    fn completion_menu_shows_filtered_candidates_and_follows_selection() {
+        let mut s = TuiState::new();
+        s.chat_input = "/".into();
+        let (lines, top) = completion_menu_lines(&s);
+        assert_eq!(lines.len(), COMPLETION_MENU_ROWS, "全部命令时只显示一屏");
+        assert_eq!(top, 0);
+        // 选中项滚到窗口之外时,窗口跟随
+        s.chat_menu_selected = 10; // 第 11 个候选:/exit
+        let (_lines, top) = completion_menu_lines(&s);
+        assert_eq!(top, 3);
+        let text = render_to_string(&mut s);
+        assert!(text.contains("/exit"), "高亮项应可见: {text}");
+
+        // 前缀过滤:输入 /c 只剩三个候选
+        s.chat_menu_selected = 0;
+        s.chat_input = "/c".into();
+        let (lines, _) = completion_menu_lines(&s);
+        assert_eq!(lines.len(), 3);
+        let text = render_to_string(&mut s);
+        assert!(text.contains("/context") && text.contains("/compact") && text.contains("/clear"));
+        // 普通输入不弹菜单
+        s.chat_input = "读文件".into();
+        assert!(completion_menu_lines(&s).0.is_empty());
     }
 
     #[test]

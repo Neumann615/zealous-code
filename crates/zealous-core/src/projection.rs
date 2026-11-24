@@ -640,6 +640,7 @@ pub fn fold(task_id: &TaskId, events: &[TaskEvent]) -> Result<TaskProjection, Fo
             EventPayload::UsageRecorded { .. } => {}
             EventPayload::ChatSessionStarted {} => {}
             EventPayload::ChatUserTurn { .. } => {}
+            EventPayload::ChatCompacted { .. } => {}
         }
     }
 

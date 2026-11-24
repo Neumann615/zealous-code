@@ -23,6 +23,8 @@ use zealous_core::ApprovalDecision;
 use zealous_engine::task_service::{CreateOutcome, TaskService};
 
 use self::runner::TuiEvent;
+use crate::commands;
+use zealous_core::TaskId;
 use self::state::{Screen, TuiState};
 
 /// 终端守卫:Drop 时恢复 raw mode / alternate screen;
@@ -318,6 +320,21 @@ pub(crate) fn apply_event(
         }
         TuiEvent::Progress(msg) => state.push_progress(msg),
         TuiEvent::ChatToolCall => state.chat_sync_pending = true,
+        TuiEvent::Compacted(result) => {
+            state.chat_compacting = false;
+            match result {
+                // 摘要已落账:立即同步账本,把压缩记录收进转录(与重启恢复同一路径)
+                Ok(()) => {
+                    state.chat_sync_pending = true;
+                    sync_chat_from_ledger(state, svc);
+                }
+                Err(msg) => {
+                    state.chat_entries
+                        .push(state::ChatEntry::system(format!("压缩失败: {msg}")));
+                    state.chat_scroll = 0;
+                }
+            }
+        }
         TuiEvent::QueueFinished(summary) => {
             state.running = false;
             *decision_tx = None;
@@ -377,8 +394,24 @@ fn clear_chat_view(state: &mut TuiState, svc: &TaskService) {
     state.chat_event_cursor = cursor;
 }
 
-/// spec 165/173:恢复最近一次聊天会话(转录 + 工具卡片 + 压缩史 + 任务绑定)。
-/// 从账本一次性回放;已绑定会话或没有可恢复的转录时不动。
+/// spec 165/173:把会话任务的转录、工具卡片、对话史与摘要装入状态。
+/// 启动恢复与 /resume 共用;失败时不改变现有状态。
+fn load_chat_session(state: &mut TuiState, svc: &TaskService, tid: &TaskId) -> Result<(), String> {
+    let (evs, _) = svc.events(tid).map_err(|e| format!("读取账本失败: {e}"))?;
+    let hist = svc.chat_history(tid).map_err(|e| format!("读取对话史失败: {e}"))?;
+    let summary = svc.chat_summary(tid).map_err(|e| format!("读取摘要失败: {e}"))?;
+    // 先读完再改状态:读取失败时原会话显示保持不变
+    state.chat_reset();
+    state.chat_task = Some(tid.clone());
+    transcript::replay(state, &evs, true);
+    // 上次进程退出时没来得及落中断事件:仍显示运行/待审批的卡片已不可能有结果
+    transcript::finalize_unfinished(state, "未完成(会话已中断)");
+    state.chat_history = hist;
+    state.chat_summary = summary.filter(|x| !x.is_empty());
+    Ok(())
+}
+
+/// spec 165/173:恢复最近一次聊天会话。已绑定会话或没有可恢复的转录时不动。
 fn restore_chat_session(state: &mut TuiState, svc: &TaskService) {
     if state.chat_task.is_some() {
         return;
@@ -386,24 +419,191 @@ fn restore_chat_session(state: &mut TuiState, svc: &TaskService) {
     let Ok(Some(tid)) = svc.latest_chat_task() else {
         return;
     };
-    let Ok((evs, _)) = svc.events(&tid) else {
-        return;
-    };
-    let Ok(hist) = svc.chat_history(&tid) else {
-        return;
-    };
-    state.chat_task = Some(tid.clone());
-    transcript::replay(state, &evs, true);
-    // 上次进程退出时没来得及落中断事件:仍显示运行/待审批的卡片已不可能有结果
-    transcript::finalize_unfinished(state, "未完成(会话已中断)");
-    if state.chat_entries.is_empty() {
-        // 只有会话标记、没有任何对话:不绑定,保持新会话
-        state.chat_task = None;
-        state.chat_event_cursor = 0;
+    if load_chat_session(state, svc, &tid).is_err() {
         return;
     }
-    state.chat_history = hist;
-    state.chat_scroll = 0;
+    // 只有会话标记、没有任何对话:不绑定,保持新会话
+    if state.chat_entries.is_empty() && state.chat_history.is_empty() && state.chat_summary.is_none() {
+        state.chat_reset();
+    }
+}
+
+/// spec 173:/model 显示用的当前模型(会话覆盖优先,其次 provider 配置)
+fn current_model_name(state: &TuiState) -> Result<String, String> {
+    if let Some(m) = &state.chat_model_override {
+        return Ok(m.clone());
+    }
+    zealous_engine::provider::ProviderConfig::resolve()
+        .map(|c| c.model)
+        .map_err(|e| e.to_string())
+}
+
+/// spec 173:/compact —— 后台线程调用模型压缩对话史并落账,结果经 TuiEvent::Compacted 回传。
+/// 摘要本身不在这里进转录:落账后由账本同步(transcript::replay)回放出压缩记录,
+/// 与重启恢复走同一条路径。
+fn compact_chat(state: &mut TuiState, svc: &TaskService, event_tx: &mpsc::Sender<TuiEvent>) {
+    use zealous_engine::provider::OpenAiCompatProvider;
+    let say = |state: &mut TuiState, text: String| {
+        state.chat_entries.push(state::ChatEntry::system(text));
+        state.chat_scroll = 0;
+    };
+    if state.running || state.chat_streaming {
+        say(state, "运行中不能压缩,请等本轮结束".into());
+        return;
+    }
+    if state.chat_compacting {
+        return;
+    }
+    let Some(tid) = state.chat_task.clone() else {
+        say(state, "(无会话任务)".into());
+        return;
+    };
+    if state.chat_history.is_empty() {
+        say(state, "没有新的对话可压缩".into());
+        return;
+    }
+    let history = state.chat_history.clone();
+    let prior = state.chat_summary.clone();
+    let model_override = state.chat_model_override.clone();
+    let svc = TaskService::new(svc.repo_root().to_path_buf());
+    let tx = event_tx.clone();
+    state.chat_compacting = true;
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(), String> {
+            let mut config = zealous_engine::provider::ProviderConfig::resolve()
+                .map_err(|e| format!("provider 配置无效: {e}"))?;
+            if let Some(m) = model_override {
+                config.model = m;
+            }
+            let provider = OpenAiCompatProvider::new(config.clone());
+            let turns = history.len() as u64;
+            let summary = zealous_engine::task_service::summarize_history(
+                &provider,
+                &config.model,
+                &history,
+                prior.as_deref(),
+            )
+            .map_err(|e| format!("模型调用失败: {e}"))?;
+            svc.append_chat_compacted(&tid, &summary, turns)
+                .map_err(|e| format!("摘要落账失败: {e}"))?;
+            Ok(())
+        })();
+        let _ = tx.send(TuiEvent::Compacted(result));
+    });
+}
+
+/// spec 172/173:执行一条聊天命令。查询类命令直接读账本;
+/// 有副作用的只有 /new /clear /exit /model /resume /compact。
+fn run_chat_command(
+    state: &mut TuiState,
+    svc: &TaskService,
+    event_tx: &mpsc::Sender<TuiEvent>,
+    cmd: commands::Command,
+    arg: String,
+) {
+    use commands::Command;
+    let say = |state: &mut TuiState, text: String| {
+        state.chat_entries.push(state::ChatEntry::system(text));
+        state.chat_scroll = 0;
+    };
+    let session_events = |state: &TuiState, svc: &TaskService| -> Option<Vec<zealous_core::TaskEvent>> {
+        state
+            .chat_task
+            .as_ref()
+            .and_then(|t| svc.events(t).ok())
+            .map(|(evs, _)| evs)
+    };
+    match cmd {
+        Command::Help => say(state, commands::help_text()),
+        Command::New => {
+            state.chat_reset();
+            say(state, "会话已重置".into());
+        }
+        Command::Task => say(
+            state,
+            state
+                .chat_task
+                .as_ref()
+                .map(|t| format!("当前任务: {}", t.as_str()))
+                .unwrap_or_else(|| "(无会话任务)".into()),
+        ),
+        Command::Status => {
+            let text = match state.chat_task.as_ref().map(|t| svc.open_task(t)) {
+                Some(Ok((_, proj, _))) => format!("状态: {:?}", proj.status),
+                Some(Err(e)) => format!("error: {e}"),
+                None => "(无会话任务)".to_string(),
+            };
+            say(state, text);
+        }
+        Command::Usage => say(
+            state,
+            session_events(state, svc)
+                .map(|evs| commands::usage_text(&evs))
+                .unwrap_or_else(|| "(无会话任务)".into()),
+        ),
+        Command::Context => say(
+            state,
+            session_events(state, svc)
+                .map(|evs| commands::context_text(&evs, state.chat_history.len()))
+                .unwrap_or_else(|| "(无会话任务)".into()),
+        ),
+        Command::Model => {
+            let name = arg.trim();
+            if name.is_empty() {
+                let text = match (&state.chat_model_override, current_model_name(state)) {
+                    (Some(m), _) => format!("当前模型: {m}(本会话 /model 覆盖)"),
+                    (None, Ok(m)) => format!("当前模型: {m}(来自 provider 配置)"),
+                    (None, Err(e)) => format!("当前模型无法确定: {e}"),
+                };
+                say(state, text);
+            } else {
+                state.chat_model_override = Some(name.to_string());
+                say(
+                    state,
+                    format!("后续运行使用模型: {name}(仅本会话生效,不改配置文件)"),
+                );
+            }
+        }
+        Command::Clear => {
+            // 只清转录显示;会话任务、对话史、摘要与账本都保留
+            clear_chat_view(state, svc);
+            say(state, "转录区已清空(会话与账本保留)".into());
+        }
+        Command::Exit => state.screen = Screen::List,
+        Command::Resume => {
+            if state.running || state.chat_streaming {
+                say(state, "运行中不能切换会话,请等本轮结束".into());
+                return;
+            }
+            let sessions = match svc.chat_sessions() {
+                Ok(list) => list,
+                Err(e) => {
+                    say(state, format!("读取会话列表失败: {e}"));
+                    return;
+                }
+            };
+            let pick = arg.trim();
+            if pick.is_empty() {
+                say(state, commands::resume_text(&sessions, state.chat_task.as_ref()));
+                return;
+            }
+            match commands::pick_session(&sessions, pick) {
+                Err(text) => say(state, text),
+                Ok(target) => {
+                    let (tid, turns) = (target.task_id.clone(), target.turns);
+                    let text = match load_chat_session(state, svc, &tid) {
+                        Ok(()) => format!(
+                            "已切换到会话 {}({turns} 轮)",
+                            commands::short_task_id(tid.as_str())
+                        ),
+                        Err(e) => format!("切换会话失败: {e}"),
+                    };
+                    say(state, text);
+                }
+            }
+        }
+        Command::Compact => compact_chat(state, svc, event_tx),
+    }
 }
 
 fn format_resolution(proposal: &zealous_engine::merge_resolution::Proposal) -> String {
@@ -485,6 +685,7 @@ fn handle_key(
                                 abort.clone(),
                                 true,
                                 true,
+                                None,
                                 None,
                                 None,
                                 None,
@@ -1017,8 +1218,26 @@ fn handle_key(
         },
             Screen::Chat => match key.code {
                 KeyCode::Esc => state.screen = Screen::List,
-                KeyCode::Up => state.chat_scroll_up(1),
-                KeyCode::Down => state.chat_scroll_down(1),
+                // spec 173:/ 补全菜单打开时 ↑/↓ 在候选间移动,否则滚动转录
+                KeyCode::Up => {
+                    if !state.chat_menu_move(false) {
+                        state.chat_scroll_up(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if !state.chat_menu_move(true) {
+                        state.chat_scroll_down(1);
+                    }
+                }
+                // spec 173:Tab 补全为高亮的候选(带参数的命令补出尾随空格)
+                KeyCode::Tab | KeyCode::Char('\t') => {
+                    if let Some(c) = state
+                        .chat_menu_choice()
+                        .and_then(|i| state.chat_completions().get(i).cloned())
+                    {
+                        state.chat_apply_completion(&c);
+                    }
+                }
                 KeyCode::PageUp => state.chat_scroll_up(10),
                 KeyCode::PageDown => state.chat_scroll_down(10),
                 KeyCode::Backspace => state.chat_input_backspace(),
@@ -1035,56 +1254,14 @@ fn handle_key(
                     if msg.is_empty() {
                         return;
                     }
-                    // spec 172:/ 命令拦截(不发给模型)
-                    if msg.starts_with("/") {
+                    // spec 172/173:/ 命令拦截(不发给模型);命令表与解析在 commands.rs
+                    if let Some(parsed) = commands::parse(&msg) {
                         state.chat_input.clear();
-                        match msg.as_str() {
-                            "/help" => {
-                                state.chat_entries.push(state::ChatEntry::system("命令: /new 新会话 /task 任务id /status 状态 /usage 用量 /clear 清转录 /exit 任务列表"));
-                            }
-                            "/new" => {
-                                state.chat_reset();
-                                state.chat_entries.push(state::ChatEntry::system("会话已重置"));
-                            }
-                            "/task" => {
-                                let text = state.chat_task.as_ref()
-                                    .map(|t| format!("当前任务: {}", t.as_str()))
-                                    .unwrap_or_else(|| "(无会话任务)".into());
+                        match parsed {
+                            Err(text) => {
                                 state.chat_entries.push(state::ChatEntry::system(text));
                             }
-                            "/status" => {
-                                match state.chat_task.as_ref().map(|t| svc.open_task(t)) {
-                                    Some(Ok((_, proj, _))) => state.chat_entries.push(state::ChatEntry::system(format!("状态: {:?}", proj.status))),
-                                    Some(Err(e)) => state.chat_entries.push(state::ChatEntry::system(format!("error: {e}"))),
-                                    None => state.chat_entries.push(state::ChatEntry::system("(无会话任务)")),
-                                }
-                            }
-                            "/usage" => {
-                                let usage_text = state.chat_task.as_ref()
-                                    .and_then(|t| svc.events(t).ok())
-                                    .map(|(evs, _)| {
-                                        let (p, c, tot): (u64, u64, u64) = evs.iter().filter_map(|e| match &e.payload {
-                                            zealous_core::EventPayload::UsageRecorded { prompt_tokens, completion_tokens, total_tokens, .. }
-                                                => Some((*prompt_tokens, *completion_tokens, *total_tokens)),
-                                            _ => None,
-                                        }).fold((0, 0, 0), |(a, b, c), (x, y, z)| (a + x, b + y, c + z));
-                                        format!("用量: prompt={p} completion={c} total={tot} tokens")
-                                    })
-                                    .unwrap_or_else(|| "(无会话任务)".into());
-                                state.chat_entries.push(state::ChatEntry::system(usage_text));
-                            }
-                            "/clear" => {
-                                // 只清转录显示;会话任务、对话史与账本都保留
-                                clear_chat_view(state, svc);
-                                state.chat_entries.push(state::ChatEntry::system("转录区已清空(会话与账本保留)"));
-                            }
-                            "/exit" | "/quit" => {
-                                // 退出聊天屏回到任务列表;退出整个 TUI 用 q
-                                state.screen = Screen::List;
-                            }
-                            other => {
-                                state.chat_entries.push(state::ChatEntry::system(format!("未知命令: {other}(输入 /help 查看可用命令)")));
-                            }
+                            Ok((cmd, arg)) => run_chat_command(state, svc, event_tx, cmd, arg),
                         }
                         return;
                     }
@@ -1158,6 +1335,7 @@ fn handle_key(
                         abort.clone(),
                         false,
                         true,
+                        state.chat_model_override.clone(),
                         Some(prompt),
                         Some(msg.clone()),
                         Some(on_delta),
@@ -1274,7 +1452,8 @@ fn handle_key(
                             progress_sink.clone(),
                             abort.clone(),
                             false,
-            false,
+                            false,
+                            None,
                             None,
                             None,
                             None,
@@ -1309,8 +1488,18 @@ mod integration_tests {
     }
 
     /// 同上,但脚本项是完整的 assistant message(可带原生 tool_calls)
+    /// 同上,但脚本项是完整的 assistant message(可带原生 tool_calls)
     fn mock_endpoint_msgs(script: Vec<serde_json::Value>) -> String {
+        mock_endpoint_msgs_capture(script).0
+    }
+
+    /// 同 mock_endpoint_msgs,并返回收到的请求体(断言 /model 覆盖是否真的生效)
+    fn mock_endpoint_msgs_capture(
+        script: Vec<serde_json::Value>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let counter = std::sync::atomic::AtomicU32::new(0);
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies_sink = bodies.clone();
         let script = std::sync::Mutex::new(script);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1341,6 +1530,11 @@ mod integration_tests {
                     }
                 }
             }
+            let full = String::from_utf8_lossy(&raw).to_string();
+            bodies_sink
+                .lock()
+                .unwrap()
+                .push(full.split("\r\n\r\n").nth(1).unwrap_or("").to_string());
             let idx = counter.fetch_add(1, Ordering::Relaxed) as usize;
             let content = {
                 let script = script.lock().unwrap();
@@ -1350,8 +1544,10 @@ mod integration_tests {
                     serde_json::json!("guard")
                 }
             };
+            // 每次应答带一份固定用量(prompt 11 / completion 7),/usage /context 才有账可查
             let body = serde_json::json!({
-                "choices": [{ "message": content }]
+                "choices": [{ "message": content }],
+                "usage": { "prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18 }
             })
             .to_string();
             let _ = stream.write_all(
@@ -1364,7 +1560,7 @@ mod integration_tests {
             );
             let _ = stream.shutdown(std::net::Shutdown::Write);
         });
-        format!("http://{addr}/v1")
+        (format!("http://{addr}/v1"), bodies)
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -1459,6 +1655,7 @@ mod integration_tests {
             abort.clone(),
             false,
             false,
+            None,
             None,
             None,
             None,
@@ -1632,6 +1829,7 @@ mod integration_tests {
             abort.clone(),
             false,
             true,
+            None,
             Some("读 README".into()),
             Some("读 README".into()),
             None,
@@ -1772,6 +1970,372 @@ mod integration_tests {
         let fresh = Arc::new(AtomicBool::new(false));
         sync_abort_flag(&idle, &fresh);
         assert!(!fresh.load(Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// 原生 tool-calls 脚本:读 README → 最终答复;第三条给 /compact 的摘要调用备用
+    fn chat_then_summary_script(final_text: &str, summary: Option<&str>) -> Vec<serde_json::Value> {
+        let mut script = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_readme",
+                    "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"README.md\"}" }
+                }]
+            }),
+            serde_json::json!({ "role": "assistant", "content": final_text }),
+        ];
+        if let Some(sm) = summary {
+            script.push(serde_json::json!({ "role": "assistant", "content": sm }));
+        }
+        script
+    }
+
+    /// 真实跑一轮聊天(原生 tool-calls,与 TUI 发送路径同构),等到 Finished。
+    /// `endpoint` 是本轮专用的 mock(model 配置经环境变量注入)
+    fn run_mock_chat_turn(repo: &Path, tid: &zealous_core::TaskId, user: &str, endpoint: &str) {
+        std::env::set_var("ZEALOUS_BASE_URL", endpoint);
+        let abort = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (approval_sink, _request_rx, _decision_tx) =
+            approval::channel(tid.as_str().to_string(), abort.clone());
+        let (progress_sink, _progress_rx) = progress::channel();
+        runner::spawn_run(
+            TaskService::new(repo),
+            tid.clone(),
+            event_tx.clone(),
+            Arc::new(approval_sink),
+            Arc::new(progress_sink),
+            abort.clone(),
+            false,
+            true,
+            None,
+            Some(user.into()),
+            Some(user.into()),
+            None,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Ok(ev) = event_rx.try_recv() {
+                match ev {
+                    TuiEvent::Finished(status) => {
+                        if status != TaskStatus::Completed {
+                            let (evs, _) = TaskService::new(repo).events(tid).unwrap();
+                            let tail: Vec<String> = evs
+                                .iter()
+                                .rev()
+                                .take(8)
+                                .rev()
+                                .map(|e| format!("{} {:?}", e.seq, e.payload))
+                                .collect();
+                            panic!("运行状态 {status:?};账本尾部:\n{}", tail.join("\n"));
+                        }
+                        break;
+                    }
+                    TuiEvent::Failure(msg) => panic!("运行失败: {msg}"),
+                    _ => {}
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "30s 未完成");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn chat_task(svc: &TaskService, title: &str) -> zealous_core::TaskId {
+        match svc.create_chat_task(title, Some("brief".into())).unwrap() {
+            CreateOutcome::Ready { task_id, .. } => task_id,
+            other => panic!("expected Ready: {other:?}"),
+        }
+    }
+
+    /// TUI 控制器接线(无终端):用于逐键驱动 / 命令
+    struct Harness {
+        svc: TaskService,
+        decision_tx: Option<mpsc::Sender<ApprovalDecision>>,
+        event_tx: mpsc::Sender<TuiEvent>,
+        event_rx: mpsc::Receiver<TuiEvent>,
+        sink: Arc<dyn zealous_engine::progress::ProgressSink>,
+        abort: Arc<AtomicBool>,
+    }
+
+    impl Harness {
+        fn new(repo: &Path) -> Self {
+            let svc = TaskService::new(repo);
+            let (event_tx, event_rx) = mpsc::channel();
+            let (sink, _progress_rx) = progress::channel();
+            Self {
+                svc,
+                decision_tx: None,
+                event_tx,
+                event_rx,
+                sink: Arc::new(sink),
+                abort: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn press(&mut self, state: &mut TuiState, key: KeyEvent) {
+            let Harness { svc, decision_tx, event_tx, sink, abort, .. } = self;
+            handle_key(state, svc, decision_tx, event_tx, sink, abort, key);
+        }
+
+        /// 逐字符输入一行再回车(与真实按键路径一致)
+        fn type_line(&mut self, state: &mut TuiState, line: &str) {
+            for c in line.chars() {
+                self.press(state, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            self.press(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+
+        /// 把后台事件应用到状态(与 run_command 主循环同构)
+        fn drain(&mut self, state: &mut TuiState) {
+            loop {
+                let mut got = false;
+                while let Ok(ev) = self.event_rx.try_recv() {
+                    let Harness { svc, decision_tx, .. } = self;
+                    apply_event(state, svc, decision_tx, ev);
+                    got = true;
+                }
+                state.chat_sync_pending = true;
+                maybe_sync_chat(state, &self.svc);
+                if !got {
+                    break;
+                }
+            }
+        }
+
+        /// 最后一条系统提示(命令的文本产出)
+        fn last_system(state: &TuiState) -> String {
+            state
+                .chat_entries
+                .iter()
+                .rev()
+                .find(|e| e.role == state::ChatRole::System)
+                .map(|e| e.text.clone())
+                .expect("应有系统提示")
+        }
+    }
+
+    /// spec 172/173:聊天屏 / 命令走共享命令表;查询类命令读账本,
+    /// /model /resume /exit /Tab 补全改变实际状态;未知命令不发给模型。
+    #[test]
+    fn slash_commands_in_chat_screen() {
+        let _env = MOCK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = init_repo("commands");
+        // 建任务要校验 provider 配置:先给占位地址,每轮运行前再指向各自的 mock
+        std::env::set_var("ZEALOUS_BASE_URL", "http://127.0.0.1:9/v1");
+        std::env::set_var("ZEALOUS_API_KEY", "tui-secret-key");
+        std::env::set_var("ZEALOUS_MODEL", "mock-model");
+        let mut h = Harness::new(&repo);
+        let first = chat_task(&h.svc, "first");
+        run_mock_chat_turn(
+            &repo,
+            &first,
+            "读 README",
+            &mock_endpoint_msgs(chat_then_summary_script("读完了", None)),
+        );
+        // 第二个会话最后活动,排在 /resume 列表第 1 位
+        let second = chat_task(&h.svc, "second");
+        run_mock_chat_turn(
+            &repo,
+            &second,
+            "看看第二个会话",
+            &mock_endpoint_msgs(chat_then_summary_script("第二个会话读完了", None)),
+        );
+        let (endpoint, request_bodies) =
+            mock_endpoint_msgs_capture(chat_then_summary_script("答复", None));
+        std::env::set_var("ZEALOUS_BASE_URL", &endpoint);
+
+        let mut state = TuiState::new();
+        load_chat_session(&mut state, &h.svc, &first).unwrap();
+        assert_eq!(state.chat_history.len(), 1);
+        assert!(state.chat_tool_index.values().count() == 1, "工具卡片随会话恢复");
+
+        // /help:列出全部命令
+        h.type_line(&mut state, "/help");
+        let help = Harness::last_system(&state);
+        for name in ["/help", "/new", "/task", "/status", "/context", "/usage", "/model", "/resume", "/compact", "/clear", "/exit"] {
+            assert!(help.contains(name), "/help 缺少 {name}: {help}");
+        }
+        // /context /usage:数据来自账本
+        h.type_line(&mut state, "/context");
+        let ctx = Harness::last_system(&state);
+        // 一轮 = 工具调用 + 最终答复 = 2 次模型调用,每次 prompt 11 / completion 7
+        assert!(
+            ctx.contains("上下文: 1 轮 · 对话史 1 条 · 累计 36 tokens(prompt 22 / completion 14)"),
+            "{ctx}"
+        );
+        assert!(ctx.contains("最近一次 prompt: 11 tokens · 模型调用 2 次"), "{ctx}");
+        h.type_line(&mut state, "/usage");
+        assert_eq!(
+            Harness::last_system(&state),
+            "用量: prompt=22 completion=14 total=36 tokens"
+        );
+        // /task /status
+        h.type_line(&mut state, "/task");
+        assert!(Harness::last_system(&state).contains(first.as_str()));
+        h.type_line(&mut state, "/status");
+        assert!(Harness::last_system(&state).contains("Completed"), "{}", Harness::last_system(&state));
+
+        // Tab 补全:输入 /com → /compact;/mo → "/model "(带尾随空格)
+        for c in "/com".chars() {
+            h.press(&mut state, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(state.chat_completions(), vec!["/compact"]);
+        h.press(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.chat_input, "/compact");
+        state.chat_input.clear();
+        for c in "/mo".chars() {
+            h.press(&mut state, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        h.press(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.chat_input, "/model ");
+        // 补全后直接接参数:/model foo
+        for c in "foo".chars() {
+            h.press(&mut state, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(state.chat_completions().is_empty(), "输入参数后不再弹菜单");
+        h.press(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.chat_model_override.as_deref(), Some("foo"));
+        assert!(Harness::last_system(&state).contains("后续运行使用模型: foo"));
+        // /model(无参数)显示当前模型
+        h.type_line(&mut state, "/model");
+        assert!(Harness::last_system(&state).contains("当前模型: foo"), "{}", Harness::last_system(&state));
+        // 覆盖真的进入模型请求:发一条消息,抓到的请求体里 model 是 foo
+        h.type_line(&mut state, "再读一次");
+        assert!(state.running && state.chat_streaming, "消息应触发运行");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.running {
+            h.drain(&mut state);
+            assert!(std::time::Instant::now() < deadline, "运行 30s 未完成");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let bodies = request_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "这一轮只调用一次模型: {bodies:?}");
+        let sent: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(sent["model"], "foo", "请求应使用 /model 设置的模型: {}", bodies[0]);
+        // 流式请求体带工具声明(回归:此前流式漏发 tools)
+        assert!(sent["tools"].is_array() && !sent["tools"].as_array().unwrap().is_empty());
+        // prompt 注入了对话史
+        let messages = sent["messages"].as_array().unwrap();
+        assert!(
+            messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("[历史对话(压缩参考)]") && c.contains("再读一次"))),
+            "{messages:?}"
+        );
+        drop(bodies);
+        state.chat_model_override = None;
+        h.type_line(&mut state, "/model");
+        assert!(Harness::last_system(&state).contains("mock-model"));
+
+        // 未知命令 / 多余参数:提示且不发给模型
+        h.type_line(&mut state, "/nope");
+        assert!(Harness::last_system(&state).starts_with("未知命令: /nope"));
+        h.type_line(&mut state, "/compact later");
+        assert!(Harness::last_system(&state).contains("不接受参数"));
+        assert!(!state.running, "命令不应触发运行");
+
+        // /resume:列出会话(最近活动在前),按序号切换并恢复转录
+        // (上面在第一个会话里又发了一轮,它仍是最近活动,排第 1)
+        h.type_line(&mut state, "/resume");
+        let list = Harness::last_system(&state);
+        assert!(
+            list.contains(&format!(
+                "1. 读 README · 2 轮 · {} · 当前",
+                commands::short_task_id(first.as_str())
+            )),
+            "{list}"
+        );
+        assert!(list.contains("2. 看看第二个会话 · 1 轮"), "{list}");
+        h.type_line(&mut state, "/resume 99");
+        assert!(Harness::last_system(&state).contains("没有第 99 个会话"));
+        assert_eq!(state.chat_task.as_ref(), Some(&first), "失败的切换不改当前会话");
+        h.type_line(&mut state, "/resume 2");
+        assert_eq!(state.chat_task.as_ref(), Some(&second));
+        assert_eq!(
+            Harness::last_system(&state),
+            format!("已切换到会话 {}(1 轮)", commands::short_task_id(second.as_str()))
+        );
+        // 转录来自第二个会话的账本
+        assert!(state.chat_entries.iter().any(|e| e.role == state::ChatRole::User && e.text == "看看第二个会话"));
+        assert!(state.chat_tool_index.len() == 1, "切换后工具卡片索引只含新会话的");
+        // 按任务 id 前缀切回第一个会话
+        let prefix = &first.as_str()[..18];
+        h.type_line(&mut state, &format!("/resume {prefix}"));
+        assert_eq!(state.chat_task.as_ref(), Some(&first));
+
+        // /exit:回任务列表
+        h.type_line(&mut state, "/exit");
+        assert_eq!(state.screen, Screen::List);
+
+        std::env::remove_var("ZEALOUS_BASE_URL");
+        std::env::remove_var("ZEALOUS_API_KEY");
+        std::env::remove_var("ZEALOUS_MODEL");
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// spec 173:/compact 调模型生成摘要 → 落账 → 转录回放 → 注入后续 prompt;重启后仍在
+    #[test]
+    fn compact_summarizes_persists_and_replays() {
+        let _env = MOCK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = init_repo("compact");
+        let endpoint = mock_endpoint_msgs(chat_then_summary_script(
+            "读完了",
+            Some("摘要: 用户让我读 README,已读完。"),
+        ));
+        std::env::set_var("ZEALOUS_BASE_URL", &endpoint);
+        std::env::set_var("ZEALOUS_API_KEY", "tui-secret-key");
+        std::env::set_var("ZEALOUS_MODEL", "mock-model");
+        std::env::set_var("ZEALOUS_API_KEY", "tui-secret-key");
+        std::env::set_var("ZEALOUS_MODEL", "mock-model");
+        let mut h = Harness::new(&repo);
+        let tid = chat_task(&h.svc, "compact-me");
+        run_mock_chat_turn(&repo, &tid, "读 README", &endpoint);
+
+        let mut state = TuiState::new();
+        load_chat_session(&mut state, &h.svc, &tid).unwrap();
+        assert_eq!(state.chat_history.len(), 1);
+        assert_eq!(state.chat_summary, None);
+
+        // 没有会话时 /compact 给出提示;有会话且有对话时才调用模型
+        h.type_line(&mut state, "/compact");
+        assert!(state.chat_compacting, "压缩在后台线程进行");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.chat_compacting {
+            h.drain(&mut state);
+            assert!(std::time::Instant::now() < deadline, "压缩 30s 未完成");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // 摘要落账
+        let summary = h.svc.chat_summary(&tid).unwrap();
+        assert_eq!(summary.as_deref(), Some("摘要: 用户让我读 README,已读完。"));
+        assert!(h.svc.chat_history(&tid).unwrap().is_empty(), "摘要取代此前的对话史");
+        // 账本事件可投影(压缩不改变任务状态)
+        assert_eq!(h.svc.refresh(&tid).unwrap().status, TaskStatus::Completed);
+        // TUI 状态:对话史清空、摘要到位、转录里有一条压缩记录
+        assert!(state.chat_history.is_empty());
+        assert_eq!(state.chat_summary, summary);
+        assert!(Harness::last_system(&state).starts_with("✂ 已压缩 1 轮对话为摘要:"), "{}", Harness::last_system(&state));
+        // 后续 prompt 注入摘要
+        let prompt = state.chat_history_prompt("继续");
+        assert!(prompt.contains("用户消息: 继续") && prompt.contains("摘要: 用户让我读 README"), "{prompt}");
+        assert!(!prompt.contains("[历史对话(压缩参考)]"), "没有新的原文对话时不带历史块: {prompt}");
+        // 再次压缩:没有新对话
+        h.type_line(&mut state, "/compact");
+        assert!(Harness::last_system(&state).contains("没有新的对话可压缩"));
+
+        // 重启恢复:摘要与压缩记录都从账本回放
+        let mut fresh = TuiState::new();
+        restore_chat_session(&mut fresh, &h.svc);
+        assert_eq!(fresh.chat_task.as_ref(), Some(&tid));
+        assert_eq!(fresh.chat_summary, summary);
+        assert!(fresh.chat_history.is_empty());
+        assert!(fresh.chat_entries.iter().any(|e| e.text.starts_with("✂ 已压缩 1 轮对话为摘要:")));
+
+        std::env::remove_var("ZEALOUS_BASE_URL");
+        std::env::remove_var("ZEALOUS_API_KEY");
+        std::env::remove_var("ZEALOUS_MODEL");
         let _ = std::fs::remove_dir_all(repo);
     }
 

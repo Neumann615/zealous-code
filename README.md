@@ -100,7 +100,10 @@ Rust workspace:`zealous-core`(领域/事件,纯逻辑)→ `zealous-engine`(编�
    zealous chat                 # 交互输入;也可 zealous chat "首条消息"
    ```
 
-   会话内命令:`/new` 新会话 `/task` 当前任务 id `/status` 状态 `/exit` 退出。
+   会话内命令(与 TUI 聊天屏共用同一张命令表;`/help` 查看全部):
+   `/new` 新会话 · `/task` 当前任务 id · `/status` 状态 · `/context` 上下文用量 ·
+   `/usage` token 用量 · `/model [<name>]` 查看/切换模型 · `/resume [<序号|任务id>]` 历史会话 ·
+   `/compact` 压缩对话史 · `/clear` 清屏 · `/exit` 退出。
 
 6. 或进入可视化工作台:
 
@@ -207,7 +210,7 @@ node scripts/update-agent-assets.mjs
 | ------------ | ---- | - | ------------ | ---- |
 | `↑/↓` | 选择任务 | | `R` | 运行/恢复 |
 | `r` | 刷新列表 | | `x` | 中断任务 |
-| `Enter` | 打开详情 | | `a` / `d` | 批准/拒绝当前审批 |
+| `Enter` | 打开详情 | | `a` / `w` / `d` | 批准 / 始终允许 / 拒绝当前审批 |
 | `n` | 新建任务表单 | | `P` | apply |
 | `q` | 退出 | | `m` | merge |
 |  |  | | `Shift+M` | 创建 merge workspace |
@@ -215,6 +218,23 @@ node scripts/update-agent-assets.mjs
 |  |  | | `C` / `A` | 继续 / 中止 merge |
 |  |  | | `e` | 展开/收起事件流 |
 | `q` | 退出 | | `Esc` | 返回列表 |
+
+聊天屏(TUI 默认屏,启动时自动恢复最近会话):
+
+| 键位 | 作用 |
+| ---- | ---- |
+| `Enter` | 发送消息 |
+| `/` | 输入命令;弹出补全菜单,`↑/↓` 选候选,`Tab` 补全 |
+| `↑` / `↓` / `PageUp` / `PageDown` | 滚动转录 |
+| `Ctrl+O` | 展开/收起工具卡片的结果 |
+| `a` / `w` / `d` / `x` | 审批弹窗:批准 / 本会话始终允许 / 拒绝 / 中断(任意屏生效) |
+| `Shift+Enter` | 输入框换行 |
+| `Ctrl+N` | 新会话 |
+| `Esc` | 回任务列表 |
+| `Ctrl-C` | 中断运行并退出 |
+
+每次工具调用在转录里显示为一张卡片(工具名、关键参数、运行中/等待审批/完成/失败/被拒、
+结果摘要),数据来自事件账本,重启后回放。
 
 新建表单:title 必填;brief file 可选(相对当前 Git 仓库根)。
 `--quiet` 等 CLI 文本输出参数与 TUI 无关;审批、进度、最终状态均来自

@@ -35,6 +35,8 @@ pub enum TuiEvent {
     ReasoningDelta(String),
     /// spec 173:工具调用开始流式返回(提示 TUI 同步账本工具卡片;不携带内容)
     ChatToolCall,
+    /// spec 173:/compact 结束(Ok = 摘要已落账;Err = 失败原因)
+    Compacted(Result<(), String>),
     /// queue/parallel 将决策通道交回主循环
     ApprovalChannel(std::sync::mpsc::Sender<zealous_core::ApprovalDecision>),
 }
@@ -53,6 +55,8 @@ pub fn spawn_run(
     // spec 163:聊天模式自定义 prompt(覆盖 proj.title)
     // spec 164:聊天路径启用原生 tool-calls
     native: bool,
+    // spec 173:/model 设置的会话级模型覆盖(优先于 provider 配置)
+    model_override: Option<String>,
     prompt_override: Option<String>,
     // spec 165:用户原文(聊天路径;ChatUserTurn 落账)
     user_text: Option<String>,
@@ -69,6 +73,10 @@ pub fn spawn_run(
                 return;
             }
         };
+        let mut config = config;
+        if let Some(m) = model_override.filter(|m| !m.trim().is_empty()) {
+            config.model = m.trim().to_string();
+        }
         let (ledger, proj, _) = match svc.open_task(&task_id) {
             Ok(x) => x,
             Err(e) => {
