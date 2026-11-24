@@ -179,6 +179,30 @@ fn default_max_retries() -> u32 {
     3
 }
 
+/// spec 164:工具定义 → OpenAI function 声明;流式与非流式请求体共用。
+/// 没有工具时返回 None(请求体不带 tools 字段)。
+fn tools_json(tools: &[ToolDef]) -> Option<serde_json::Value> {
+    if tools.is_empty() {
+        return None;
+    }
+    let tools: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|td| {
+            let params = serde_json::from_str::<serde_json::Value>(&td.parameters)
+                .unwrap_or_else(|_| serde_json::json!({"type": "object", "properties": {}}));
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": td.name,
+                    "description": td.description,
+                    "parameters": params,
+                },
+            })
+        })
+        .collect();
+    Some(serde_json::Value::Array(tools))
+}
+
 impl ProviderConfig {
     /// 解析优先级(spec 10,代码内固定):环境变量 > 用户配置文件。
     /// 配置文件:`~/.zealous/config.json`
@@ -357,8 +381,7 @@ impl OpenAiCompatProvider {
     }
 
     fn endpoint(&self) -> String {
-        let base = self.config.base_url.trim_end_matches('/');
-        format!("{base}/chat/completions")
+        let base = self.config.base_url.trim_end_matches('/');        format!("{base}/chat/completions")
     }
 
     fn once(&self, model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {
@@ -372,26 +395,8 @@ impl OpenAiCompatProvider {
             "messages": messages,
         });
         // spec 164:native tool-calls 声明
-        if !req.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = req
-                .tools
-                .iter()
-                .map(|td| {
-                    let params =
-                        serde_json::from_str::<serde_json::Value>(&td.parameters).unwrap_or_else(
-                            |_| serde_json::json!({"type": "object", "properties": {}}),
-                        );
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": td.name,
-                            "description": td.description,
-                            "parameters": params,
-                        },
-                    })
-                })
-                .collect();
-            body["tools"] = serde_json::Value::Array(tools);
+        if let Some(tools) = tools_json(&req.tools) {
+            body["tools"] = tools;
         }
         let resp = self
             .agent
@@ -425,13 +430,18 @@ impl OpenAiCompatProvider {
         self.attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let messages = messages_json(req);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": true,
             "stream_options": { "include_usage": true },
-        })
-        .to_string();
+        });
+        // 流式与非流式必须携带同一份工具声明:此前流式请求体漏了 tools,
+        // 模型收不到工具定义,聊天屏(TUI 走流式)因此从不产生工具调用
+        if let Some(tools) = tools_json(&req.tools) {
+            body["tools"] = tools;
+        }
+        let body = body.to_string();
         let resp = self
             .agent
             .post(&self.endpoint())
@@ -1166,6 +1176,110 @@ mod tests {
         assert_eq!(msgs[3]["content"], "u2");
         assert_eq!(v["model"], "m");
         drop(server);
+    }
+
+    /// 流式请求体必须带工具声明(回归:TUI 走流式,此前漏发 tools 导致模型从不调工具)
+    #[test]
+    fn streaming_request_carries_tool_definitions_and_parses_tool_calls() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut raw: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                raw.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(h) = text.find("\r\n\r\n") {
+                    let len = text
+                        .split("\r\n")
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= h + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).to_string();
+            *cap.lock().unwrap() = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let frames = [
+                serde_json::json!({"choices":[{"index":0,"delta":{"content":"看看"}}]}),
+                serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}),
+                serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"README.md\"}"}}]}}]}),
+                serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":5,"total_tokens":14}}),
+            ];
+            let mut sse = String::new();
+            for f in frames {
+                sse.push_str(&format!("data: {f}\n\n"));
+            }
+            sse.push_str("data: [DONE]\n\n");
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    sse.len(),
+                    sse
+                )
+                .as_bytes(),
+            );
+        });
+        let cfg = ProviderConfig {
+            base_url: format!("http://{addr}/v1"),
+            api_key: "k".into(),
+            model: "m".into(),
+            timeout_secs: 5,
+            max_retries: 0,
+        };
+        let provider = OpenAiCompatProvider::new(cfg);
+        let req = ChatRequest {
+            tools: vec![ToolDef {
+                name: "read_file".into(),
+                description: "读文件".into(),
+                parameters: r#"{"type":"object","properties":{"path":{"type":"string"}}}"#.into(),
+            }],
+            system: None,
+            messages: vec![ChatMessage::user("读 README")],
+        };
+        let events = std::sync::Mutex::new(Vec::new());
+        let resp = provider
+            .complete_streaming("m", &req, &|ev| events.lock().unwrap().push(ev))
+            .unwrap();
+
+        let body: serde_json::Value =
+            serde_json::from_str(&captured.lock().unwrap()).unwrap();
+        assert_eq!(body["stream"], true);
+        let tools = body["tools"].as_array().expect("流式请求体应带 tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "read_file");
+        assert_eq!(tools[0]["function"]["parameters"]["properties"]["path"]["type"], "string");
+
+        assert_eq!(resp.text, "看看");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.tool_calls[0].arguments, r#"{"path":"README.md"}"#);
+        assert_eq!(resp.tool_calls[0].id, "call_1");
+        let kinds: Vec<&str> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| match e {
+                ProviderStreamEvent::TextDelta(_) => "text",
+                ProviderStreamEvent::ReasoningDelta(_) => "reasoning",
+                ProviderStreamEvent::ToolCallDelta { .. } => "tool",
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "tool", "tool"]);
     }
 
     #[test]

@@ -7,7 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::state::{ChatRole, FormField, Screen, TuiState};
+use super::state::{ChatRole, ChatToolCard, ChatToolState, FormField, Screen, TuiState};
+use zealous_core::RiskTier;
 
 fn status_str(s: zealous_core::TaskStatus) -> &'static str {
     match s {
@@ -264,7 +265,47 @@ fn render_detail_full(f: &mut Frame, area: Rect, state: &mut TuiState) {
 fn render_chat(f: &mut Frame, area: Rect, state: &mut TuiState) {
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(area);
 
-    // 转录行构建:角色前缀 + 系统提示
+    // 转录行构建:角色前缀 + 工具卡片 + 系统提示
+    let lines = chat_lines(state);
+
+    // 自底部滚动:chat_scroll = 底部向上偏移行数;贴底时自动跟随
+    // spec 173:高度按换行后的行数算(长行换行不再把滚动高度算少)
+    let inner_w = chunks[0].width.saturating_sub(2); // 边框占 2
+    let inner_h = chunks[0].height.saturating_sub(2) as usize;
+    let total = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_w);
+    let max_offset = total.saturating_sub(inner_h);
+    let offset = max_offset.saturating_sub(state.chat_scroll).min(u16::MAX as usize) as u16;
+    let title = match (&state.chat_task, state.chat_streaming) {
+        (Some(t), true) => format!("对话 · {} · 流式接收中", task_id_short(t)),
+        (Some(t), false) => format!("对话 · {}", task_id_short(t)),
+        (None, _) => "对话 · 新会话".to_string(),
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::new().borders(Borders::ALL).title(title))
+            .scroll((offset, 0)),
+        chunks[0],
+    );
+
+    // 输入框
+    let cursor = if state.running || state.chat_streaming { "…" } else { "▏" };
+    let input = Paragraph::new(format!("> {}{cursor}", state.chat_input))
+        .wrap(Wrap { trim: false })
+        .block(Block::new().borders(Borders::ALL).title("输入(Enter 发送 / Backspace 删除)"));
+    f.render_widget(input, chunks[1]);
+}
+
+/// spec 173:工具卡片收起时可见的结果行数
+const TOOL_OUTPUT_COLLAPSED: usize = 2;
+/// spec 173:工具卡片展开时最多显示的结果行数
+const TOOL_OUTPUT_EXPANDED: usize = 60;
+
+/// spec 163/173:聊天转录行(角色前缀 + 工具卡片 + 系统提示)。
+/// 纯函数,渲染与测试共用。
+fn chat_lines(state: &TuiState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     if state.chat_task.is_none() && state.chat_entries.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -274,30 +315,31 @@ fn render_chat(f: &mut Frame, area: Rect, state: &mut TuiState) {
     }
     for e in &state.chat_entries {
         match e.role {
-            ChatRole::User => {
-                lines.push(Line::from(Span::styled(
-                    "you> ".to_string(),
-                    Style::default().cyan().add_modifier(Modifier::BOLD),
-                )));
-                for l in e.text.lines() {
-                    lines.push(Line::from(format!("    {l}")));
-                }
-            }
-            ChatRole::Assistant => {
-                lines.push(Line::from(Span::styled(
-                    "zealous> ".to_string(),
-                    Style::default().green().add_modifier(Modifier::BOLD),
-                )));
-                for l in e.text.lines() {
-                    lines.push(Line::from(format!("    {l}")));
-                }
-            }
+            ChatRole::User => push_speech(
+                &mut lines,
+                "you> ",
+                Style::default().cyan().add_modifier(Modifier::BOLD),
+                &e.text,
+            ),
+            // 流式占位(尚无内容)不渲染空气泡
+            ChatRole::Assistant if e.text.is_empty() => {}
+            ChatRole::Assistant => push_speech(
+                &mut lines,
+                "zealous> ",
+                Style::default().green().add_modifier(Modifier::BOLD),
+                &e.text,
+            ),
             ChatRole::System => {
                 for l in e.text.lines() {
                     lines.push(Line::from(Span::styled(
                         format!("    {l}"),
                         Style::default().dark_gray(),
                     )));
+                }
+            }
+            ChatRole::Tool => {
+                if let Some(card) = &e.tool {
+                    tool_card_lines(card, state.chat_expand_tools, &mut lines);
                 }
             }
         }
@@ -309,29 +351,68 @@ fn render_chat(f: &mut Frame, area: Rect, state: &mut TuiState) {
             Style::default().yellow(),
         )));
     }
+    lines
+}
 
-    // 自底部滚动:chat_scroll = 底部向上偏移行数;贴底时自动跟随
-    let total = lines.len();
-    let inner_h = chunks[0].height.saturating_sub(2) as usize; // 边框占 2
-    let max_offset = total.saturating_sub(inner_h);
-    let offset = max_offset.saturating_sub(state.chat_scroll);
-    let title = match (&state.chat_task, state.chat_streaming) {
-        (Some(t), true) => format!("对话 · {} · 流式接收中", task_id_short(t)),
-        (Some(t), false) => format!("对话 · {}", task_id_short(t)),
-        (None, _) => "对话 · 新会话".to_string(),
+fn push_speech(lines: &mut Vec<Line<'static>>, prefix: &'static str, style: Style, text: &str) {
+    lines.push(Line::from(Span::styled(prefix, style)));
+    for l in text.lines() {
+        lines.push(Line::from(format!("    {l}")));
+    }
+}
+
+/// spec 173:工具卡片 = 标题行(工具名 + 关键参数 + 状态)+ 结果摘要(暗色,可展开)
+fn tool_card_lines(card: &ChatToolCard, expanded: bool, lines: &mut Vec<Line<'static>>) {
+    let (mark, label, state_style) = match card.state {
+        ChatToolState::Running => ("…", "运行中", Style::default().yellow()),
+        ChatToolState::WaitingApproval => (
+            "?",
+            "等待审批",
+            Style::default().yellow().add_modifier(Modifier::BOLD),
+        ),
+        ChatToolState::Ok => ("✓", "完成", Style::default().green()),
+        ChatToolState::Failed => ("✗", "失败", Style::default().red()),
+        ChatToolState::Rejected => ("✗", "已拒绝", Style::default().red()),
     };
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::new().borders(Borders::ALL).title(title))
-            .scroll((offset as u16, 0)),
-        chunks[0],
-    );
+    let mut header = vec![
+        Span::styled("⚙ ", Style::default().dark_gray()),
+        Span::styled(card.tool.clone(), Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if !card.args_summary.is_empty() {
+        header.push(Span::raw(format!("  {}", card.args_summary)));
+    }
+    if card.risk != RiskTier::T0 {
+        header.push(Span::styled(
+            format!("  [{}]", card.risk),
+            Style::default().yellow(),
+        ));
+    }
+    header.push(Span::styled(format!("  {mark} {label}"), state_style));
+    lines.push(Line::from(header));
 
-    // 输入框
-    let cursor = if state.running || state.chat_streaming { "…" } else { "▏" };
-    let input = Paragraph::new(format!("> {}{cursor}", state.chat_input))
-        .block(Block::new().borders(Borders::ALL).title("输入(Enter 发送 / Backspace 删除)"));
-    f.render_widget(input, chunks[1]);
+    let output: Vec<&str> = card
+        .output
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let cap = if expanded {
+        TOOL_OUTPUT_EXPANDED
+    } else {
+        TOOL_OUTPUT_COLLAPSED
+    };
+    for l in output.iter().take(cap) {
+        lines.push(Line::from(Span::styled(
+            format!("  │ {l}"),
+            Style::default().dark_gray(),
+        )));
+    }
+    if output.len() > cap {
+        let more = output.len() - cap;
+        lines.push(Line::from(Span::styled(
+            format!("  │ …另有 {more} 行(Ctrl+O 展开)"),
+            Style::default().dark_gray(),
+        )));
+    }
 }
 
 fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
@@ -349,7 +430,7 @@ fn render_help(f: &mut Frame, area: Rect, state: &TuiState) {
         let run_state = if state.running { "运行中" } else { "空闲" };
         if state.screen == Screen::Chat && !state.abort_requested {
             Line::from(format!(
-                "[{run_state}] Enter 发送 · Esc 任务列表 · Ctrl+N 新会话 · ↑/↓ 滚动 · /help 命令"
+                "[{run_state}] Enter 发送 · Esc 任务列表 · Ctrl+N 新会话 · ↑/↓ 滚动 · Ctrl+O 工具详情 · /help 命令"
             ))
         } else if state.abort_requested {
             Line::from(format!(
@@ -770,4 +851,85 @@ pub(crate) mod tests {
         assert!(text.contains("配置无效"), "错误应显示: {text}");
         assert!(text.contains("visible"), "错误不应遮蔽任务列表: {text}");
     }
+
+    fn card(state: ChatToolState, output: &str) -> ChatToolCard {
+        ChatToolCard {
+            call_id: "c".into(),
+            tool: "read_file".into(),
+            risk: RiskTier::T1,
+            args_summary: "README.md".into(),
+            state,
+            output: output.into(),
+        }
+    }
+
+    #[test]
+    fn chat_renders_tool_card_name_args_and_status() {
+        let mut s = TuiState::new();
+        s.chat_begin_turn("读一下 README");
+        s.chat_push_tool(card(ChatToolState::Ok, "ok: 3 行"));
+        let text = render_to_string(&mut s);
+        assert!(text.contains("you>"), "{text}");
+        assert!(text.contains("read_file"), "{text}");
+        assert!(text.contains("README.md"), "{text}");
+        assert!(text.contains("[T1]"), "{text}");
+        assert!(text.contains("✓完成"), "{text}");
+        assert!(text.contains("ok:3行"), "{text}");
+        // 转录里不再有"⚙ 工具 x 完成"进度行
+        assert!(!text.contains("工具read_file"), "{text}");
+
+        s.chat_push_tool(card(ChatToolState::WaitingApproval, ""));
+        s.chat_push_tool(card(ChatToolState::Rejected, "用户拒绝审批"));
+        let text = render_to_string(&mut s);
+        assert!(text.contains("?等待审批"), "{text}");
+        assert!(text.contains("✗已拒绝"), "{text}");
+    }
+
+    #[test]
+    fn tool_card_output_expands() {
+        let mut s = TuiState::new();
+        s.chat_push_tool(card(ChatToolState::Ok, "l1\nl2\nl3\nl4\nl5"));
+        let text = render_to_string(&mut s);
+        assert!(text.contains("l1") && text.contains("l2"), "{text}");
+        assert!(!text.contains("l3"), "收起时只显示前 2 行: {text}");
+        assert!(text.contains("另有3行"), "{text}");
+        s.chat_expand_tools = true;
+        let text = render_to_string(&mut s);
+        assert!(text.contains("l5"), "{text}");
+        assert!(!text.contains("另有3行"), "{text}");
+    }
+
+    #[test]
+    fn chat_wraps_long_text_and_follows_bottom() {
+        let mut s = TuiState::new();
+        for i in 0..6 {
+            s.chat_entries.push(super::super::state::ChatEntry {
+                role: ChatRole::Assistant,
+                text: format!("第{i}段 {}", "长".repeat(150)),
+                tool: None,
+            });
+        }
+        // 贴底跟随:滚动高度按换行后行数算,末尾条目可见而最早的滚出视口
+        let text = render_to_string(&mut s);
+        assert!(text.contains("第5段"), "{text}");
+        assert!(!text.contains("第0段"), "{text}");
+        // 滚到顶:最早可见,末尾滚出视口
+        s.chat_scroll = 10_000;
+        let text = render_to_string(&mut s);
+        assert!(text.contains("第0段"), "{text}");
+        assert!(!text.contains("第5段"), "{text}");
+    }
+
+    #[test]
+    fn empty_streaming_placeholder_renders_no_bubble() {
+        let mut s = TuiState::new();
+        s.chat_begin_turn("q");
+        let text = render_to_string(&mut s);
+        assert!(text.contains("you>"), "{text}");
+        assert!(!text.contains("zealous>"), "{text}");
+        s.chat_append_delta("答案");
+        let text = render_to_string(&mut s);
+        assert!(text.contains("zealous>"), "{text}");
+    }
+
 }

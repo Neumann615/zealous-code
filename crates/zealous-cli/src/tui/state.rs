@@ -53,6 +53,8 @@ pub enum ChatRole {
     User,
     Assistant,
     System,
+    /// spec 173:工具调用卡片(事实来自账本工具事件)
+    Tool,
 }
 
 /// spec 163:聊天转录条目(UI 派生数据;事实源仍是事件账本)
@@ -60,6 +62,37 @@ pub enum ChatRole {
 pub struct ChatEntry {
     pub role: ChatRole,
     pub text: String,
+    /// spec 173:role == Tool 时非空
+    pub tool: Option<ChatToolCard>,
+}
+
+impl ChatEntry {
+    pub fn system(text: impl Into<String>) -> Self {
+        Self { role: ChatRole::System, text: text.into(), tool: None }
+    }
+}
+
+/// spec 173:工具卡片状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatToolState {
+    Running,
+    WaitingApproval,
+    Ok,
+    Failed,
+    Rejected,
+}
+
+/// spec 173:工具调用卡片(由账本 ToolCallRequested / ApprovalRequested /
+/// ApprovalDecided / ToolCallCompleted 归并而成)
+#[derive(Debug, Clone)]
+pub struct ChatToolCard {
+    pub call_id: String,
+    pub tool: String,
+    pub risk: zealous_core::RiskTier,
+    /// 关键参数摘要(展示用)
+    pub args_summary: String,
+    pub state: ChatToolState,
+    pub output: String,
 }
 
 pub const PROGRESS_RING_CAP: usize = 200;
@@ -133,6 +166,16 @@ pub struct TuiState {
     pub chat_history: Vec<(String, String)>,
     /// spec 163:当前 run 是否在流式输出中
     pub chat_streaming: bool,
+    /// spec 173:call_id → chat_entries 下标(账本事件归并用)
+    pub chat_tool_index: std::collections::HashMap<String, usize>,
+    /// spec 173:会话账本已应用到转录的事件数(增量同步游标)
+    pub chat_event_cursor: usize,
+    /// spec 173:有信号表明账本可能已有新的工具事件,需尽快同步
+    pub chat_sync_pending: bool,
+    /// spec 173:上次账本同步时刻(流式中节流)
+    pub chat_last_sync: Option<std::time::Instant>,
+    /// spec 173:工具卡片展开完整输出(Ctrl+O 切换)
+    pub chat_expand_tools: bool,
     /// spec 167:会话级始终允许的工具(TUI 存活期)
     pub tool_allowlist: std::collections::HashSet<String>,
     /// engine 线程是否在运行(R 已发出且未收到 Finished/Failure)
@@ -180,6 +223,11 @@ impl TuiState {
             chat_task: None,
             chat_history: Vec::new(),
             chat_streaming: false,
+            chat_tool_index: std::collections::HashMap::new(),
+            chat_event_cursor: 0,
+            chat_sync_pending: false,
+            chat_last_sync: None,
+            chat_expand_tools: false,
             tool_allowlist: std::collections::HashSet::new(),
             running: false,
             abort_requested: false,
@@ -375,8 +423,34 @@ impl TuiState {
 
     /// 发送用户消息:转录入条目 + 助手流式条目占位;返回要发送的文本
     pub fn chat_begin_turn(&mut self, msg: &str) {
-        self.chat_entries.push(ChatEntry { role: ChatRole::User, text: msg.to_string() });
-        self.chat_entries.push(ChatEntry { role: ChatRole::Assistant, text: String::new() });
+        self.chat_entries.push(ChatEntry { role: ChatRole::User, text: msg.to_string(), tool: None });
+        self.chat_entries.push(ChatEntry { role: ChatRole::Assistant, text: String::new(), tool: None });
+        self.chat_scroll = 0;
+    }
+
+    /// spec 173:转录末尾追加工具卡片并登记 call_id
+    pub fn chat_push_tool(&mut self, card: ChatToolCard) {
+        let call_id = card.call_id.clone();
+        let idx = self.chat_entries.len();
+        self.chat_entries.push(ChatEntry {
+            role: ChatRole::Tool,
+            text: String::new(),
+            tool: Some(card),
+        });
+        self.chat_tool_index.insert(call_id, idx);
+        self.chat_scroll = 0;
+    }
+
+    /// spec 173:按 call_id 取卡片(不存在返回 None)
+    pub fn chat_tool_mut(&mut self, call_id: &str) -> Option<&mut ChatToolCard> {
+        let idx = *self.chat_tool_index.get(call_id)?;
+        self.chat_entries[idx].tool.as_mut()
+    }
+
+    /// spec 173:清空转录派生数据(条目、索引、游标、滚动)
+    pub fn chat_clear_transcript(&mut self) {
+        self.chat_entries.clear();
+        self.chat_tool_index.clear();
         self.chat_scroll = 0;
     }
 
@@ -392,7 +466,7 @@ impl TuiState {
                 self.chat_collapse_reasoning();
                 self.chat_entries.push(ChatEntry {
                     role: ChatRole::Assistant,
-                    text: piece.to_string(),
+                    text: piece.to_string(), tool: None,
                 });
             }
         }
@@ -408,7 +482,7 @@ impl TuiState {
             _ => {
                 self.chat_entries.push(ChatEntry {
                     role: ChatRole::System,
-                    text: format!("💭 {piece}"),
+                    text: format!("💭 {piece}"), tool: None,
                 });
             }
         }
@@ -423,17 +497,6 @@ impl TuiState {
         }
     }
 
-    /// spec 166:工具活动行进转录(仅工具类进度;简化版活动卡)
-    pub fn chat_tool_line(&mut self, msg: &str) {
-        if msg.starts_with("工具") {
-            self.chat_entries.push(ChatEntry {
-                role: ChatRole::System,
-                text: format!("⚙ {msg}"),
-            });
-            self.chat_scroll = 0;
-        }
-    }
-
     /// run 结束:用账本最终答复替换流式原文,并写入压缩对话史
     pub fn chat_finish_reply(&mut self, reply: Option<String>) {
         let user = self
@@ -444,10 +507,14 @@ impl TuiState {
             .map(|e| e.text.clone())
             .unwrap_or_default();
         if let Some(text) = reply.filter(|s| !s.is_empty()) {
-            if let Some(last) = self.chat_entries.last_mut() {
-                if last.role == ChatRole::Assistant {
-                    last.text = text.clone();
-                }
+            // spec 173:尾部可能已是工具卡片(无流式增量到达),此时补一条助手条目
+            match self.chat_entries.last_mut() {
+                Some(last) if last.role == ChatRole::Assistant => last.text = text.clone(),
+                _ => self.chat_entries.push(ChatEntry {
+                    role: ChatRole::Assistant,
+                    text: text.clone(),
+                    tool: None,
+                }),
             }
             self.chat_history.push((user, text));
         } else if let Some(last) = self.chat_entries.last_mut() {
@@ -487,8 +554,11 @@ impl TuiState {
     /// /new 语义:清空会话(任务与账本不动)
     pub fn chat_reset(&mut self) {
         self.chat_input.clear();
-        self.chat_entries.clear();
-        self.chat_scroll = 0;
+        self.chat_clear_transcript();
+        self.chat_tool_index.clear();
+        self.chat_event_cursor = 0;
+        self.chat_sync_pending = false;
+        self.chat_last_sync = None;
         self.chat_task = None;
         self.chat_history.clear();
         self.chat_streaming = false;
@@ -807,18 +877,47 @@ mod chat_ux_tests {
     }
 
     #[test]
-    fn tool_line_only_for_tool_progress() {
+    fn tool_card_push_and_lookup_by_call_id() {
         let mut s = TuiState::new();
         s.chat_begin_turn("q");
-        s.chat_tool_line("工具 read_file(T0) 完成");
-        s.chat_tool_line("任务进入 Running(from Queued)");
-        let sys: Vec<_> = s
-            .chat_entries
-            .iter()
-            .filter(|e| e.role == ChatRole::System)
-            .collect();
-        assert_eq!(sys.len(), 1);
-        assert!(sys[0].text.contains("⚙"));
+        s.chat_push_tool(ChatToolCard {
+            call_id: "c1".into(),
+            tool: "read_file".into(),
+            risk: zealous_core::RiskTier::T0,
+            args_summary: "README.md".into(),
+            state: ChatToolState::Running,
+            output: String::new(),
+        });
+        let last = s.chat_entries.last().unwrap();
+        assert_eq!(last.role, ChatRole::Tool);
+        assert_eq!(last.tool.as_ref().unwrap().state, ChatToolState::Running);
+        s.chat_tool_mut("c1").unwrap().state = ChatToolState::Ok;
+        s.chat_tool_mut("c1").unwrap().output = "hello".into();
+        let card = s.chat_entries.last().unwrap().tool.as_ref().unwrap();
+        assert_eq!(card.state, ChatToolState::Ok);
+        assert_eq!(card.output, "hello");
+        assert!(s.chat_tool_mut("nope").is_none());
+    }
+
+    #[test]
+    fn reset_and_clear_drop_tool_index_and_cursor() {
+        let mut s = TuiState::new();
+        s.chat_push_tool(ChatToolCard {
+            call_id: "c1".into(),
+            tool: "shell".into(),
+            risk: zealous_core::RiskTier::T1,
+            args_summary: "ls".into(),
+            state: ChatToolState::Failed,
+            output: String::new(),
+        });
+        s.chat_event_cursor = 7;
+        s.chat_clear_transcript();
+        assert!(s.chat_tool_index.is_empty());
+        assert!(s.chat_tool_mut("c1").is_none());
+        s.chat_reset();
+        assert_eq!(s.chat_event_cursor, 0);
+        assert!(!s.chat_sync_pending);
+        assert!(s.chat_last_sync.is_none());
     }
 
     #[test]

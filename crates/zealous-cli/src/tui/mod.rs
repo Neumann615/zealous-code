@@ -5,6 +5,7 @@ pub mod approval;
 pub mod progress;
 pub mod runner;
 pub mod state;
+pub mod transcript;
 pub mod views;
 
 use std::io::{self, Write};
@@ -97,6 +98,8 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
     let mut decision_tx: Option<mpsc::Sender<ApprovalDecision>> = None;
 
     loop {
+        // 0) spec 173:先同步账本工具事件,保证卡片排在其后到达的流式文本之前
+        maybe_sync_chat(&mut state, &svc);
         // 1) 消费 engine 事件
         while let Ok(ev) = event_rx.try_recv() {
             apply_event(&mut state, &svc, &mut decision_tx, ev);
@@ -104,10 +107,19 @@ pub fn run_command(repo_root: PathBuf) -> i32 {
         // 2) 消费进度通道(runner 的 sink 适配层)
         while let Ok(msg) = progress_rx.try_recv() {
             match msg {
-                progress::ProgressMsg::Progress(l) => state.push_progress(l),
+                progress::ProgressMsg::Progress(l) => {
+                    // 工具进度行意味着账本刚落了工具事件
+                    if state.chat_streaming && l.starts_with("工具") {
+                        state.chat_sync_pending = true;
+                    }
+                    state.push_progress(l);
+                }
                 progress::ProgressMsg::Important(l) => state.push_important(&l),
             }
         }
+        // 本轮出现工具信号则立即补一次同步,不等下个轮询周期
+        maybe_sync_chat(&mut state, &svc);
+        sync_abort_flag(&state, &abort);
 
         // 3) 绘制
         let _ = terminal.draw(|f| views::render(f, &mut state));
@@ -170,6 +182,40 @@ fn refresh_task_list(state: &mut TuiState, svc: &TaskService) {
     }
 }
 
+/// 中断请求(state 标志)传播到 engine 的 abort 信号。
+/// 此前只有详情屏的 x 会置位;聊天屏的 Ctrl-C / q 只改 UI 标志,
+/// 引擎照常运行,有审批挂起时 TUI 会一直停在"已请求中断,等待引擎落账"。
+fn sync_abort_flag(state: &TuiState, abort: &AtomicBool) {
+    if state.abort_requested {
+        abort.store(true, Ordering::Relaxed);
+    }
+}
+
+/// spec 173:审批决策(a 批准 / w 本会话始终允许 / d 拒绝)。
+/// 弹窗在任意屏都生效;返回 false 表示该键不是决策键。
+fn decide_approval(
+    state: &mut TuiState,
+    decision_tx: &Option<mpsc::Sender<ApprovalDecision>>,
+    key: KeyCode,
+) -> bool {
+    let decision = match key {
+        KeyCode::Char('a') | KeyCode::Char('w') => ApprovalDecision::Approve,
+        KeyCode::Char('d') => ApprovalDecision::Reject,
+        _ => return false,
+    };
+    if let Some(req) = state.take_pending_approval() {
+        if key == KeyCode::Char('w') {
+            // spec 167:本会话始终允许该工具
+            state.tool_allowlist.insert(req.tool.clone());
+            state.push_important(&format!("[{}] 已加入本会话始终允许", req.tool));
+        }
+        if let Some(tx) = decision_tx {
+            let _ = tx.send(decision);
+        }
+    }
+    true
+}
+
 /// 滚动路由:审批弹窗优先,其次已展开的事件流
 fn scroll_view(state: &mut TuiState, page: usize, down: bool) {
     if state.pending_approval.is_some() {
@@ -198,6 +244,8 @@ pub(crate) fn apply_event(
     match ev {
         TuiEvent::ApprovalChannel(tx) => *decision_tx = Some(tx),
         TuiEvent::Approval(req) => {
+            // spec 173:审批已落账,卡片应尽快显示"等待审批"
+            state.chat_sync_pending = true;
             // spec 167:会话始终允许的工具自动批准(不发弹窗)
             if state.tool_allowlist.contains(req.tool.as_str()) {
                 state.push_important(&format!(
@@ -220,6 +268,9 @@ pub(crate) fn apply_event(
             state.task_finished(status);
             *decision_tx = None;
             // spec 163:聊天流结束 —— 用账本最终答复替换流式原文并写入对话史
+            // spec 173:run 结束前把剩余工具事件收进转录(被中断的工具卡等)
+            sync_chat_from_ledger(state, svc);
+            state.chat_sync_pending = false;
             if state.chat_streaming {
                 state.chat_streaming = false;
                 let reply = state.chat_task.as_ref().and_then(|t| svc.events(t).ok()).and_then(
@@ -250,6 +301,7 @@ pub(crate) fn apply_event(
         TuiEvent::Failure(msg) => {
             state.running = false;
             state.chat_streaming = false;
+            state.chat_sync_pending = false;
             state.set_error(msg);
         }
         TuiEvent::ParallelFinished(summary) => {
@@ -264,13 +316,8 @@ pub(crate) fn apply_event(
         TuiEvent::ReasoningDelta(piece) => {
             state.chat_append_reasoning(&piece);
         }
-        TuiEvent::Progress(msg) => {
-            // spec 166:聊天运行中,工具活动行进转录(简化活动卡)
-            if state.chat_streaming {
-                state.chat_tool_line(&msg);
-            }
-            state.push_progress(msg);
-        }
+        TuiEvent::Progress(msg) => state.push_progress(msg),
+        TuiEvent::ChatToolCall => state.chat_sync_pending = true,
         TuiEvent::QueueFinished(summary) => {
             state.running = false;
             *decision_tx = None;
@@ -280,8 +327,58 @@ pub(crate) fn apply_event(
     }
 }
 
-/// spec 165:恢复最近一次聊天会话(转录 + 压缩史 + 任务绑定;事实来自账本)。
-/// 已绑定会话或没有可恢复的转录时不动。
+/// spec 173:流式输出期间每隔多久把账本同步进转录(工具卡片)
+const CHAT_SYNC_INTERVAL: Duration = Duration::from_millis(300);
+/// spec 173:两次账本同步的最小间隔(信号密集时避免重复读文件)
+const CHAT_SYNC_MIN_GAP: Duration = Duration::from_millis(100);
+
+/// spec 173:按需把账本里的事件同步进转录。
+/// 触发条件:有工具信号待处理,或流式输出中到达节流间隔。
+fn maybe_sync_chat(state: &mut TuiState, svc: &TaskService) {
+    if state.chat_task.is_none() {
+        return;
+    }
+    let since = state.chat_last_sync.map(|t| t.elapsed());
+    if since.is_some_and(|d| d < CHAT_SYNC_MIN_GAP) {
+        return;
+    }
+    let due = state.chat_sync_pending
+        || (state.chat_streaming && since.map_or(true, |d| d >= CHAT_SYNC_INTERVAL));
+    if due {
+        sync_chat_from_ledger(state, svc);
+    }
+}
+
+/// spec 173:读会话账本并把游标之后的事件归并进转录。
+/// 流式输出中信号可能先于账本落盘,此时保留 pending 等下次重试;
+/// 空闲时没有新事件就清掉 pending,避免空转。
+fn sync_chat_from_ledger(state: &mut TuiState, svc: &TaskService) {
+    let Some(tid) = state.chat_task.clone() else {
+        return;
+    };
+    let Ok((evs, _)) = svc.events(&tid) else {
+        return;
+    };
+    let applied = transcript::replay(state, &evs, false);
+    if applied || !state.chat_streaming {
+        state.chat_sync_pending = false;
+    }
+    state.chat_last_sync = Some(std::time::Instant::now());
+}
+
+/// spec 173:/clear 只清转录显示;游标对齐到账本末尾,之后的新事件仍生成卡片
+fn clear_chat_view(state: &mut TuiState, svc: &TaskService) {
+    let cursor = state
+        .chat_task
+        .as_ref()
+        .and_then(|t| svc.events(t).ok())
+        .map_or(0, |(evs, _)| evs.len());
+    state.chat_clear_transcript();
+    state.chat_event_cursor = cursor;
+}
+
+/// spec 165/173:恢复最近一次聊天会话(转录 + 工具卡片 + 压缩史 + 任务绑定)。
+/// 从账本一次性回放;已绑定会话或没有可恢复的转录时不动。
 fn restore_chat_session(state: &mut TuiState, svc: &TaskService) {
     if state.chat_task.is_some() {
         return;
@@ -289,27 +386,23 @@ fn restore_chat_session(state: &mut TuiState, svc: &TaskService) {
     let Ok(Some(tid)) = svc.latest_chat_task() else {
         return;
     };
+    let Ok((evs, _)) = svc.events(&tid) else {
+        return;
+    };
     let Ok(hist) = svc.chat_history(&tid) else {
         return;
     };
-    let Ok(tr) = svc.chat_transcript(&tid) else {
+    state.chat_task = Some(tid.clone());
+    transcript::replay(state, &evs, true);
+    // 上次进程退出时没来得及落中断事件:仍显示运行/待审批的卡片已不可能有结果
+    transcript::finalize_unfinished(state, "未完成(会话已中断)");
+    if state.chat_entries.is_empty() {
+        // 只有会话标记、没有任何对话:不绑定,保持新会话
+        state.chat_task = None;
+        state.chat_event_cursor = 0;
         return;
-    };
-    if tr.is_empty() {
-        return;
-    }
-    for (is_user, text) in tr {
-        state.chat_entries.push(state::ChatEntry {
-            role: if is_user {
-                state::ChatRole::User
-            } else {
-                state::ChatRole::Assistant
-            },
-            text,
-        });
     }
     state.chat_history = hist;
-    state.chat_task = Some(tid);
     state.chat_scroll = 0;
 }
 
@@ -637,6 +730,30 @@ fn handle_key(
         return;
     }
 
+    // spec 173:审批弹窗在任意屏都可滚动与决策。此前 a/d/w 只在详情屏处理,
+    // 聊天屏(默认屏)里审批是死路:按键被直接打进输入框。
+    if state.pending_approval.is_some()
+        && key.modifiers.intersection(KeyModifiers::CONTROL | KeyModifiers::ALT).is_empty()
+    {
+        match key.code {
+            KeyCode::Up => state.approval_scroll_up(1),
+            KeyCode::Down => state.approval_scroll_down(1),
+            KeyCode::PageUp => state.approval_scroll_up(10),
+            KeyCode::PageDown => state.approval_scroll_down(10),
+            KeyCode::Char('x') => {
+                state.request_abort();
+                abort.store(true, Ordering::Relaxed);
+            }
+            // 离开当前屏不吞掉:弹窗保留,到别的屏仍可决策
+            KeyCode::Esc | KeyCode::Char('q') => {}
+            key => {
+                if !decide_approval(state, decision_tx, key) {
+                    return;
+                }
+            }
+        }
+        return;
+    }
     match state.screen {
         Screen::Form => match key.code {
             KeyCode::Esc => state.form_close(),
@@ -923,41 +1040,23 @@ fn handle_key(
                         state.chat_input.clear();
                         match msg.as_str() {
                             "/help" => {
-                                state.chat_entries.push(state::ChatEntry {
-                                    role: state::ChatRole::System,
-                                    text: "命令: /new 新会话 /task 任务id /status 状态 /usage 用量 /clear 清转录 /exit 任务列表".into(),
-                                });
+                                state.chat_entries.push(state::ChatEntry::system("命令: /new 新会话 /task 任务id /status 状态 /usage 用量 /clear 清转录 /exit 任务列表"));
                             }
                             "/new" => {
                                 state.chat_reset();
-                                state.chat_entries.push(state::ChatEntry {
-                                    role: state::ChatRole::System,
-                                    text: "会话已重置".into(),
-                                });
+                                state.chat_entries.push(state::ChatEntry::system("会话已重置"));
                             }
                             "/task" => {
                                 let text = state.chat_task.as_ref()
                                     .map(|t| format!("当前任务: {}", t.as_str()))
                                     .unwrap_or_else(|| "(无会话任务)".into());
-                                state.chat_entries.push(state::ChatEntry {
-                                    role: state::ChatRole::System,
-                                    text,
-                                });
+                                state.chat_entries.push(state::ChatEntry::system(text));
                             }
                             "/status" => {
                                 match state.chat_task.as_ref().map(|t| svc.open_task(t)) {
-                                    Some(Ok((_, proj, _))) => state.chat_entries.push(state::ChatEntry {
-                                        role: state::ChatRole::System,
-                                        text: format!("状态: {:?}", proj.status),
-                                    }),
-                                    Some(Err(e)) => state.chat_entries.push(state::ChatEntry {
-                                        role: state::ChatRole::System,
-                                        text: format!("error: {e}"),
-                                    }),
-                                    None => state.chat_entries.push(state::ChatEntry {
-                                        role: state::ChatRole::System,
-                                        text: "(无会话任务)".into(),
-                                    }),
+                                    Some(Ok((_, proj, _))) => state.chat_entries.push(state::ChatEntry::system(format!("状态: {:?}", proj.status))),
+                                    Some(Err(e)) => state.chat_entries.push(state::ChatEntry::system(format!("error: {e}"))),
+                                    None => state.chat_entries.push(state::ChatEntry::system("(无会话任务)")),
                                 }
                             }
                             "/usage" => {
@@ -972,29 +1071,19 @@ fn handle_key(
                                         format!("用量: prompt={p} completion={c} total={tot} tokens")
                                     })
                                     .unwrap_or_else(|| "(无会话任务)".into());
-                                state.chat_entries.push(state::ChatEntry {
-                                    role: state::ChatRole::System,
-                                    text: usage_text,
-                                });
+                                state.chat_entries.push(state::ChatEntry::system(usage_text));
                             }
                             "/clear" => {
                                 // 只清转录显示;会话任务、对话史与账本都保留
-                                state.chat_entries.clear();
-                                state.chat_scroll = 0;
-                                state.chat_entries.push(state::ChatEntry {
-                                    role: state::ChatRole::System,
-                                    text: "转录区已清空(会话与账本保留)".into(),
-                                });
+                                clear_chat_view(state, svc);
+                                state.chat_entries.push(state::ChatEntry::system("转录区已清空(会话与账本保留)"));
                             }
                             "/exit" | "/quit" => {
                                 // 退出聊天屏回到任务列表;退出整个 TUI 用 q
                                 state.screen = Screen::List;
                             }
                             other => {
-                                state.chat_entries.push(state::ChatEntry {
-                                    role: state::ChatRole::System,
-                                    text: format!("未知命令: {other}(输入 /help 查看可用命令)"),
-                                });
+                                state.chat_entries.push(state::ChatEntry::system(format!("未知命令: {other}(输入 /help 查看可用命令)")));
                             }
                         }
                         return;
@@ -1054,7 +1143,10 @@ fn handle_key(
                                 zealous_engine::provider::ProviderStreamEvent::ReasoningDelta(piece) => {
                                     let _ = delta_tx.send(TuiEvent::ReasoningDelta(piece));
                                 }
-                                _ => (),
+                                // spec 173:工具参数开始流式返回 → 本轮正文已结束,提示同步账本
+                                zealous_engine::provider::ProviderStreamEvent::ToolCallDelta { .. } => {
+                                    let _ = delta_tx.send(TuiEvent::ChatToolCall);
+                                }
                             };
                         });
                     runner::spawn_run(
@@ -1074,6 +1166,10 @@ fn handle_key(
                 // Ctrl+N:重置会话(/new 语义;任务与账本不动)
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     state.chat_reset();
+                }
+                // spec 173:Ctrl+O 展开/收起工具卡片的完整输出
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.chat_expand_tools = !state.chat_expand_tools;
                 }
                 KeyCode::Char(c) => state.chat_input_char(c),
                 _ => {}
@@ -1186,29 +1282,6 @@ fn handle_key(
                     }
                 }
             }
-            KeyCode::Char('w') if state.pending_approval.is_some() => {
-                // spec 167:本会话始终允许该工具
-                if let Some(req) = state.take_pending_approval() {
-                    state.tool_allowlist.insert(req.tool.clone());
-                    state.push_important(&format!("[{}] 已加入本会话始终允许", req.tool));
-                    if let Some(tx) = decision_tx {
-                        let _ = tx.send(ApprovalDecision::Approve);
-                    }
-                }
-            }
-            KeyCode::Char('a') | KeyCode::Char('d') if state.pending_approval.is_some() => {
-                if let Some(req) = state.take_pending_approval() {
-                    let decision = if key.code == KeyCode::Char('a') {
-                        ApprovalDecision::Approve
-                    } else {
-                        ApprovalDecision::Reject
-                    };
-                    let _ = req;
-                    if let Some(tx) = decision_tx {
-                        let _ = tx.send(decision);
-                    }
-                }
-            }
             _ => {}
         },
     }
@@ -1222,8 +1295,21 @@ mod integration_tests {
     use std::sync::atomic::AtomicBool;
     use zealous_core::TaskStatus;
 
+    /// mock 端点经进程级环境变量注入:用到的测试串行执行
+    static MOCK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 本地 mock /chat/completions:按请求顺序返回脚本(spec 60 §6 同款)
     fn mock_endpoint(script: Vec<String>) -> String {
+        mock_endpoint_msgs(
+            script
+                .into_iter()
+                .map(|c| serde_json::json!({ "content": c }))
+                .collect(),
+        )
+    }
+
+    /// 同上,但脚本项是完整的 assistant message(可带原生 tool_calls)
+    fn mock_endpoint_msgs(script: Vec<serde_json::Value>) -> String {
         let counter = std::sync::atomic::AtomicU32::new(0);
         let script = std::sync::Mutex::new(script);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1261,11 +1347,11 @@ mod integration_tests {
                 if idx < script.len() {
                     script[idx].clone()
                 } else {
-                    "guard".into()
+                    serde_json::json!("guard")
                 }
             };
             let body = serde_json::json!({
-                "choices": [{ "message": { "content": content } }]
+                "choices": [{ "message": content }]
             })
             .to_string();
             let _ = stream.write_all(
@@ -1292,6 +1378,7 @@ mod integration_tests {
 
     #[test]
     fn tui_controller_drives_mock_run_to_completed() {
+        let _env = MOCK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // ---- 夹具:真实 git 仓库 + 初始 commit + README ----
         let repo = std::env::temp_dir().join(format!(
             "zealous-tui-e2e-{}-{}",
@@ -1360,7 +1447,8 @@ mod integration_tests {
         let selected_id = state.selected_task().unwrap().task_id.clone();
         assert_eq!(selected_id, task_id);
 
-        // ---- 模拟 R:启动运行 ----
+        // ---- 模拟 R:启动运行(spec 173:绑定会话任务,工具事件同步进转录)----
+        state.chat_task = Some(task_id.clone());
         state.running = true;
         runner::spawn_run(
             TaskService::new(&repo),
@@ -1380,6 +1468,9 @@ mod integration_tests {
         let mut decision_tx = Some(decision_tx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
+            // 模拟工具信号:每个周期都要求同步账本(真实循环由 ToolCallDelta/进度触发)
+            state.chat_sync_pending = true;
+            maybe_sync_chat(&mut state, &svc);
             while let Ok(ev) = event_rx.try_recv() {
                 apply_event(&mut state, &svc, &mut decision_tx, ev);
             }
@@ -1443,6 +1534,27 @@ mod integration_tests {
             .iter()
             .any(|c| c.tool == "edit_file"));
 
+        // spec 173:工具调用以卡片进转录(账本 → 卡片),按调用顺序;无"⚙ 工具"进度行
+        let cards: Vec<_> = state
+            .chat_entries
+            .iter()
+            .filter_map(|e| e.tool.as_ref())
+            .collect();
+        assert_eq!(cards.len(), 2, "工具卡片数: {cards:?}");
+        assert_eq!((cards[0].tool.as_str(), cards[0].state), ("read_file", state::ChatToolState::Ok));
+        assert_eq!(cards[0].args_summary, "README.md");
+        assert_eq!((cards[1].tool.as_str(), cards[1].state), ("edit_file", state::ChatToolState::Ok));
+        assert!(cards[0].output.contains("fixture"), "{}", cards[0].output);
+        assert!(state.chat_entries.iter().all(|e| !e.text.starts_with("⚙ 工具")));
+        // 重启恢复:新状态从同一账本回放出同样的卡片
+        let mut fresh = TuiState::new();
+        fresh.chat_task = Some(task_id.clone());
+        let (ledger_events, _) = svc.events(&task_id).unwrap();
+        assert!(transcript::replay(&mut fresh, &ledger_events, false));
+        let restored: Vec<_> = fresh.chat_entries.iter().filter_map(|e| e.tool.as_ref()).collect();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[1].state, state::ChatToolState::Ok);
+
         // 密钥不落账
         let text = std::fs::read_to_string(zealous_engine::ledger::events_path(
             &zealous_engine::ledger::task_dir(&repo, &task_id),
@@ -1454,4 +1566,213 @@ mod integration_tests {
         std::env::remove_var("ZEALOUS_MODEL");
         let _ = std::fs::remove_dir_all(repo);
     }
+
+    fn init_repo(tag: &str) -> std::path::PathBuf {
+        let repo = std::env::temp_dir().join(format!(
+            "zealous-tui-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(
+            &repo,
+            &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+        );
+        repo
+    }
+
+    /// spec 173:重启后恢复会话,工具卡片从账本回放(与运行中同步共用 transcript::replay)
+    #[test]
+    fn restore_chat_session_replays_tool_cards_after_restart() {
+        let _env = MOCK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let repo = init_repo("restart");
+        // Provider 指向本地 mock:与真实 TUI 聊天路径一致(原生 tool-calls)
+        let endpoint = mock_endpoint_msgs(vec![
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_readme",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                }]
+            }),
+            serde_json::json!({ "role": "assistant", "content": "README 里是 fixture" }),
+        ]);
+        std::env::set_var("ZEALOUS_BASE_URL", &endpoint);
+        std::env::set_var("ZEALOUS_API_KEY", "tui-secret-key");
+        std::env::set_var("ZEALOUS_MODEL", "mock-model");
+
+        let svc = TaskService::new(&repo);
+        let tid = match svc.create_chat_task("tui: restart", Some("读 README".into())).unwrap() {
+            CreateOutcome::Ready { task_id, .. } => task_id,
+            other => panic!("expected Ready: {other:?}"),
+        };
+
+        // 第一次运行(无 TUI 状态):账本由引擎真实写入
+        let abort = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = mpsc::channel();
+        let (approval_sink, _request_rx, _decision_tx) =
+            approval::channel(tid.as_str().to_string(), abort.clone());
+        let (progress_sink, _progress_rx) = progress::channel();
+        runner::spawn_run(
+            TaskService::new(&repo),
+            tid.clone(),
+            event_tx.clone(),
+            Arc::new(approval_sink),
+            Arc::new(progress_sink),
+            abort.clone(),
+            false,
+            true,
+            Some("读 README".into()),
+            Some("读 README".into()),
+            None,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let final_status = loop {
+            if let Ok(ev) = event_rx.try_recv() {
+                if let TuiEvent::Finished(status) = ev {
+                    break status;
+                }
+                if let TuiEvent::Failure(msg) = ev {
+                    panic!("运行失败: {msg}");
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "30s 未完成");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(final_status, TaskStatus::Completed);
+        std::env::remove_var("ZEALOUS_BASE_URL");
+        std::env::remove_var("ZEALOUS_API_KEY");
+        std::env::remove_var("ZEALOUS_MODEL");
+
+        // "重启":全新 TUI 状态,只凭账本恢复
+        let mut state = TuiState::new();
+        restore_chat_session(&mut state, &svc);
+        assert_eq!(state.chat_task.as_ref(), Some(&tid));
+        let roles: Vec<_> = state.chat_entries.iter().map(|e| e.role).collect();
+        assert_eq!(
+            roles,
+            [state::ChatRole::User, state::ChatRole::Tool, state::ChatRole::Assistant]
+        );
+        assert_eq!(state.chat_entries[0].text, "读 README");
+        let card = state.chat_entries[1].tool.as_ref().unwrap();
+        assert_eq!(card.tool, "read_file");
+        assert_eq!(card.args_summary, "README.md");
+        assert_eq!(card.state, state::ChatToolState::Ok);
+        assert_eq!(card.output, "fixture\n");
+        assert_eq!(state.chat_entries[2].text, "README 里是 fixture");
+        assert_eq!(
+            state.chat_history,
+            vec![("读 README".to_string(), "README 里是 fixture".to_string())]
+        );
+        // 已绑定会话时不覆盖
+        let mut bound = TuiState::new();
+        bound.chat_task = Some(tid.clone());
+        restore_chat_session(&mut bound, &svc);
+        assert!(bound.chat_entries.is_empty());
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// spec 173:审批弹窗在聊天屏(默认屏)也必须能决策,且按键不进输入框
+    #[test]
+    fn approval_keys_decide_on_chat_screen() {
+        let repo = std::env::temp_dir().join(format!("zealous-tui-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let svc = TaskService::new(&repo);
+        let (sink, _progress_rx) = progress::channel();
+        let sink: Arc<dyn zealous_engine::progress::ProgressSink> = Arc::new(sink);
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let req = || state::ApprovalRequestUi {
+            task_id: "t".into(),
+            call_id: "c1".into(),
+            tool: "shell".into(),
+            summary: "echo hi".into(),
+        };
+
+        // a:批准(有审批挂起 = 引擎运行中)
+        let mut state = TuiState::new();
+        assert_eq!(state.screen, Screen::Chat);
+        state.running = true;
+        state.approval_arrived(req());
+        let (tx, rx) = mpsc::channel();
+        let mut decision_tx = Some(tx);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let abort = Arc::new(AtomicBool::new(false));
+        handle_key(&mut state, &svc, &mut decision_tx, &event_tx, &sink, &abort, key('a'));
+        assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Approve);
+        assert!(state.pending_approval.is_none());
+        assert!(state.chat_input.is_empty(), "审批键不应打进输入框");
+        assert_eq!(state.screen, Screen::Chat);
+        assert!(state.tool_allowlist.is_empty());
+
+        // w:批准 + 本会话始终允许
+        state.approval_arrived(req());
+        handle_key(&mut state, &svc, &mut decision_tx, &event_tx, &sink, &abort, key('w'));
+        assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Approve);
+        assert!(state.tool_allowlist.contains("shell"));
+
+        // d:拒绝
+        state.approval_arrived(req());
+        handle_key(&mut state, &svc, &mut decision_tx, &event_tx, &sink, &abort, key('d'));
+        assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Reject);
+        assert!(state.pending_approval.is_none());
+
+        // x:中断任务(abort 信号置位)
+        state.approval_arrived(req());
+        handle_key(&mut state, &svc, &mut decision_tx, &event_tx, &sink, &abort, key('x'));
+        assert!(abort.load(Ordering::Relaxed));
+        assert!(state.abort_requested);
+
+        // 无审批时 a 仍是普通输入字符
+        let mut state = TuiState::new();
+        let abort2 = Arc::new(AtomicBool::new(false));
+        handle_key(&mut state, &svc, &mut decision_tx, &event_tx, &sink, &abort2, key('a'));
+        assert_eq!(state.chat_input, "a");
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// spec 173:Ctrl-C / q 的中断请求必须传到 engine 的 abort 信号
+    #[test]
+    fn quit_and_abort_requests_reach_engine_flag() {
+        let repo = std::env::temp_dir().join(format!("zealous-tui-abort-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let svc = TaskService::new(&repo);
+        let (sink, _progress_rx) = progress::channel();
+        let sink: Arc<dyn zealous_engine::progress::ProgressSink> = Arc::new(sink);
+        let mut state = TuiState::new();
+        state.running = true;
+        let (tx, _rx) = mpsc::channel();
+        let mut decision_tx = Some(tx);
+        let (event_tx, _event_rx) = mpsc::channel();
+        let abort = Arc::new(AtomicBool::new(false));
+        handle_key(
+            &mut state,
+            &svc,
+            &mut decision_tx,
+            &event_tx,
+            &sink,
+            &abort,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(state.quit && state.abort_requested);
+        assert!(!abort.load(Ordering::Relaxed), "尚未经主循环传播");
+        sync_abort_flag(&state, &abort);
+        assert!(abort.load(Ordering::Relaxed));
+        // 未请求中断时不改动信号
+        let idle = TuiState::new();
+        let fresh = Arc::new(AtomicBool::new(false));
+        sync_abort_flag(&idle, &fresh);
+        assert!(!fresh.load(Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
 }

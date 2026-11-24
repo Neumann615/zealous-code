@@ -15,7 +15,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 # TUI(spec 90):ratatui 只允许出现在 zealous-cli
-ratatui = "0.30.2"
+# unstable-rendered-line-info:Paragraph::line_count(聊天屏换行后的滚动高度)
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"
 # Ctrl-C:handler 内只设标志位,不做 IO(spec 60 §3)
 ctrlc = "3"

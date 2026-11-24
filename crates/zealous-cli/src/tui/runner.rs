@@ -33,6 +33,8 @@ pub enum TuiEvent {
     ChatDelta(String),
     /// spec 166:思考流增量(reasoning_content)
     ReasoningDelta(String),
+    /// spec 173:工具调用开始流式返回(提示 TUI 同步账本工具卡片;不携带内容)
+    ChatToolCall,
     /// queue/parallel 将决策通道交回主循环
     ApprovalChannel(std::sync::mpsc::Sender<zealous_core::ApprovalDecision>),
 }
