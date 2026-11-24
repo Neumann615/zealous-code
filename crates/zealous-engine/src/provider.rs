@@ -874,7 +874,55 @@ impl MockProvider {
             prompts: std::sync::Mutex::new(Vec::new()),
         }
     }
+    /// spec 169:legacy JSON 动作脚本 → 原生 tool_calls 响应。
+    /// 已切 native 的路径(parallel/queue)其测试脚本保持 `{"action":...}` 写法,
+    /// 由这里逐条映射(见 action_text_to_response)。
+    pub fn scripted_actions(script: Vec<String>) -> Self {
+        Self::scripted_chat(
+            script
+                .into_iter()
+                .map(|text| Ok(action_text_to_response(&text)))
+                .collect(),
+        )
+    }
 }
+
+/// spec 169:一条 legacy 动作 JSON → 原生 ChatResponse(MockProvider::scripted_actions 用)。
+/// plan → plan 工具调用;tool → 对应工具调用;message → 纯文本;其余原样作为文本。
+pub fn action_text_to_response(text: &str) -> ChatResponse {
+    let mut resp = ChatResponse {
+        text: String::new(),
+        tool_calls: Vec::new(),
+        usage: None,
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        resp.text = text.to_string();
+        return resp;
+    };
+    let call = |name: String, arguments: String| {
+        let n = MOCK_CALL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ToolCallInfo {
+            id: format!("call_mock_{n}"),
+            name,
+            arguments,
+        }
+    };
+    match v["action"].as_str() {
+        Some("plan") => resp.tool_calls.push(call(
+            "plan".into(),
+            serde_json::json!({ "plan": v["plan"], "workers": v["workers"] }).to_string(),
+        )),
+        Some("tool") => resp.tool_calls.push(call(
+            v["tool"].as_str().unwrap_or_default().to_string(),
+            v["args"].to_string(),
+        )),
+        Some("message") => resp.text = v["text"].as_str().unwrap_or_default().to_string(),
+        _ => resp.text = text.to_string(),
+    }
+    resp
+}
+
+static MOCK_CALL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Provider for MockProvider {
     fn complete(&self, _model: &str, req: &ChatRequest) -> Result<ChatResponse, ProviderError> {

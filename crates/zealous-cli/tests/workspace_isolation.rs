@@ -635,7 +635,11 @@ fn stage_mock_endpoint() -> String {
             }
         }
         let request = String::from_utf8_lossy(&raw).to_string();
-        let content = if request.contains("tool `edit_file` result") {
+        let content = if request.contains("tool `edit_file` result")
+            // 原生路径回填给模型的工具结果是 "ok=<bool>\n...",不是旧的 "tool `x` result"
+            || request.contains("ok=true")
+            || request.contains("ok=false")
+        {
             r#"{"action":"message","text":"done"}"#
         } else if request.contains("edit shared note") {
             r#"{"action":"tool","tool":"edit_file","args":{"path":"note.txt","old_text":"OLD-VALUE","new_text":"NEW-VALUE"}}"#
@@ -769,7 +773,11 @@ fn parallel_merge_endpoint() -> String {
         }
         let request = String::from_utf8_lossy(&raw).to_string();
         let left = request.contains("parallel merge left");
-        let content = if request.contains("tool `edit_file` result") {
+        let content = if request.contains("tool `edit_file` result")
+            // 原生路径回填给模型的工具结果是 "ok=<bool>\n...",不是旧的 "tool `x` result"
+            || request.contains("ok=true")
+            || request.contains("ok=false")
+        {
             r#"{"action":"message","text":"done"}"#
         } else if request.contains("edit target") {
             if left {
@@ -975,7 +983,11 @@ fn conflicting_parallel_endpoint() -> String {
             continue;
         }
         let left = request.contains("conflict left");
-        let content = if request.contains("tool `edit_file` result") {
+        let content = if request.contains("tool `edit_file` result")
+            // 原生路径回填给模型的工具结果是 "ok=<bool>\n...",不是旧的 "tool `x` result"
+            || request.contains("ok=true")
+            || request.contains("ok=false")
+        {
             r#"{"action":"message","text":"done"}"#
         } else if request.contains("edit conflict") {
             if left {
@@ -1279,6 +1291,9 @@ fn three_parallel_endpoint() -> String {
         let remaining = request.contains("three task remaining");
         let content = if request.contains("tool `edit_file` result")
             || request.contains("tool `write_file` result")
+            // 原生路径回填给模型的工具结果是 "ok=<bool>\n...",不是旧的 "tool `x` result"
+            || request.contains("ok=true")
+            || request.contains("ok=false")
         {
             r#"{"action":"message","text":"done"}"#
         } else if request.contains("edit target") {

@@ -152,10 +152,7 @@ fn mock_endpoint(script: Vec<String>) -> String {
                 "guard".into()
             }
         };
-        let body = serde_json::json!({
-            "choices": [{ "message": { "content": content } }]
-        })
-        .to_string();
+        let body = chat_body(&content);
         let _ = stream.write_all(
             format!(
                 "HTTP/1.1 200 OK
@@ -172,6 +169,54 @@ Connection: close
         let _ = stream.shutdown(std::net::Shutdown::Write);
     });
     format!("http://{addr}/v1")
+}
+
+/// spec 169:serve 路径已切 native —— legacy JSON 动作脚本映射为原生 tool_calls 响应;
+/// 其余(纯文本、"guard")按文本 content 返回。脚本本身保持 `{"action":...}` 写法。
+fn chat_body(content: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        if v["action"] == "plan" {
+            let args = serde_json::json!({ "plan": v["plan"], "workers": v["workers"] });
+            return tool_call_body("plan", &args.to_string());
+        }
+        if v["action"] == "tool" {
+            return tool_call_body(
+                v["tool"].as_str().unwrap_or_default(),
+                &v["args"].to_string(),
+            );
+        }
+        if v["action"] == "message" {
+            return text_body(v["text"].as_str().unwrap_or_default());
+        }
+    }
+    text_body(content)
+}
+
+/// 每次工具调用一个唯一 id(同任务多轮调用不能复用 id)
+static CALL_SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn tool_call_body(name: &str, arguments: &str) -> String {
+    let n = CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+    serde_json::json!({
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": format!("call_mock_{n}"),
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments },
+                }],
+            },
+        }],
+    })
+    .to_string()
+}
+
+fn text_body(text: &str) -> String {
+    serde_json::json!({ "choices": [{ "message": { "role": "assistant", "content": text } }] })
+        .to_string()
 }
 
 fn truncate_dbg(s: &str, max: usize) -> String {
@@ -333,9 +378,9 @@ fn neg_already_running_and_approval_binding() {
         };
         let v: serde_json::Value = serde_json::from_str(&line).expect("合法 JSON 行");
         if v.get("id").and_then(|x| x.as_u64()) == Some(4) {
-            let is_already = v["error"]["code"].as_str() == Some("already_running");
-            let is_ok = v["ok"].as_bool().unwrap_or(false);
-            assert!(is_already || is_ok, "{v}");
+            // 严格断言:首轮卡在 T1 审批上,此刻必在运行
+            assert_eq!(v["error"]["code"], "already_running", "{v}");
+            already_seen = true;
         }
         if v["event"] == "approval_requested" {
             call_id = v["params"]["call_id"].as_str().unwrap().into();

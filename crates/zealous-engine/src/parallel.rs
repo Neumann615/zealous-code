@@ -657,7 +657,10 @@ mod tests {
     }
 
     fn provider_env() -> ProviderEnv {
-        let guard = crate::test_support::ENV_LOCK.lock().unwrap();
+        // 与其它调用点一致:容忍锁毒化,避免一个用例 panic 级联拖垮整个模块
+        let guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ZEALOUS_BASE_URL", "https://api.example.invalid/v1");
         std::env::set_var("ZEALOUS_API_KEY", "test-key");
         std::env::set_var("ZEALOUS_MODEL", "test-model");
@@ -726,12 +729,13 @@ mod tests {
     }
 
     fn provider(tool_path: &str, old: &str, new: &str) -> Arc<dyn Provider> {
-        Arc::new(crate::provider::MockProvider::scripted(vec![
-            Ok(r#"{"action":"plan","plan":"edit","workers":[]}"#.into()),
-            Ok(format!(
+        // 路径已切 native:脚本保持 legacy 动作写法,逐条映射为原生响应
+        Arc::new(crate::provider::MockProvider::scripted_actions(vec![
+            r#"{"action":"plan","plan":"edit","workers":[]}"#.to_string(),
+            format!(
                 r#"{{"action":"tool","tool":"edit_file","args":{{"path":"{tool_path}","old_text":"{old}","new_text":"{new}"}}}}"#
-            )),
-            Ok(r#"{"action":"message","text":"done"}"#.into()),
+            ),
+            r#"{"action":"message","text":"done"}"#.to_string(),
         ]))
     }
 

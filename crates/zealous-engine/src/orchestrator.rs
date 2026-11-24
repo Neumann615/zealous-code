@@ -507,7 +507,11 @@ impl Orchestrator {
             // 探测到即对该轮改走非流式重试(端点非流式返回结构化 tool_calls,已探测验证)
             let looks_like_tool_text = resp.text.contains("<loong")
                 || self.tools.iter().any(|td| {                     resp.text.trim_start().starts_with(&format!("{}(", td.name))                 });
-            let resp = if resp.tool_calls.is_empty() && looks_like_tool_text {
+            // 降级嗅探只针对流式模板退化;非流式返回的是结构化 tool_calls,无需重发
+            let resp = if self.on_delta.is_some()
+                && resp.tool_calls.is_empty()
+                && looks_like_tool_text
+            {
                 self.provider.complete(&self.model, &req).map_err(AgentLoopOutcome::ProviderFailed)?
             } else {
                 resp

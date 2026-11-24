@@ -248,9 +248,8 @@ mod tests {
     }
 
     fn scripted_provider(script: Vec<String>) -> Arc<dyn Provider> {
-        Arc::new(crate::provider::MockProvider::scripted(
-            script.into_iter().map(Ok).collect(),
-        ))
+        // 路径已切 native:脚本保持 legacy 动作写法,逐条映射为原生响应
+        Arc::new(crate::provider::MockProvider::scripted_actions(script))
     }
 
     #[test]
